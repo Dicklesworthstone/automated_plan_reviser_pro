@@ -189,12 +189,30 @@ release_lock() {
 # Compare semantic versions. Returns 0 if $1 > $2
 version_gt() {
     local v1="$1" v2="$2"
-    if command -v sort &> /dev/null && printf '%s\n' "$v1" "$v2" | sort -V &>/dev/null; then
-        [[ "$(printf '%s\n' "$v1" "$v2" | sort -V | tail -n1)" == "$v1" && "$v1" != "$v2" ]]
-    else
-        # Fallback to string comparison
-        [[ "$v1" > "$v2" ]]
-    fi
+    if [[ "$v1" == "$v2" ]]; then return 1; fi
+
+    local IFS=.
+    local ver1=($v1) ver2=($v2)
+    local i
+
+    # Compare each segment
+    for ((i=0; i<${#ver1[@]} || i<${#ver2[@]}; i++)); do
+        local t1=${ver1[i]:-0}
+        local t2=${ver2[i]:-0}
+        
+        # Strip non-numeric suffixes for comparison (e.g. 1.0.0-beta -> 1.0.0)
+        # This is a simplified check for x.y.z format
+        t1="${t1%%[!0-9]*}"
+        t2="${t2%%[!0-9]*}"
+        
+        # Default to 0 if empty
+        [[ -z "$t1" ]] && t1=0
+        [[ -z "$t2" ]] && t2=0
+
+        if ((10#$t1 > 10#$t2)); then return 0; fi
+        if ((10#$t1 < 10#$t2)); then return 1; fi
+    done
+    return 1
 }
 
 # Check if we can prompt the user (interactive terminal)
@@ -2523,7 +2541,7 @@ run_round() {
             exit $oracle_exit
         fi
     else
-        $ORACLE_CMD "${oracle_args[@]}" &
+        "${ORACLE_CMD[@]}" "${oracle_args[@]}" &
         local oracle_pid=$!
 
         # Brief delay to verify process started
@@ -2548,13 +2566,13 @@ run_round() {
                 "" \
                 "Check status:      $(gum style --foreground 82 "apr status")" \
                 "Attach to session: $(gum style --foreground 82 "apr attach $slug")" \
-                "View with output:  $(gum style --foreground 82 "$ORACLE_CMD session $slug --render")" >&2
+                "View with output:  $(gum style --foreground 82 "${ORACLE_CMD[*]} session $slug --render")" >&2
         elif [[ "$QUIET_MODE" != "true" ]]; then
             echo -e "  ${BOLD}${CYAN}MONITORING COMMANDS${NC}" >&2
             echo "" >&2
             echo -e "  Check status:      ${GREEN}apr status${NC}" >&2
             echo -e "  Attach to session: ${GREEN}apr attach $slug${NC}" >&2
-            echo -e "  View with output:  ${GREEN}$ORACLE_CMD session $slug --render${NC}" >&2
+            echo -e "  View with output:  ${GREEN}${ORACLE_CMD[*]} session $slug --render${NC}" >&2
         fi
 
         echo "" >&2
@@ -2604,7 +2622,7 @@ show_status() {
     print_header "ORACLE SESSION STATUS"
     print_info "Showing sessions from last ${STATUS_HOURS}h"
     echo "" >&2
-    $ORACLE_CMD status --hours "$STATUS_HOURS"
+    "${ORACLE_CMD[@]}" status --hours "$STATUS_HOURS"
 }
 
 attach_session() {
@@ -2612,7 +2630,7 @@ attach_session() {
     print_banner
     print_info "Attaching to session: $session"
     echo "" >&2
-    $ORACLE_CMD session "$session" --render
+    "${ORACLE_CMD[@]}" session "$session" --render
 }
 
 # -----------------------------------------------------------------------------
@@ -4183,11 +4201,11 @@ robot_run() {
         -p "$prompt"
     )
 
-    verbose "robot_run Oracle command: $ORACLE_CMD ${oracle_args[*]}"
+    verbose "robot_run Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
     verbose "robot_run output_file: $output_file"
 
     # Execute in background
-    $ORACLE_CMD "${oracle_args[@]}" &
+    "${ORACLE_CMD[@]}" "${oracle_args[@]}" &
     local oracle_pid=$!
 
     # Return session info
