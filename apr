@@ -146,22 +146,29 @@ acquire_lock() {
     local workflow="$1"
     local round="$2"
     local lock_dir="$CONFIG_DIR/.locks"
-    mkdir -p "$lock_dir" 2>/dev/null
+    if ! mkdir -p "$lock_dir" 2>/dev/null; then
+        return 1
+    fi
 
     local lock_path="$lock_dir/${workflow}_round_${round}.lock"
 
     # Use flock if available (preferred - atomic and robust)
     if command -v flock &>/dev/null; then
-        # Open file descriptor
-        exec {APR_LOCK_FD}>"$lock_path"
-        if ! flock -n "$APR_LOCK_FD"; then
-            # Failed to acquire: close FD and return
-            exec {APR_LOCK_FD}>&-
+        # Open file descriptor without truncating. Only update the PID file after the lock is acquired,
+        # otherwise failed attempts can clobber the running process' PID info.
+        if ! exec {APR_LOCK_FD}<>"$lock_path"; then
             APR_LOCK_FD=""
             return 1
         fi
-        # Success: write PID and set global path
-        echo "$$" >&"$APR_LOCK_FD"
+        if ! flock -n "$APR_LOCK_FD"; then
+            # Failed to acquire: close FD and return
+            { exec {APR_LOCK_FD}>&-; } 2>/dev/null || true
+            APR_LOCK_FD=""
+            return 1
+        fi
+        # Success: update PID file content and set global path.
+        : > "$lock_path" 2>/dev/null || true
+        printf '%s\n' "$$" 1>&"$APR_LOCK_FD" 2>/dev/null || true
         APR_LOCK_FILE="$lock_path"
     else
         # Fallback: simple file-based locking
@@ -180,7 +187,9 @@ acquire_lock() {
         fi
         
         # Stale lock file - remove and retry once
-        rm -f "$lock_path"
+        if ! rm -f "$lock_path" 2>/dev/null; then
+            return 1
+        fi
         if (set -C; echo "$$" > "$lock_path") 2>/dev/null; then
             APR_LOCK_FILE="$lock_path"
             return 0
@@ -193,13 +202,33 @@ acquire_lock() {
 # Release the lock
 release_lock() {
     if [[ -n "$APR_LOCK_FD" ]]; then
-        exec {APR_LOCK_FD}>&-
+        { exec {APR_LOCK_FD}>&-; } 2>/dev/null || true
         APR_LOCK_FD=""
     fi
     if [[ -n "$APR_LOCK_FILE" && -f "$APR_LOCK_FILE" ]]; then
-        rm -f "$APR_LOCK_FILE"
+        rm -f "$APR_LOCK_FILE" 2>/dev/null || true
         APR_LOCK_FILE=""
     fi
+}
+
+# In background runs, keep the lock held by the background process and prevent
+# the parent shell EXIT trap from releasing it prematurely.
+background_lock_detach_parent() {
+    local background_pid="$1"
+
+    # If using file-based lock fallback (no flock), write the background PID so
+    # stale detection doesn't treat the lock as dead when the parent exits.
+    if [[ -z "$APR_LOCK_FD" && -n "$APR_LOCK_FILE" && -f "$APR_LOCK_FILE" ]]; then
+        printf '%s\n' "$background_pid" > "$APR_LOCK_FILE" 2>/dev/null || true
+    fi
+
+    # Close parent's copy of the lock FD (if any) without removing the lock file.
+    if [[ -n "$APR_LOCK_FD" ]]; then
+        { exec {APR_LOCK_FD}>&-; } 2>/dev/null || true
+    fi
+
+    APR_LOCK_FD=""
+    APR_LOCK_FILE=""
 }
 
 # -----------------------------------------------------------------------------
@@ -2505,14 +2534,11 @@ run_round() {
         exit $EXIT_SUCCESS
     fi
 
-    # Acquire lock to prevent concurrent runs of the same workflow/round (foreground only)
-    # In background mode, we rely on the output file overwrite warning
-    if [[ "$wait_mode" == "true" ]]; then
-        if ! acquire_lock "$workflow" "$round_num"; then
-            print_error "Another APR process is already running round $round_num for workflow '$workflow'"
-            print_info "Wait for it to complete or check 'apr status'"
-            exit $EXIT_CONFIG_ERROR
-        fi
+    # Acquire lock to prevent concurrent runs of the same workflow/round.
+    if ! acquire_lock "$workflow" "$round_num"; then
+        print_error "Another APR process is already running round $round_num for workflow '$workflow'"
+        print_info "Wait for it to complete or check 'apr status'"
+        exit $EXIT_CONFIG_ERROR
     fi
 
     # Build Oracle command
@@ -2654,11 +2680,13 @@ run_round() {
             exit $oracle_exit
         fi
     else
-        if [[ "$enable_retry" == "true" ]]; then
-            run_oracle_with_retry "${oracle_args[@]}" &
-        else
-            "${ORACLE_CMD[@]}" "${oracle_args[@]}" &
-        fi
+        (
+            if [[ "$enable_retry" == "true" ]]; then
+                run_oracle_with_retry "${oracle_args[@]}"
+            else
+                "${ORACLE_CMD[@]}" "${oracle_args[@]}"
+            fi
+        ) &
         local oracle_pid=$!
 
         # Brief delay to verify process started
@@ -2666,10 +2694,13 @@ run_round() {
 
         # Verify the process is actually running
         if ! kill -0 "$oracle_pid" 2>/dev/null; then
+            release_lock 2>/dev/null || true
             print_error "Oracle process failed to start"
             print_info "Try running with --wait to see error output"
             exit $EXIT_DEPENDENCY_ERROR
         fi
+
+        background_lock_detach_parent "$oracle_pid"
 
         print_success "Oracle running in background (PID: $oracle_pid)"
         echo "" >&2
@@ -4489,17 +4520,19 @@ robot_status() {
         default_workflow=$(get_config_value "default_workflow" "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "")
     fi
 
-    # Count and list workflows
+    # Count and list workflows (JSON-safe)
     if [[ -d "$CONFIG_DIR/workflows" ]]; then
-        workflow_count=$(find "$CONFIG_DIR/workflows" -name "*.yaml" 2>/dev/null | wc -l | tr -d ' ')
-        local wf_list=()
+        local workflow_names=()
         for wf in "$CONFIG_DIR/workflows"/*.yaml; do
             [[ -f "$wf" ]] || continue
-            wf_list+=("\"$(basename "$wf" .yaml)\"")
+            local name
+            name=$(basename "$wf" .yaml)
+            if is_valid_workflow_name "$name"; then
+                workflow_names+=("$name")
+            fi
         done
-        if [[ ${#wf_list[@]} -gt 0 ]]; then
-            workflows_json="[$(IFS=,; echo "${wf_list[*]}")]"
-        fi
+        workflow_count="${#workflow_names[@]}"
+        workflows_json=$(printf '%s\n' "${workflow_names[@]}" | jq -Rsc 'split("\n") | map(select(length>0))')
     fi
 
     # Check Oracle
@@ -4747,6 +4780,16 @@ robot_run() {
         return 1
     fi
 
+    # Acquire lock so concurrent robot runs can't trample the same workflow/round.
+    local lock_file="$CONFIG_DIR/.locks/${workflow}_round_${round_num}.lock"
+    if ! acquire_lock "$workflow" "$round_num"; then
+        local existing_pid=""
+        existing_pid=$(cat "$lock_file" 2>/dev/null || echo "")
+        robot_json false "already_exists" "$(jq -nc --arg wf "$workflow" --argjson r "$round_num" --arg lock "$lock_file" --arg pid "$existing_pid" '{workflow: $wf, round: $r, lock_file: $lock, pid: $pid}')" \
+            "Another APR process is already running this round"
+        return 1
+    fi
+
     # Build file arguments
     local file_args=(--file "$readme_path")
     if [[ "$include_impl" == "true" && -n "$impl_path" && -f "$impl_path" ]]; then
@@ -4794,7 +4837,9 @@ robot_run() {
         oracle_log="$logs_dir/oracle_${slug}.log"
     fi
 
-    run_oracle_with_retry "${oracle_args[@]}" >"$oracle_log" 2>&1 &
+    (
+        run_oracle_with_retry "${oracle_args[@]}"
+    ) >"$oracle_log" 2>&1 &
     local oracle_pid=$!
 
     # Brief delay to verify process started
@@ -4802,9 +4847,12 @@ robot_run() {
 
     # Verify the process is actually running
     if ! kill -0 "$oracle_pid" 2>/dev/null; then
+        release_lock 2>/dev/null || true
         robot_json false "oracle_error" '{"reason":"process_start_failed"}' "Oracle process failed to start immediately"
         return 1
     fi
+
+    background_lock_detach_parent "$oracle_pid"
 
     # Return session info
     local data

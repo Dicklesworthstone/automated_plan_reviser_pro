@@ -631,6 +631,21 @@ EOF
     [[ "$output" == *"workflow-b"* ]]
 }
 
+@test "run: rejects concurrent background run for same round" {
+    setup_mock_oracle
+    export MOCK_ORACLE_SLEEP=3
+
+    capture_streams "$APR_SCRIPT" run 1 -w default
+    log_test_actual "first exit code" "$CAPTURED_STATUS"
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+
+    capture_streams "$APR_SCRIPT" run 1 -w default
+    log_test_actual "second exit code" "$CAPTURED_STATUS"
+    log_test_actual "second stderr" "$CAPTURED_STDERR"
+    [[ "$CAPTURED_STATUS" -eq 4 ]]
+    [[ "$CAPTURED_STDERR" == *"already running"* ]]
+}
+
 # =============================================================================
 # Oracle Command Construction Tests
 # =============================================================================

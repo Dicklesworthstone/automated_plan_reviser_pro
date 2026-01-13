@@ -123,6 +123,28 @@ teardown() {
     assert_json_value "$json_output" ".data.round" "1"
 }
 
+@test "apr robot run: rejects concurrent run for same round" {
+    setup_mock_oracle
+    setup_test_workflow "robot"
+
+    export MOCK_ORACLE_SLEEP=3
+
+    capture_streams "$APR_SCRIPT" robot run 1 -w robot --compact
+    log_test_actual "first stdout" "$CAPTURED_STDOUT"
+    log_test_actual "first stderr" "$CAPTURED_STDERR"
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_valid_json "$CAPTURED_STDOUT"
+    assert_json_value "$CAPTURED_STDOUT" ".ok" "true"
+
+    capture_streams "$APR_SCRIPT" robot run 1 -w robot --compact
+    log_test_actual "second stdout" "$CAPTURED_STDOUT"
+    log_test_actual "second stderr" "$CAPTURED_STDERR"
+    [[ "$CAPTURED_STATUS" -ne 0 ]]
+    assert_valid_json "$CAPTURED_STDOUT"
+    assert_json_value "$CAPTURED_STDOUT" ".ok" "false"
+    assert_json_value "$CAPTURED_STDOUT" ".code" "already_exists"
+}
+
 @test "apr robot history: returns rounds list" {
     setup_test_workflow "robot"
     create_mock_round 1 "robot"

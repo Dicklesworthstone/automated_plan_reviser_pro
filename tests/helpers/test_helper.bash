@@ -315,11 +315,11 @@ capture_streams() {
     stdout_file="$(mktemp)"
     stderr_file="$(mktemp)"
 
-    set +e
-    "$@" > "$stdout_file" 2> "$stderr_file"
+    # Don't let Bats' ERR trap (and our helper's `set -e`) turn a non-zero exit
+    # into an immediate test failure. We intentionally capture failures.
     # shellcheck disable=SC2034  # Used by callers
-    CAPTURED_STATUS=$?
-    set -e
+    CAPTURED_STATUS=0
+    "$@" > "$stdout_file" 2> "$stderr_file" || CAPTURED_STATUS=$?
 
     # shellcheck disable=SC2034  # Used by callers
     CAPTURED_STDOUT="$(cat "$stdout_file")"
@@ -372,7 +372,7 @@ case "$1" in
         else
             # Simulate a long-running request - output to stderr only
             echo "Mock response for: $*" >&2
-            sleep 1
+            sleep "${MOCK_ORACLE_SLEEP:-1}"
         fi
         ;;
 esac
