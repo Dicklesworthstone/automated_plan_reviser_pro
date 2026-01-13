@@ -32,6 +32,7 @@ source "$HELPERS_DIR/logging.bash"
 source "$HELPERS_DIR/assertions.bash"
 
 # Fixtures directory
+# shellcheck disable=SC2034  # Used by test files
 FIXTURES_DIR="$TESTS_DIR/fixtures"
 
 # APR script path
@@ -280,10 +281,13 @@ capture_streams() {
 
     set +e
     "$@" > "$stdout_file" 2> "$stderr_file"
+    # shellcheck disable=SC2034  # Used by callers
     CAPTURED_STATUS=$?
     set -e
 
+    # shellcheck disable=SC2034  # Used by callers
     CAPTURED_STDOUT="$(cat "$stdout_file")"
+    # shellcheck disable=SC2034  # Used by callers
     CAPTURED_STDERR="$(cat "$stderr_file")"
 
     rm -f "$stdout_file" "$stderr_file"

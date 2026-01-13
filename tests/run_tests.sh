@@ -177,7 +177,8 @@ main() {
 
     # Create log directory
     mkdir -p "$LOG_DIR"
-    local log_file="$LOG_DIR/test_run_$(date '+%Y%m%d_%H%M%S').log"
+    local log_file
+    log_file="$LOG_DIR/test_run_$(date '+%Y%m%d_%H%M%S').log"
 
     # Build BATS options
     local bats_opts=()
@@ -221,7 +222,9 @@ main() {
 
     # Export environment for tests
     export TEST_LOG_DIR="$LOG_DIR"
-    export TEST_VERBOSITY=$([[ "$VERBOSE" == "true" ]] && echo 2 || echo 1)
+    local test_verbosity
+    test_verbosity=$([[ "$VERBOSE" == "true" ]] && echo 2 || echo 1)
+    export TEST_VERBOSITY="$test_verbosity"
     export PROJECT_ROOT
 
     # Run BATS

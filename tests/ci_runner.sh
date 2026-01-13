@@ -32,6 +32,7 @@ export APR_CHECK_UPDATES=0
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
 JUNIT_FILE="$RESULTS_DIR/junit.xml"
 TAP_FILE="$RESULTS_DIR/results.tap"
+# shellcheck disable=SC2034  # Reserved for future use
 LOG_FILE="$RESULTS_DIR/test.log"
 
 # Test configuration

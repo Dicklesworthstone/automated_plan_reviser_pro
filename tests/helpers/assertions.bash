@@ -138,8 +138,8 @@ assert_json_field_exists() {
 
     log_test_step "check" "Checking JSON field exists: $path"
 
-    local value
-    value=$(echo "$json" | jq -e "$path" 2>/dev/null) || {
+    # Check if field exists (we don't need the value, just existence check)
+    echo "$json" | jq -e "$path" >/dev/null 2>&1 || {
         log_test_error "JSON field not found: $path"
         fail "Expected JSON field $path to exist"
     }
