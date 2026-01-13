@@ -4434,7 +4434,7 @@ robot_diff() {
     lines_b=$(wc -l < "$file_b" | tr -d ' ')
 
     # Generate unified diff
-    local diff_output diff_stats
+    local diff_output
     diff_output=$(diff -u "$file_b" "$file_a" 2>/dev/null || true)
 
     # Calculate diff stats
