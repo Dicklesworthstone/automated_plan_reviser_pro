@@ -60,10 +60,20 @@ teardown() {
     assert_output "0.50"
 }
 
+@test "format_float: handles leading dot (bc output)" {
+    run format_float ".5"
+    assert_success
+    assert_output "0.50"
+    
+    run format_float ".0"
+    assert_success
+    assert_output "0.00"
+}
+
 @test "format_float: returns '-' for null input" {
     run format_float null
     assert_success
-    assert_output "-"
+    assert_output -- "-"
 }
 
 # =============================================================================

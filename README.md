@@ -113,17 +113,18 @@ apr robot status               # {configured, workflows, oracle_available}
 apr robot workflows            # [{name, description}, ...]
 apr robot init                 # Create .apr/
 apr robot validate <N>         # Pre-flight → {valid, errors[], warnings[]}
-apr robot run <N>              # Execute → {slug, pid, output_file, status}
+apr robot run <N>              # Execute → {slug, pid, output_file, log_file, status}
 apr robot history              # List completed rounds
 apr robot help                 # API docs
 
 Response: {ok, code, data, hint?, meta: {v, ts}}
-Codes: ok | not_configured | not_found | validation_failed | oracle_error
+Codes: ok | not_configured | not_found | validation_failed | oracle_error | dependency_missing | missing_argument | invalid_argument | already_exists | config_error | invalid_option | unknown_command | init_failed
 
 ## Key Paths
 
 .apr/rounds/<workflow>/round_N.md   # ← GPT output (INTEGRATE THIS)
-.apr/rounds/<workflow>/metrics/     # Round analytics data
+.apr/analytics/<workflow>/metrics.json  # Round analytics data
+.apr/logs/oracle_<slug>.log             # Oracle output log (robot mode)
 .apr/workflows/<name>.yaml          # Workflow definition
 .apr/config.yaml                    # Default workflow
 
@@ -517,7 +518,7 @@ Run `apr setup` to launch the interactive wizard:
 
 ```
 ╔════════════════════════════════════════════════════════════╗
-║    Automated Plan Reviser Pro v1.1.0                       ║
+║    Automated Plan Reviser Pro v1.2.0                       ║
 ║    Iterative AI-Powered Spec Refinement                    ║
 ╚════════════════════════════════════════════════════════════╝
 
@@ -914,7 +915,7 @@ All robot mode commands return a consistent JSON envelope:
   "data": { ... },
   "hint": "Optional helpful message for debugging",
   "meta": {
-    "v": "1.1.0",
+    "v": "1.2.0",
     "ts": "2026-01-12T19:14:00Z"
   }
 }
@@ -931,6 +932,12 @@ When errors occur, `ok` becomes `false` and `code` contains a semantic error ide
 | `oracle_error` | Oracle invocation failed |
 | `missing_argument` | Required argument not provided |
 | `dependency_missing` | jq or Oracle not available |
+| `invalid_argument` | Argument provided but invalid |
+| `invalid_option` | Unknown CLI option |
+| `unknown_command` | Unknown robot subcommand |
+| `already_exists` | Refusing to overwrite existing output |
+| `config_error` | Configuration error (e.g. cannot create output dir) |
+| `init_failed` | Failed to initialize `.apr/` |
 
 ### Commands
 
@@ -1064,6 +1071,7 @@ apr robot run 5 --workflow fcp-spec --include-impl
     "slug": "apr-fcp-spec-round-5-with-impl",
     "pid": 12345,
     "output_file": ".apr/rounds/fcp-spec/round_5.md",
+    "log_file": ".apr/logs/oracle_apr-fcp-spec-round-5-with-impl.log",
     "workflow": "fcp-spec",
     "round": 5,
     "include_impl": true,
@@ -1072,7 +1080,7 @@ apr robot run 5 --workflow fcp-spec --include-impl
 }
 ```
 
-The `slug` can be used with `apr attach` to monitor the session. The `output_file` will contain the GPT Pro response once complete.
+The `slug` can be used with `apr attach` to monitor the session. The `output_file` will contain the GPT Pro response once complete, and `log_file` captures Oracle output.
 
 #### `apr robot help`
 
@@ -1144,7 +1152,7 @@ apr update
 The update command:
 
 1. **Fetches the latest version** from GitHub with a 5-second timeout
-2. **Compares versions** using semantic versioning (e.g., `1.1.0 → 1.2.0`)
+2. **Compares versions** using semantic versioning (e.g., `1.2.0 → 1.2.1`)
 3. **Shows what's available** and asks for confirmation
 4. **Downloads the new version** to a temporary location
 5. **Verifies the download** with multiple security checks
@@ -1170,8 +1178,8 @@ Updates always require confirmation:
 ╭────────────────────────────────────────────────────────────╮
 │  UPDATE AVAILABLE                                           │
 │                                                             │
-│  Current version: 1.1.0                                     │
-│  Latest version:  1.2.0                                     │
+│  Current version: 1.2.0                                     │
+│  Latest version:  1.2.1                                     │
 │                                                             │
 │  Install update? [y/N]                                      │
 ╰────────────────────────────────────────────────────────────╯
@@ -1392,9 +1400,14 @@ apr (bash script, ~5000 LOC)
 ├── config.yaml           # Global settings
 ├── workflows/            # Workflow definitions
 │   └── <name>.yaml
+├── analytics/            # Convergence + metrics data
+│   └── <workflow>/
+│       └── metrics.json
 ├── rounds/               # Round outputs
 │   └── <workflow>/
 │       └── round_N.md
+├── logs/                 # Oracle logs (robot mode)
+│   └── oracle_<slug>.log
 └── templates/            # Custom prompt templates
 
 ~/.local/share/apr/ (user data)
@@ -1415,7 +1428,8 @@ override the Oracle prompt. If omitted, APR uses the built-in default prompt.
 | `.apr/config.yaml` | Global APR config for this project |
 | `.apr/workflows/*.yaml` | Workflow definitions |
 | `.apr/rounds/<workflow>/` | GPT Pro outputs per round |
-| `.apr/rounds/<workflow>/metrics/` | Round analytics data |
+| `.apr/analytics/<workflow>/metrics.json` | Round analytics data |
+| `.apr/logs/oracle_<slug>.log` | Oracle output log (robot mode) |
 
 ---
 
@@ -1504,7 +1518,7 @@ APR uses [gum](https://github.com/charmbracelet/gum) for beautiful terminal outp
 
 ```
 ╔════════════════════════════════════════════════════════════╗
-║    Automated Plan Reviser Pro v1.1.0                       ║
+║    Automated Plan Reviser Pro v1.2.0                       ║
 ║    Iterative AI-Powered Spec Refinement                    ║
 ╚════════════════════════════════════════════════════════════╝
 

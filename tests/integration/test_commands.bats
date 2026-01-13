@@ -362,6 +362,16 @@ teardown() {
     [[ -f ".apr/analytics/backfill-test/metrics.json" ]]
 }
 
+@test "apr backfill: rejects invalid workflow argument (positional)" {
+    capture_streams "$APR_SCRIPT" backfill "../oops"
+
+    log_test_actual "exit code" "$CAPTURED_STATUS"
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STATUS" -eq 2 ]]
+    [[ "$CAPTURED_STDERR" == *"Invalid workflow name"* ]]
+}
+
 @test "apr backfill: --all processes all workflows" {
     setup_test_workflow "workflow-a"
     setup_test_workflow "workflow-b"
@@ -431,6 +441,18 @@ teardown() {
     log_test_actual "stderr" "$CAPTURED_STDERR"
 
     [[ "$CAPTURED_STDERR" == *"Mock Oracle called with: status --hours 12"* ]]
+}
+
+@test "apr status: rejects non-numeric hours" {
+    setup_mock_oracle
+
+    capture_streams "$APR_SCRIPT" status --hours foo
+
+    log_test_actual "exit code" "$CAPTURED_STATUS"
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STATUS" -eq 2 ]]
+    [[ "$CAPTURED_STDERR" == *"requires a non-negative integer"* ]]
 }
 
 @test "apr attach: calls oracle session with --render" {

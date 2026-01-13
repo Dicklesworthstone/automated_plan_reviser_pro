@@ -125,12 +125,15 @@ cleanup_temp() {
     release_lock 2>/dev/null || true
     # Remove temp directory
     if [[ -n "$APR_TEMP_DIR" && -d "$APR_TEMP_DIR" ]]; then
-        rm -rf "$APR_TEMP_DIR"
+        rm -rf -- "$APR_TEMP_DIR"
     fi
 }
 
-# Set trap for cleanup on exit/interrupt
-trap cleanup_temp EXIT INT TERM
+# Set trap for cleanup on exit/interrupt.
+# Important: avoid clobbering caller traps when this file is sourced (e.g. unit tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap cleanup_temp EXIT INT TERM
+fi
 
 # Lock file path (set when acquired)
 APR_LOCK_FILE=""
@@ -145,33 +148,41 @@ acquire_lock() {
     local lock_dir="$CONFIG_DIR/.locks"
     mkdir -p "$lock_dir" 2>/dev/null
 
-    APR_LOCK_FILE="$lock_dir/${workflow}_round_${round}.lock"
+    local lock_path="$lock_dir/${workflow}_round_${round}.lock"
 
     # Use flock if available (preferred - atomic and robust)
     if command -v flock &>/dev/null; then
-        exec {APR_LOCK_FD}>"$APR_LOCK_FILE"
+        # Open file descriptor
+        exec {APR_LOCK_FD}>"$lock_path"
         if ! flock -n "$APR_LOCK_FD"; then
+            # Failed to acquire: close FD and return
+            exec {APR_LOCK_FD}>&-
+            APR_LOCK_FD=""
             return 1
         fi
+        # Success: write PID and set global path
         echo "$$" >&"$APR_LOCK_FD"
+        APR_LOCK_FILE="$lock_path"
     else
         # Fallback: simple file-based locking
         # Try atomic creation first (noclobber)
-        if (set -C; echo "$$" > "$APR_LOCK_FILE") 2>/dev/null; then
+        if (set -C; echo "$$" > "$lock_path") 2>/dev/null; then
+            APR_LOCK_FILE="$lock_path"
             return 0
         fi
 
         # File exists - check if stale
         local pid
-        pid=$(cat "$APR_LOCK_FILE" 2>/dev/null || echo "")
+        pid=$(cat "$lock_path" 2>/dev/null || echo "")
         # Check if the process is still running
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             return 1
         fi
         
         # Stale lock file - remove and retry once
-        rm -f "$APR_LOCK_FILE"
-        if (set -C; echo "$$" > "$APR_LOCK_FILE") 2>/dev/null; then
+        rm -f "$lock_path"
+        if (set -C; echo "$$" > "$lock_path") 2>/dev/null; then
+            APR_LOCK_FILE="$lock_path"
             return 0
         fi
         return 1
@@ -233,6 +244,14 @@ can_prompt() {
 # ISO8601 timestamp (UTC)
 iso_timestamp() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+is_non_negative_int() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+is_valid_workflow_name() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]
 }
 
 # -----------------------------------------------------------------------------
@@ -306,6 +325,12 @@ cmd_update() {
         exit $EXIT_NETWORK_ERROR
     fi
 
+    # Basic sanity check: remote version must be a safe semver-like token (no spaces, slashes, etc.).
+    if [[ ! "$remote_version" =~ ^[0-9]+(\\.[0-9]+)*([A-Za-z0-9._-]+)?$ ]]; then
+        print_error "Remote version string is invalid: '$remote_version'"
+        exit $EXIT_UPDATE_ERROR
+    fi
+
     if [[ "$remote_version" == "$VERSION" ]]; then
         print_success "Already up to date (v${VERSION})"
         exit $EXIT_SUCCESS
@@ -328,7 +353,7 @@ cmd_update() {
     fi
 
     # Create temp directory (uses global for cleanup trap)
-    APR_TEMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t apr 2>/dev/null)
+    APR_TEMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t apr 2>/dev/null || echo "")
     if [[ -z "$APR_TEMP_DIR" || ! -d "$APR_TEMP_DIR" ]]; then
         print_error "Failed to create temp directory"
         exit $EXIT_UPDATE_ERROR
@@ -353,7 +378,7 @@ cmd_update() {
 
     if [[ ! -s "$tmp_dir/apr" ]]; then
         print_error "Failed to download update"
-        rm -rf "$tmp_dir"
+        rm -rf -- "$tmp_dir"
         exit $EXIT_UPDATE_ERROR
     fi
 
@@ -364,7 +389,17 @@ cmd_update() {
     if [[ ! "$first_line" =~ ^#!.*bash ]]; then
         print_error "Downloaded file is not a valid apr script"
         print_dim "Expected bash shebang, got: $first_line"
-        rm -rf "$tmp_dir"
+        rm -rf -- "$tmp_dir"
+        exit $EXIT_UPDATE_ERROR
+    fi
+
+    # Syntax check (security + reliability): ensure the downloaded script parses as bash.
+    local syntax_err=""
+    if ! bash -n "$tmp_dir/apr" 2>/dev/null; then
+        syntax_err=$(bash -n "$tmp_dir/apr" 2>&1 || true)
+        print_error "Downloaded file failed bash syntax check"
+        [[ -n "$syntax_err" ]] && print_dim "$syntax_err"
+        rm -rf -- "$tmp_dir"
         exit $EXIT_UPDATE_ERROR
     fi
 
@@ -378,6 +413,9 @@ cmd_update() {
     fi
     # Extract just the hash (first field if space-separated, otherwise whole string)
     expected_checksum=$(echo "$raw_checksum" | awk '{print $1}' | tr -d '[:space:]')
+    if [[ -n "$expected_checksum" && ! "$expected_checksum" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+        expected_checksum=""
+    fi
 
     if [[ -n "$expected_checksum" ]]; then
         print_info "Verifying checksum..."
@@ -392,7 +430,7 @@ cmd_update() {
             print_error "Checksum verification failed!"
             print_error "Expected: $expected_checksum"
             print_error "Got:      $actual_checksum"
-            rm -rf "$tmp_dir"
+            rm -rf -- "$tmp_dir"
             exit $EXIT_UPDATE_ERROR
         fi
         print_success "Checksum verified"
@@ -400,9 +438,26 @@ cmd_update() {
         print_warning "Checksum not available (installing from main branch)"
     fi
 
-    # Find where we're installed
+    # Find where we're installed.
+    # Note: when invoked via $PATH, $0/BASH_SOURCE[0] may be just "apr" (no slash),
+    # so we must resolve via `command -v` first.
     local script_path="${BASH_SOURCE[0]}"
+    if [[ "$script_path" != /* ]]; then
+        if [[ "$script_path" == */* ]]; then
+            local script_dir=""
+            script_dir=$(cd "$(dirname "$script_path")" 2>/dev/null && pwd) || script_dir=""
+            [[ -n "$script_dir" ]] && script_path="$script_dir/$(basename "$script_path")"
+        else
+            script_path=$(command -v -- "$script_path" 2>/dev/null || echo "$script_path")
+        fi
+    fi
     script_path=$(realpath "$script_path" 2>/dev/null || readlink -f "$script_path" 2>/dev/null || echo "$script_path")
+    if [[ -z "$script_path" || ! -e "$script_path" ]]; then
+        print_error "Cannot determine apr install path for update"
+        print_info "Try running update via the full path to apr, or reinstall via install.sh"
+        rm -rf -- "$tmp_dir"
+        exit $EXIT_UPDATE_ERROR
+    fi
 
     # Install update
     print_info "Installing to $script_path..."
@@ -414,105 +469,30 @@ cmd_update() {
         sudo mv "$tmp_dir/apr" "$script_path"
     else
         print_error "Cannot write to $script_path (try running with sudo)"
-        rm -rf "$tmp_dir"
+        rm -rf -- "$tmp_dir"
         exit $EXIT_UPDATE_ERROR
     fi
 
-    rm -rf "$tmp_dir"
+    rm -rf -- "$tmp_dir"
     APR_TEMP_DIR=""  # Clear for trap
     print_success "Updated to v${remote_version}!"
 }
 
 # -----------------------------------------------------------------------------
-# Gum Installation & Detection
+# Gum Detection
 # -----------------------------------------------------------------------------
-
-try_install_gum() {
-    local os="unknown"
-    case "$(uname -s)" in
-        Darwin*) os="macos" ;;
-        Linux*)  os="linux" ;;
-    esac
-
-    case "$os" in
-        macos)
-            if command -v brew &> /dev/null; then
-                brew install gum &>/dev/null && return 0
-            fi
-            ;;
-        linux)
-            if command -v apt-get &> /dev/null; then
-                (
-                    sudo mkdir -p /etc/apt/keyrings 2>/dev/null
-                    curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg 2>/dev/null
-                    echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list >/dev/null
-                    sudo apt-get update -qq && sudo apt-get install -y -qq gum
-                ) &>/dev/null && return 0
-            elif command -v dnf &> /dev/null; then
-                (
-                    echo '[charm]
-name=Charm
-baseurl=https://repo.charm.sh/yum/
-enabled=1
-gpgcheck=1
-gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo >/dev/null
-                    sudo dnf install -y gum
-                ) &>/dev/null && return 0
-            elif command -v pacman &> /dev/null; then
-                sudo pacman -S --noconfirm gum &>/dev/null && return 0
-            fi
-
-            # Fallback: GitHub releases
-            local arch
-            arch=$(uname -m)
-            case "$arch" in
-                x86_64) arch="amd64" ;;
-                aarch64|arm64) arch="arm64" ;;
-                *) return 1 ;;
-            esac
-
-            local tmp_dir gum_version="0.14.5"
-            tmp_dir=$(mktemp -d)
-            local gum_url="https://github.com/charmbracelet/gum/releases/download/v${gum_version}/gum_${gum_version}_Linux_${arch}.tar.gz"
-
-            (
-                cd "$tmp_dir"
-                curl -fsSL "$gum_url" -o gum.tar.gz
-                tar -xzf gum.tar.gz
-                sudo mv gum /usr/local/bin/gum 2>/dev/null || {
-                    mkdir -p ~/.local/bin
-                    mv gum ~/.local/bin/gum
-                }
-            ) &>/dev/null && rm -rf "$tmp_dir" && return 0
-
-            rm -rf "$tmp_dir"
-            ;;
-    esac
-
-    return 1
-}
 
 check_gum() {
     # Respect APR_NO_GUM
     [[ -n "${APR_NO_GUM:-}" ]] && return 1
+    # Suppress gum in CI / non-interactive environments (stream-safe output)
+    [[ -n "${CI:-}" ]] && return 1
+    [[ -n "${NO_COLOR:-}" ]] && return 1
+    [[ -t 2 ]] || return 1
 
     if command -v gum &> /dev/null; then
         GUM_AVAILABLE=true
         return 0
-    fi
-
-    # Only try to install if interactive and not in CI
-    # Check stderr (-t 2) since APR outputs to stderr
-    if [[ -t 2 && -z "${CI:-}" ]]; then
-        if try_install_gum; then
-            if [[ -x "${HOME}/.local/bin/gum" && ":$PATH:" != *":${HOME}/.local/bin:"* ]]; then
-                export PATH="${HOME}/.local/bin:${PATH}"
-            fi
-            if command -v gum &> /dev/null; then
-                GUM_AVAILABLE=true
-                return 0
-            fi
-        fi
     fi
 
     return 1
@@ -629,6 +609,16 @@ preflight_check() {
 MAX_RETRY_ATTEMPTS="${APR_MAX_RETRIES:-3}"
 # Initial backoff in seconds
 INITIAL_BACKOFF="${APR_INITIAL_BACKOFF:-10}"
+
+# Validate retry configuration to avoid integer-comparison crashes when env vars are invalid.
+# - MAX_RETRY_ATTEMPTS must be >= 1
+# - INITIAL_BACKOFF may be 0 (useful for tests / instant retries)
+if ! is_non_negative_int "$MAX_RETRY_ATTEMPTS" || [[ "$MAX_RETRY_ATTEMPTS" -lt 1 ]]; then
+    MAX_RETRY_ATTEMPTS=3
+fi
+if ! is_non_negative_int "$INITIAL_BACKOFF"; then
+    INITIAL_BACKOFF=10
+fi
 
 # Run Oracle with auto-retry on transient failures
 # Usage: run_oracle_with_retry oracle_args...
@@ -1517,8 +1507,9 @@ metrics_write_convergence() {
 metrics_write_atomic() {
     local workflow="$1"
     local json_input="$2"
-    local metrics_path
+    local metrics_path metrics_dir_path
     metrics_path=$(metrics_file_path "$workflow")
+    metrics_dir_path=$(metrics_dir "$workflow")
 
     if ! command -v jq &>/dev/null; then
         print_error "jq is required for analytics metrics"
@@ -1530,17 +1521,26 @@ metrics_write_atomic() {
         return 1
     fi
 
-    mkdir -p "$(metrics_dir "$workflow")"
+    mkdir -p "$metrics_dir_path"
 
     local tmp_file=""
-    tmp_file=$(mktemp 2>/dev/null || mktemp -t apr_metrics 2>/dev/null || echo "")
+    tmp_file=$(mktemp -p "$metrics_dir_path" "metrics.json.tmp.XXXXXX" 2>/dev/null \
+        || mktemp "${metrics_dir_path}/metrics.json.tmp.XXXXXX" 2>/dev/null \
+        || echo "")
     if [[ -z "$tmp_file" ]]; then
         print_error "Failed to create temporary file for metrics"
         return 1
     fi
 
-    printf '%s\n' "$json_input" > "$tmp_file"
-    mv "$tmp_file" "$metrics_path"
+    if ! printf '%s\n' "$json_input" > "$tmp_file"; then
+        print_error "Failed to write metrics temp file"
+        return 1
+    fi
+
+    if ! mv -f "$tmp_file" "$metrics_path"; then
+        print_error "Failed to move metrics temp file into place"
+        return 1
+    fi
     verbose "Wrote metrics to $metrics_path"
 }
 
@@ -1920,6 +1920,14 @@ calculate_change_velocity_signal() {
 
     verbose "Calculating change velocity signal"
 
+    # Require enough rounds for a meaningful velocity signal.
+    local round_count
+    round_count=$(echo "$metrics_json" | jq -r '.rounds | length' 2>/dev/null || echo "0")
+    if [[ "$round_count" -lt 3 ]]; then
+        echo "0"
+        return 0
+    fi
+
     local ratios=()
     mapfile -t ratios < <(echo "$metrics_json" | jq -r '.rounds[-5:][].changes_from_previous.diff_ratio // 1.0' 2>/dev/null || true)
 
@@ -1966,6 +1974,14 @@ calculate_similarity_trend_signal() {
     local metrics_json="$1"
 
     verbose "Calculating similarity trend signal"
+
+    # Require enough rounds for a meaningful similarity trend.
+    local round_count
+    round_count=$(echo "$metrics_json" | jq -r '.rounds | length' 2>/dev/null || echo "0")
+    if [[ "$round_count" -lt 3 ]]; then
+        echo "0"
+        return 0
+    fi
 
     local sims=()
     mapfile -t sims < <(echo "$metrics_json" | jq -r '.rounds[-5:][].changes_from_previous.similarity_score // 0' 2>/dev/null || true)
@@ -2047,6 +2063,7 @@ calculate_convergence() {
     if [[ "$round_count" -lt 3 ]]; then
         verbose "Insufficient rounds for convergence analysis (need >= 3)"
         jq -nc '{
+            reason: "insufficient_rounds",
             detected: false,
             confidence: 0.0,
             estimated_rounds_remaining: null,
@@ -2148,9 +2165,9 @@ run_setup() {
     local workflow_name
     while true; do
         workflow_name=$(input "Workflow name" "default")
-        # Validate: alphanumeric, hyphens, underscores only
-        if [[ ! "$workflow_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-            print_error "Invalid name: use only letters, numbers, hyphens, underscores"
+        # Validate: safe filename segment (no slashes/spaces)
+        if ! is_valid_workflow_name "$workflow_name"; then
+            print_error "Invalid name: use only letters, numbers, dots, hyphens, underscores"
             continue
         fi
         # Check for existing workflow
@@ -2334,11 +2351,12 @@ run_round() {
     [[ -z "$model" ]] && config_errors+=("Model not configured in workflow")
     [[ -z "$output_dir" ]] && config_errors+=("Output directory not configured in workflow")
     if [[ ${#config_errors[@]} -gt 0 ]]; then
-        local errors_json
-        errors_json=$(printf '%s\n' "${config_errors[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
-        robot_json false "validation_failed" "$(jq -nc --argjson errors "$errors_json" '{errors: $errors}')" \
-            "Fix workflow configuration before running"
-        return 1
+        local err
+        for err in "${config_errors[@]}"; do
+            print_error "$err"
+        done
+        print_info "Fix workflow configuration in $config_path"
+        exit $EXIT_CONFIG_ERROR
     fi
 
     verbose "Config parsed:"
@@ -2636,7 +2654,11 @@ run_round() {
             exit $oracle_exit
         fi
     else
-        "${ORACLE_CMD[@]}" "${oracle_args[@]}" &
+        if [[ "$enable_retry" == "true" ]]; then
+            run_oracle_with_retry "${oracle_args[@]}" &
+        else
+            "${ORACLE_CMD[@]}" "${oracle_args[@]}" &
+        fi
         local oracle_pid=$!
 
         # Brief delay to verify process started
@@ -2715,6 +2737,9 @@ run_round() {
 show_status() {
     print_banner
     print_header "ORACLE SESSION STATUS"
+    if ! is_non_negative_int "${STATUS_HOURS:-}"; then
+        STATUS_HOURS=72
+    fi
     print_info "Showing sessions from last ${STATUS_HOURS}h"
     echo "" >&2
     "${ORACLE_CMD[@]}" status --hours "$STATUS_HOURS"
@@ -2912,11 +2937,11 @@ show_round() {
 # -----------------------------------------------------------------------------
 
 diff_rounds() {
-    local round_a="$1"
-    local round_b="${2:-}"
+    local arg1="$1"
+    local arg2="${2:-}"
     local workflow="${WORKFLOW:-default}"
 
-    verbose "diff_rounds: round_a=$round_a round_b=${round_b:-<auto>} workflow=$workflow"
+    verbose "diff_rounds: arg1=$arg1 arg2=${arg2:-<none>} workflow=$workflow"
 
     # Verify workflow exists
     local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
@@ -2927,41 +2952,49 @@ diff_rounds() {
     fi
 
     local rounds_dir="$CONFIG_DIR/rounds/$workflow"
+    local round_old
+    local round_new
 
-    # If only one round given, compare with previous
-    if [[ -z "$round_b" ]]; then
-        if [[ "$round_a" -le 1 ]]; then
+    # Argument normalization
+    # Case 1: apr diff 5       -> old=4, new=5
+    # Case 2: apr diff 3 5     -> old=3, new=5 (Standard diff order)
+    if [[ -z "$arg2" ]]; then
+        round_new="$arg1"
+        if [[ "$round_new" -le 1 ]]; then
             print_error "Round 1 has no previous round to compare with"
-            print_info "Usage: apr diff <round_a> <round_b>"
+            print_info "Usage: apr diff <round>"
             exit $EXIT_USAGE_ERROR
         fi
-        round_b=$((round_a - 1))
-        verbose "Auto-selected round_b=$round_b (previous round)"
+        round_old=$((round_new - 1))
+        verbose "Auto-selected round_old=$round_old (previous round)"
+    else
+        round_old="$arg1"
+        round_new="$arg2"
     fi
 
-    local file_a="$rounds_dir/round_${round_a}.md"
-    local file_b="$rounds_dir/round_${round_b}.md"
+    local file_old="$rounds_dir/round_${round_old}.md"
+    local file_new="$rounds_dir/round_${round_new}.md"
 
     # Validate both files exist
-    if [[ ! -f "$file_a" ]]; then
-        print_error "Round $round_a not found for workflow '$workflow'"
+    if [[ ! -f "$file_old" ]]; then
+        print_error "Round $round_old not found for workflow '$workflow'"
         print_info "Run 'apr history' to see available rounds"
         exit $EXIT_CONFIG_ERROR
     fi
-    if [[ ! -f "$file_b" ]]; then
-        print_error "Round $round_b not found for workflow '$workflow'"
+    if [[ ! -f "$file_new" ]]; then
+        print_error "Round $round_new not found for workflow '$workflow'"
         print_info "Run 'apr history' to see available rounds"
         exit $EXIT_CONFIG_ERROR
     fi
 
-    local size_a size_b
-    size_a=$(du -h "$file_a" 2>/dev/null | cut -f1)
-    size_b=$(du -h "$file_b" 2>/dev/null | cut -f1)
+    local size_old size_new
+    size_old=$(du -h "$file_old" 2>/dev/null | cut -f1)
+    size_new=$(du -h "$file_new" 2>/dev/null | cut -f1)
 
     print_banner
-    print_header "ROUND COMPARISON: $round_b → $round_a"
+    print_header "ROUND COMPARISON: $round_old → $round_new"
     echo "" >&2
-    print_info "Comparing Round $round_b ($size_b) with Round $round_a ($size_a)"
+    print_info "Comparing Round $round_old ($size_old) with Round $round_new ($size_new)"
     echo "" >&2
 
     # Use delta if available (beautiful diff), otherwise fall back to diff
@@ -2969,21 +3002,21 @@ diff_rounds() {
     # script exit with set -euo pipefail. Exit code 2 indicates an actual error.
     if command -v delta &>/dev/null; then
         verbose "Using delta for diff"
-        delta --side-by-side "$file_b" "$file_a" || true
+        delta --side-by-side "$file_old" "$file_new" || true
     elif command -v diff &>/dev/null; then
         verbose "Using diff (delta not available)"
         # Use colored diff if terminal supports it
         if [[ -t 1 ]] && diff --color=auto /dev/null /dev/null 2>/dev/null; then
             if command -v less &>/dev/null; then
-                diff --color=auto -u "$file_b" "$file_a" | less -R || true
+                diff --color=auto -u "$file_old" "$file_new" | less -R || true
             else
-                diff --color=auto -u "$file_b" "$file_a" || true
+                diff --color=auto -u "$file_old" "$file_new" || true
             fi
         else
             if [[ -t 1 ]] && command -v less &>/dev/null; then
-                diff -u "$file_b" "$file_a" | less || true
+                diff -u "$file_old" "$file_new" | less || true
             else
-                diff -u "$file_b" "$file_a" || true
+                diff -u "$file_old" "$file_new" || true
             fi
         fi
     else
@@ -3152,6 +3185,10 @@ format_float() {
     if [[ -z "$value" || "$value" == "null" ]]; then
         echo "-"
         return 0
+    fi
+    # Prepend 0 if value starts with .
+    if [[ "$value" == .* ]]; then
+        value="0$value"
     fi
     if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         printf "%.2f" "$value"
@@ -3833,7 +3870,15 @@ dashboard_iso_to_epoch() {
 
 dashboard_format_duration() {
     local seconds="${1:-0}"
-    if [[ -z "$seconds" || "$seconds" == "null" || "$seconds" -lt 0 ]]; then
+    if [[ "$seconds" == "null" ]]; then
+        echo "N/A"
+        return 0
+    fi
+    if [[ ! "$seconds" =~ ^-?[0-9]+$ ]]; then
+        echo "N/A"
+        return 0
+    fi
+    if (( seconds < 0 )); then
         echo "N/A"
         return 0
     fi
@@ -4215,6 +4260,11 @@ show_dashboard() {
 
 cmd_backfill() {
     local workflow_arg="${1:-}"
+    if [[ -n "$workflow_arg" ]] && ! is_valid_workflow_name "$workflow_arg"; then
+        print_error "Invalid workflow name: $workflow_arg"
+        print_info "Use only letters, numbers, dots, hyphens, underscores"
+        exit $EXIT_USAGE_ERROR
+    fi
     local workflow="${workflow_arg:-${WORKFLOW:-default}}"
     local force="${BACKFILL_FORCE:-false}"
     local dry_run="${DRY_RUN:-false}"
@@ -4541,22 +4591,23 @@ robot_init() {
 # Robot: Validate - Pre-run validation
 robot_validate() {
     local round_num="${1:-}"
+    local workflow="${WORKFLOW:-default}"
     local errors=()
     local warnings=()
 
     if [[ -z "$round_num" ]]; then
         errors+=("Round number required")
-    elif ! [[ "$round_num" =~ ^[0-9]+$ ]]; then
-        errors+=("Round must be a positive integer")
+    elif ! is_non_negative_int "$round_num"; then
+        errors+=("Round must be a non-negative integer")
     fi
 
     if [[ ! -d "$CONFIG_DIR" ]]; then
         errors+=("Not initialized - run 'apr robot init'")
     fi
 
-    local wf_file="$CONFIG_DIR/workflows/${WORKFLOW}.yaml"
+    local wf_file="$CONFIG_DIR/workflows/${workflow}.yaml"
     if [[ ! -f "$wf_file" ]]; then
-        errors+=("Workflow '$WORKFLOW' not found")
+        errors+=("Workflow '$workflow' not found")
     else
         # Check required documents exist
         local readme spec model output_dir
@@ -4585,9 +4636,9 @@ robot_validate() {
     fi
 
     # Check for previous round if not round 1
-    if [[ "$round_num" =~ ^[0-9]+$ ]] && [[ "$round_num" -gt 1 ]]; then
+    if is_non_negative_int "$round_num" && [[ "$round_num" -gt 1 ]]; then
         local prev=$((round_num - 1))
-        local prev_file="$CONFIG_DIR/rounds/$WORKFLOW/round_${prev}.md"
+        local prev_file="$CONFIG_DIR/rounds/$workflow/round_${prev}.md"
         if [[ ! -f "$prev_file" ]]; then
             warnings+=("Previous round $prev not found - starting fresh?")
         fi
@@ -4605,7 +4656,7 @@ robot_validate() {
         --argjson valid "$valid" \
         --argjson errors "$errors_json" \
         --argjson warnings "$warnings_json" \
-        --arg workflow "$WORKFLOW" \
+        --arg workflow "$workflow" \
         --arg round "$round_num" \
         '{valid: $valid, errors: $errors, warnings: $warnings, workflow: $workflow, round: $round}')
 
@@ -4620,9 +4671,10 @@ robot_validate() {
 # Robot: Run - Execute a revision round
 robot_run() {
     local round_num="${1:-}"
+    local workflow="${WORKFLOW:-default}"
     local include_impl="${INCLUDE_IMPL:-false}"
 
-    verbose "robot_run: round=$round_num workflow=$WORKFLOW include_impl=$include_impl"
+    verbose "robot_run: round=$round_num workflow=$workflow include_impl=$include_impl"
 
     # First validate
     if [[ -z "$round_num" ]]; then
@@ -4630,8 +4682,8 @@ robot_run() {
         return 1
     fi
 
-    if ! [[ "$round_num" =~ ^[0-9]+$ ]]; then
-        robot_json false "invalid_argument" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" "Round must be a number"
+    if ! is_non_negative_int "$round_num"; then
+        robot_json false "invalid_argument" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" "Round must be a non-negative integer"
         return 1
     fi
 
@@ -4642,9 +4694,9 @@ robot_run() {
     fi
 
     # Load workflow config
-    local config_path="$CONFIG_DIR/workflows/$WORKFLOW.yaml"
+    local config_path="$CONFIG_DIR/workflows/$workflow.yaml"
     if [[ ! -f "$config_path" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg wf "$WORKFLOW" '{resource: "workflow", name: $wf}')" "Workflow not found"
+        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "workflow", name: $wf}')" "Workflow not found"
         return 1
     fi
 
@@ -4655,6 +4707,15 @@ robot_run() {
     impl_path=$(yaml_unquote "$(get_config_value "implementation" "$config_path")")
     model=$(yaml_unquote "$(get_config_value "model" "$config_path")")
     output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$config_path")")
+
+    if [[ -z "$model" ]]; then
+        robot_json false "validation_failed" '{"errors":["Model not configured in workflow"]}' "Fix workflow configuration"
+        return 1
+    fi
+    if [[ -z "$output_dir" ]]; then
+        robot_json false "validation_failed" '{"errors":["Output directory not configured in workflow"]}' "Fix workflow configuration"
+        return 1
+    fi
 
     # Validate required files
     if [[ ! -f "$readme_path" ]]; then
@@ -4673,11 +4734,17 @@ robot_run() {
     fi
 
     # Build session info
-    local slug="apr-${WORKFLOW}-round-${round_num}"
+    local slug="apr-${workflow}-round-${round_num}"
     local output_file="${output_dir}/round_${round_num}.md"
 
     if [[ "$include_impl" == "true" && -n "$impl_path" ]]; then
         slug="${slug}-with-impl"
+    fi
+
+    # Check if output file already exists (Robot mode safety)
+    if [[ -f "$output_file" ]]; then
+        robot_json false "already_exists" "$(jq -nc --arg path "$output_file" '{file: $path}')" "Output file already exists"
+        return 1
     fi
 
     # Build file arguments
@@ -4690,9 +4757,18 @@ robot_run() {
     # Build prompt using shared function
     local prompt
     prompt=$(build_revision_prompt "$include_impl" "$config_path")
+    if [[ -z "$prompt" ]]; then
+        robot_json false "validation_failed" '{"errors":["Prompt template is empty"]}' \
+            "Add 'template' or 'template_with_impl' to workflow"
+        return 1
+    fi
 
     # Create output directory
-    mkdir -p "$(dirname "$output_file")" 2>/dev/null
+    if ! mkdir -p "$(dirname "$output_file")" 2>/dev/null; then
+        robot_json false "config_error" "$(jq -nc --arg dir "$(dirname "$output_file")" '{directory: $dir}')" \
+            "Failed to create output directory"
+        return 1
+    fi
 
     # Build Oracle command
     local oracle_args=(
@@ -4710,9 +4786,25 @@ robot_run() {
     verbose "robot_run Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
     verbose "robot_run output_file: $output_file"
 
-    # Execute in background
-    "${ORACLE_CMD[@]}" "${oracle_args[@]}" &
+    # Execute in background (always use retry for reliability in robot mode).
+    # Important: robot mode must keep output clean; capture all Oracle/retry output to a log file.
+    local logs_dir="$CONFIG_DIR/logs"
+    local oracle_log="/dev/null"
+    if mkdir -p "$logs_dir" 2>/dev/null; then
+        oracle_log="$logs_dir/oracle_${slug}.log"
+    fi
+
+    run_oracle_with_retry "${oracle_args[@]}" >"$oracle_log" 2>&1 &
     local oracle_pid=$!
+
+    # Brief delay to verify process started
+    sleep 0.5
+
+    # Verify the process is actually running
+    if ! kill -0 "$oracle_pid" 2>/dev/null; then
+        robot_json false "oracle_error" '{"reason":"process_start_failed"}' "Oracle process failed to start immediately"
+        return 1
+    fi
 
     # Return session info
     local data
@@ -4720,13 +4812,15 @@ robot_run() {
         --arg slug "$slug" \
         --argjson pid "$oracle_pid" \
         --arg output_file "$output_file" \
-        --arg workflow "$WORKFLOW" \
+        --arg log_file "$oracle_log" \
+        --arg workflow "$workflow" \
         --arg round "$round_num" \
         --argjson include_impl "$include_impl" \
         '{
             slug: $slug,
             pid: $pid,
             output_file: $output_file,
+            log_file: $log_file,
             workflow: $workflow,
             round: ($round | tonumber),
             include_impl: $include_impl,
@@ -4738,10 +4832,11 @@ robot_run() {
 
 # Robot: History - List revision rounds
 robot_history() {
-    local rounds_dir="$CONFIG_DIR/rounds/$WORKFLOW"
+    local workflow="${WORKFLOW:-default}"
+    local rounds_dir="$CONFIG_DIR/rounds/$workflow"
 
     if [[ ! -d "$rounds_dir" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg wf "$WORKFLOW" '{resource: "rounds", workflow: $wf}')" "No rounds found for workflow"
+        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "rounds", workflow: $wf}')" "No rounds found for workflow"
         return 1
     fi
 
@@ -4780,7 +4875,7 @@ robot_history() {
 
     local data
     data=$(jq -nc \
-        --arg workflow "$WORKFLOW" \
+        --arg workflow "$workflow" \
         --argjson count "${#rounds[@]}" \
         --argjson rounds "$rounds_json" \
         '{workflow: $workflow, count: $count, rounds: $rounds}')
@@ -4836,6 +4931,11 @@ robot_show() {
         robot_json false "missing_argument" '{"argument":"round"}' "Round number required"
         return 1
     fi
+    if ! is_non_negative_int "$round_num"; then
+        robot_json false "invalid_argument" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" \
+            "Round must be a non-negative integer"
+        return 1
+    fi
 
     # Verify workflow exists
     local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
@@ -4885,12 +4985,22 @@ robot_show() {
 
 # Robot: Diff - Compare two rounds
 robot_diff() {
-    local round_a="${1:-}"
-    local round_b="${2:-}"
+    local arg1="${1:-}"
+    local arg2="${2:-}"
     local workflow="${WORKFLOW:-default}"
 
-    if [[ -z "$round_a" ]]; then
+    if [[ -z "$arg1" ]]; then
         robot_json false "missing_argument" '{"argument":"round_a"}' "At least one round number required"
+        return 1
+    fi
+    if ! is_non_negative_int "$arg1"; then
+        robot_json false "invalid_argument" "$(jq -nc --arg round "$arg1" '{argument: "round_a", value: $round}')" \
+            "Round must be a non-negative integer"
+        return 1
+    fi
+    if [[ -n "$arg2" ]] && ! is_non_negative_int "$arg2"; then
+        robot_json false "invalid_argument" "$(jq -nc --arg round "$arg2" '{argument: "round_b", value: $round}')" \
+            "Round must be a non-negative integer"
         return 1
     fi
 
@@ -4902,62 +5012,73 @@ robot_diff() {
     fi
 
     local rounds_dir="$CONFIG_DIR/rounds/$workflow"
+    local round_old
+    local round_new
 
-    # If only one round given, compare with previous
-    if [[ -z "$round_b" ]]; then
-        if [[ "$round_a" -le 1 ]]; then
+    # Argument normalization
+    if [[ -z "$arg2" ]]; then
+        round_new="$arg1"
+        if [[ "$round_new" -le 1 ]]; then
             robot_json false "invalid_argument" '{"argument":"round_a","reason":"no_previous"}' "Round 1 has no previous round to compare with"
             return 1
         fi
-        round_b=$((round_a - 1))
+        round_old=$((round_new - 1))
+    else
+        round_old="$arg1"
+        round_new="$arg2"
+        if [[ "$round_old" -gt "$round_new" ]]; then
+            local tmp="$round_old"
+            round_old="$round_new"
+            round_new="$tmp"
+        fi
     fi
 
-    local file_a="$rounds_dir/round_${round_a}.md"
-    local file_b="$rounds_dir/round_${round_b}.md"
+    local file_old="$rounds_dir/round_${round_old}.md"
+    local file_new="$rounds_dir/round_${round_new}.md"
 
-    if [[ ! -f "$file_a" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg r "$round_a" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round $round_a not found"
+    if [[ ! -f "$file_old" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg r "$round_old" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round $round_old not found"
         return 1
     fi
-    if [[ ! -f "$file_b" ]]; then
-        robot_json false "not_found" "$(jq -nc --arg r "$round_b" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round $round_b not found"
+    if [[ ! -f "$file_new" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg r "$round_new" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round $round_new not found"
         return 1
     fi
 
     # Get file stats
-    local size_a size_b lines_a lines_b
-    size_a=$(stat -c %s "$file_a" 2>/dev/null || stat -f %z "$file_a" 2>/dev/null || echo "0")
-    size_b=$(stat -c %s "$file_b" 2>/dev/null || stat -f %z "$file_b" 2>/dev/null || echo "0")
-    lines_a=$(wc -l < "$file_a" | tr -d ' ')
-    lines_b=$(wc -l < "$file_b" | tr -d ' ')
+    local size_old size_new lines_old lines_new
+    size_old=$(stat -c %s "$file_old" 2>/dev/null || stat -f %z "$file_old" 2>/dev/null || echo "0")
+    size_new=$(stat -c %s "$file_new" 2>/dev/null || stat -f %z "$file_new" 2>/dev/null || echo "0")
+    lines_old=$(wc -l < "$file_old" | tr -d ' ')
+    lines_new=$(wc -l < "$file_new" | tr -d ' ')
 
     # Generate unified diff
     local diff_output
-    diff_output=$(diff -u "$file_b" "$file_a" 2>/dev/null || true)
+    diff_output=$(diff -u "$file_old" "$file_new" 2>/dev/null || true)
 
     # Calculate diff stats
     local additions deletions
-    additions=$(echo "$diff_output" | grep -c '^+[^+]' || echo "0")
-    deletions=$(echo "$diff_output" | grep -c '^-[^-]' || echo "0")
+    additions=$(printf '%s\n' "$diff_output" | grep -c '^+[^+]' || true)
+    deletions=$(printf '%s\n' "$diff_output" | grep -c '^-[^-]' || true)
 
     local data
     data=$(jq -nc \
         --arg workflow "$workflow" \
-        --argjson round_a "$round_a" \
-        --argjson round_b "$round_b" \
-        --argjson size_a "$size_a" \
-        --argjson size_b "$size_b" \
-        --argjson lines_a "$lines_a" \
-        --argjson lines_b "$lines_b" \
+        --argjson round_old "$round_old" \
+        --argjson round_new "$round_new" \
+        --argjson size_old "$size_old" \
+        --argjson size_new "$size_new" \
+        --argjson lines_old "$lines_old" \
+        --argjson lines_new "$lines_new" \
         --argjson additions "$additions" \
         --argjson deletions "$deletions" \
         --arg diff "$diff_output" \
         '{
             workflow: $workflow,
-            comparing: {from: $round_b, to: $round_a},
+            comparing: {from: $round_old, to: $round_new},
             stats: {
-                before: {bytes: $size_b, lines: $lines_b},
-                after: {bytes: $size_a, lines: $lines_a},
+                before: {bytes: $size_old, lines: $lines_old},
+                after: {bytes: $size_new, lines: $lines_new},
                 changes: {additions: $additions, deletions: $deletions}
             },
             diff: $diff
@@ -4973,6 +5094,11 @@ robot_integrate() {
 
     if [[ -z "$round_num" ]]; then
         robot_json false "missing_argument" '{"argument":"round"}' "Round number required"
+        return 1
+    fi
+    if ! is_non_negative_int "$round_num"; then
+        robot_json false "invalid_argument" "$(jq -nc --arg round "$round_num" '{argument: "round", value: $round}')" \
+            "Round must be a non-negative integer"
         return 1
     fi
 
@@ -5112,6 +5238,11 @@ cmd_robot() {
             -w|--workflow)
                 if [[ -z "${2:-}" ]]; then
                     robot_json false "missing_argument" '{"option":"-w"}' "Option -w requires a workflow name"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                if ! is_valid_workflow_name "$2"; then
+                    robot_json false "invalid_argument" "$(jq -nc --arg wf "$2" '{argument: "workflow", value: $wf}')" \
+                        "Workflow name may contain only letters, numbers, dots, hyphens, underscores"
                     exit $EXIT_USAGE_ERROR
                 fi
                 WORKFLOW="$2"
@@ -5439,6 +5570,9 @@ main() {
             WORKFLOW=$(get_config_value "default_workflow" "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "")
         fi
         WORKFLOW="${WORKFLOW:-default}"
+        if ! is_valid_workflow_name "$WORKFLOW"; then
+            WORKFLOW="default"
+        fi
         cmd_robot "$@"
         exit $?
     fi
@@ -5471,6 +5605,11 @@ main() {
             -w|--workflow)
                 if [[ -z "${2:-}" || "$2" == -* ]]; then
                     print_error "Option -w requires a workflow name"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                if ! is_valid_workflow_name "$2"; then
+                    print_error "Invalid workflow name: $2"
+                    print_info "Use only letters, numbers, dots, hyphens, underscores"
                     exit $EXIT_USAGE_ERROR
                 fi
                 WORKFLOW="$2"
@@ -5527,6 +5666,10 @@ main() {
             --hours)
                 if [[ -z "${2:-}" || "$2" == -* ]]; then
                     print_error "Option --hours requires a number"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                if ! is_non_negative_int "$2"; then
+                    print_error "Option --hours requires a non-negative integer"
                     exit $EXIT_USAGE_ERROR
                 fi
                 STATUS_HOURS="$2"
@@ -5605,9 +5748,13 @@ main() {
         WORKFLOW=$(get_config_value "default_workflow" "$CONFIG_DIR/config.yaml")
     fi
     WORKFLOW="${WORKFLOW:-default}"
+    if ! is_valid_workflow_name "$WORKFLOW"; then
+        print_warning "Invalid default workflow name in $CONFIG_DIR/config.yaml; using 'default'"
+        WORKFLOW="default"
+    fi
 
     local command_is_round=false
-    if [[ "$command" =~ ^[0-9]+$ ]]; then
+    if is_non_negative_int "$command"; then
         command_is_round=true
     fi
 
@@ -5647,8 +5794,8 @@ main() {
                 print_info "Usage: apr run <round_number>"
                 exit $EXIT_USAGE_ERROR
             fi
-            if [[ ! "${positional_args[0]}" =~ ^[0-9]+$ ]]; then
-                print_error "Round number must be a positive integer"
+            if ! is_non_negative_int "${positional_args[0]}"; then
+                print_error "Round number must be a non-negative integer"
                 print_info "Usage: apr run <round_number>"
                 exit $EXIT_USAGE_ERROR
             fi
@@ -5680,8 +5827,8 @@ main() {
                 print_info "Usage: apr show <round>"
                 exit $EXIT_USAGE_ERROR
             fi
-            if [[ ! "${positional_args[0]}" =~ ^[0-9]+$ ]]; then
-                print_error "Round number must be a positive integer"
+            if ! is_non_negative_int "${positional_args[0]}"; then
+                print_error "Round number must be a non-negative integer"
                 print_info "Usage: apr show <round>"
                 exit $EXIT_USAGE_ERROR
             fi
@@ -5695,14 +5842,14 @@ main() {
                 print_info "  apr diff 3 7    # Compare round 3 with round 7"
                 exit $EXIT_USAGE_ERROR
             fi
-            if [[ ! "${positional_args[0]}" =~ ^[0-9]+$ ]]; then
-                print_error "Round number must be a positive integer"
+            if ! is_non_negative_int "${positional_args[0]}"; then
+                print_error "Round number must be a non-negative integer"
                 exit $EXIT_USAGE_ERROR
             fi
             local round_b=""
             if [[ ${#positional_args[@]} -ge 2 ]]; then
-                if [[ ! "${positional_args[1]}" =~ ^[0-9]+$ ]]; then
-                    print_error "Second round number must be a positive integer"
+                if ! is_non_negative_int "${positional_args[1]}"; then
+                    print_error "Second round number must be a non-negative integer"
                     exit $EXIT_USAGE_ERROR
                 fi
                 round_b="${positional_args[1]}"
@@ -5715,8 +5862,8 @@ main() {
                 print_info "Usage: apr integrate <round> [--copy] [--output FILE]"
                 exit $EXIT_USAGE_ERROR
             fi
-            if [[ ! "${positional_args[0]}" =~ ^[0-9]+$ ]]; then
-                print_error "Round number must be a positive integer"
+            if ! is_non_negative_int "${positional_args[0]}"; then
+                print_error "Round number must be a non-negative integer"
                 exit $EXIT_USAGE_ERROR
             fi
             generate_integration "${positional_args[0]}"
@@ -5738,7 +5885,7 @@ main() {
             ;;
         *)
             # If command looks like a number, treat as round number
-            if [[ "$command" =~ ^[0-9]+$ ]]; then
+            if is_non_negative_int "$command"; then
                 run_round "$command"
             else
                 print_error "Unknown command: $command"

@@ -31,13 +31,11 @@ teardown() {
 
 @test "APR_HOME defaults to XDG_DATA_HOME/apr" {
     log_test_actual "APR_HOME" "$APR_HOME"
-    assert_success_silent
     [[ "$APR_HOME" == "$XDG_DATA_HOME/apr" ]]
 }
 
 @test "APR_CACHE defaults to XDG_CACHE_HOME/apr" {
     log_test_actual "APR_CACHE" "$APR_CACHE"
-    assert_success_silent
     [[ "$APR_CACHE" == "$XDG_CACHE_HOME/apr" ]]
 }
 
@@ -50,7 +48,7 @@ teardown() {
     sed '/^main "\$@"$/d' "$APR_SCRIPT" > "$tmp_script"
 
     local expected="$TEST_DIR/custom_apr_home"
-    run bash -c "APR_HOME=\"$expected\" XDG_DATA_HOME=\"$TEST_DIR/xdg\" HOME=\"$TEST_HOME\" source \"$tmp_script\"; echo \"\$APR_HOME\""
+    run bash -c "APR_HOME=\"$expected\"; XDG_DATA_HOME=\"$TEST_DIR/xdg\"; HOME=\"$TEST_HOME\"; source \"$tmp_script\"; echo \"\$APR_HOME\""
 
     assert_success
     [[ "$output" == "$expected" ]]
@@ -61,7 +59,7 @@ teardown() {
     sed '/^main "\$@"$/d' "$APR_SCRIPT" > "$tmp_script"
 
     local expected="$TEST_DIR/custom_apr_cache"
-    run bash -c "APR_CACHE=\"$expected\" XDG_CACHE_HOME=\"$TEST_DIR/xdg_cache\" HOME=\"$TEST_HOME\" source \"$tmp_script\"; echo \"\$APR_CACHE\""
+    run bash -c "APR_CACHE=\"$expected\"; XDG_CACHE_HOME=\"$TEST_DIR/xdg_cache\"; HOME=\"$TEST_HOME\"; source \"$tmp_script\"; echo \"\$APR_CACHE\""
 
     assert_success
     [[ "$output" == "$expected" ]]
@@ -72,7 +70,7 @@ teardown() {
     sed '/^main "\$@"$/d' "$APR_SCRIPT" > "$tmp_script"
 
     local expected="$TEST_HOME/.local/share/apr"
-    run bash -c "XDG_DATA_HOME=\"\" APR_HOME=\"\" HOME=\"$TEST_HOME\" source \"$tmp_script\"; echo \"\$APR_HOME\""
+    run bash -c "XDG_DATA_HOME=\"\"; APR_HOME=\"\"; HOME=\"$TEST_HOME\"; source \"$tmp_script\"; echo \"\$APR_HOME\""
 
     assert_success
     [[ "$output" == "$expected" ]]
@@ -83,7 +81,7 @@ teardown() {
     sed '/^main "\$@"$/d' "$APR_SCRIPT" > "$tmp_script"
 
     local expected="$TEST_HOME/.cache/apr"
-    run bash -c "XDG_CACHE_HOME=\"\" APR_CACHE=\"\" HOME=\"$TEST_HOME\" source \"$tmp_script\"; echo \"\$APR_CACHE\""
+    run bash -c "XDG_CACHE_HOME=\"\"; APR_CACHE=\"\"; HOME=\"$TEST_HOME\"; source \"$tmp_script\"; echo \"\$APR_CACHE\""
 
     assert_success
     [[ "$output" == "$expected" ]]

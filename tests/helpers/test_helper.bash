@@ -372,6 +372,7 @@ case "$1" in
         else
             # Simulate a long-running request - output to stderr only
             echo "Mock response for: $*" >&2
+            sleep 1
         fi
         ;;
 esac

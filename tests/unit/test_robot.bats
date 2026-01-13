@@ -247,6 +247,23 @@ teardown() {
     assert_robot_error "$output" "invalid_argument"
 }
 
+@test "robot_run: starts oracle process in background" {
+    ROBOT_COMPACT=true
+    cd "$TEST_PROJECT" || return 1
+
+    setup_mock_oracle
+    setup_test_workflow "delta"
+    WORKFLOW="delta"
+
+    run robot_run 1
+
+    assert_success
+    assert_robot_success "$output"
+    assert_json_value "$output" ".data.status" "running"
+    # PID should be an integer
+    echo "$output" | jq -e '.data.pid | type == "number"' > /dev/null
+}
+
 # =============================================================================
 # robot_stats() error path
 # =============================================================================
@@ -260,4 +277,27 @@ teardown() {
 
     assert_failure
     assert_robot_error "$output" "not_found"
+}
+
+@test "robot_diff: compares rounds with correct direction" {
+    ROBOT_COMPACT=true
+    cd "$TEST_PROJECT" || return 1
+    
+    # Setup workflow and rounds
+    WORKFLOW="diff_test"
+    mkdir -p ".apr/workflows" ".apr/rounds/$WORKFLOW"
+    echo "name: $WORKFLOW" > ".apr/workflows/$WORKFLOW.yaml"
+    
+    echo "A" > ".apr/rounds/$WORKFLOW/round_3.md"
+    echo "B" > ".apr/rounds/$WORKFLOW/round_5.md"
+    
+    # Run robot_diff 3 5
+    run robot_diff "3" "5"
+    
+    assert_success
+    assert_robot_success "$output"
+    
+    # Check JSON structure matches Old -> New
+    assert_json_value "$output" ".data.comparing.from" "3"
+    assert_json_value "$output" ".data.comparing.to" "5"
 }

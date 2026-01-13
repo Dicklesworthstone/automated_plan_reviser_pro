@@ -101,7 +101,7 @@ assert_valid_json() {
 
     log_test_step "check" "Validating JSON structure"
 
-    if ! echo "$output" | jq . > /dev/null 2>&1; then
+    if ! printf '%s' "$output" | jq . > /dev/null 2>&1; then
         log_test_error "Invalid JSON: $output"
         fail "Output is not valid JSON"
     fi
@@ -119,7 +119,7 @@ assert_json_value() {
     log_test_step "check" "Checking JSON path $path"
 
     local actual
-    actual=$(echo "$json" | jq -r "$path" 2>/dev/null)
+    actual=$(printf '%s' "$json" | jq -r "$path" 2>/dev/null)
 
     log_test_expected "$path" "$expected"
     log_test_actual "$path" "$actual"
@@ -139,7 +139,7 @@ assert_json_field_exists() {
     log_test_step "check" "Checking JSON field exists: $path"
 
     # Check if field exists (we don't need the value, just existence check)
-    echo "$json" | jq -e "$path" >/dev/null 2>&1 || {
+    printf '%s' "$json" | jq -e "$path" >/dev/null 2>&1 || {
         log_test_error "JSON field not found: $path"
         fail "Expected JSON field $path to exist"
     }
