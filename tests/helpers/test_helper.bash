@@ -267,6 +267,42 @@ Round $round complete.
     log_test_step "fixture" "Created mock round $round at $round_file"
 }
 
+# setup_test_metrics - Create test metrics file for a workflow
+# Usage: setup_test_metrics [workflow]
+setup_test_metrics() {
+    local workflow="${1:-default}"
+    local metrics_dir="$TEST_PROJECT/.apr/analytics/$workflow"
+    mkdir -p "$metrics_dir"
+
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    cat > "$metrics_dir/metrics.json" << EOF
+{
+  "schema_version": "1.0.0",
+  "workflow": "$workflow",
+  "created_at": "$ts",
+  "updated_at": "$ts",
+  "rounds": [
+    {
+      "round": 1,
+      "timestamp": "$ts",
+      "size_bytes": 1024,
+      "word_count": 150,
+      "section_count": 3
+    }
+  ],
+  "convergence": {
+    "detected": false,
+    "confidence": 0.0,
+    "estimated_rounds_remaining": null,
+    "signals": {}
+  }
+}
+EOF
+    log_test_step "fixture" "Created test metrics for workflow '$workflow'"
+}
+
 # =============================================================================
 # Stream Capture Utilities
 # =============================================================================
@@ -308,6 +344,15 @@ setup_mock_oracle() {
 # All debug output goes to stderr to avoid interfering with JSON responses
 echo "Mock Oracle called with: $*" >&2
 
+# Parse arguments for --render flag
+render_mode=false
+for arg in "$@"; do
+    case "$arg" in
+        --render) render_mode=true ;;
+        --version) echo "oracle 0.8.4 (mock)"; exit 0 ;;
+    esac
+done
+
 case "$1" in
     status)
         echo "No active sessions" >&2
@@ -316,8 +361,18 @@ case "$1" in
         echo "Session: $2" >&2
         ;;
     *)
-        # Simulate a long-running request - output to stderr only
-        echo "Mock response for: $*" >&2
+        if [[ "$render_mode" == "true" ]]; then
+            # Render mode: output bundle content to stdout (required for --render tests)
+            echo "🧿 oracle 0.8.4 — Mock Oracle"
+            echo "[SYSTEM]"
+            echo "Mock Oracle render output"
+            echo ""
+            echo "[USER]"
+            echo "Mock prompt content for testing"
+        else
+            # Simulate a long-running request - output to stderr only
+            echo "Mock response for: $*" >&2
+        fi
         ;;
 esac
 exit 0

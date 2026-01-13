@@ -43,6 +43,9 @@ teardown() {
 }
 
 @test "apr stats --export json: outputs metrics JSON" {
+    # Initialize metrics (--export requires metrics to exist)
+    setup_test_metrics "default"
+
     run "$APR_SCRIPT" stats --export json
 
     log_test_output "$output"
