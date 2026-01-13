@@ -5133,7 +5133,7 @@ main() {
         # Best-effort Oracle detection for dry-run output
         if [[ "$command_is_round" == "true" || "$command" == "run" ]]; then
             if ! check_oracle; then
-                ORACLE_CMD="oracle"
+                ORACLE_CMD=("oracle")
                 [[ "$QUIET_MODE" != "true" ]] && print_warning "Oracle not found; dry run will use a placeholder command"
             fi
         fi

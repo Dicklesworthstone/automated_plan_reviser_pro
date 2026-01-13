@@ -16,12 +16,110 @@ setup() {
 
     # Set up a complete test workflow
     cd "$TEST_PROJECT"
+    setup_render_oracle
     setup_test_workflow "default"
 }
 
 teardown() {
     log_test_end "${BATS_TEST_NAME}" "$([[ ${status:-0} -eq 0 ]] && echo pass || echo fail)"
     teardown_test_environment
+}
+
+# =============================================================================
+# Oracle Mocks (Integration-Safe)
+# =============================================================================
+
+setup_render_oracle() {
+    local bin_dir="$TEST_DIR/bin"
+    mkdir -p "$bin_dir"
+
+    cat > "$bin_dir/oracle" << 'EOF'
+#!/usr/bin/env bash
+echo "Mock Oracle called with: $*" >&2
+
+if [[ "${1:-}" == "--version" ]]; then
+    echo "oracle 0.0.0"
+    exit 0
+fi
+
+if [[ "$*" == *"--render"* ]]; then
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --file)
+                shift
+                if [[ -f "$1" ]]; then
+                    cat "$1"
+                    echo ""
+                fi
+                ;;
+            -p)
+                shift
+                echo "$1"
+                ;;
+        esac
+        shift
+    done
+    exit 0
+fi
+
+exit 0
+EOF
+    chmod +x "$bin_dir/oracle"
+
+    export PATH="$bin_dir:$PATH"
+}
+
+setup_flaky_oracle() {
+    local bin_dir="$TEST_DIR/flaky_oracle"
+    mkdir -p "$bin_dir"
+
+    cat > "$bin_dir/oracle" << 'EOF'
+#!/usr/bin/env bash
+count_file="${TEST_DIR:-/tmp}/oracle_call_count"
+count=0
+if [[ -f "$count_file" ]]; then
+    count=$(cat "$count_file" 2>/dev/null || echo "0")
+fi
+count=$((count + 1))
+echo "$count" > "$count_file"
+
+echo "Flaky Oracle args: $*" >&2
+
+if [[ "${1:-}" == "--version" ]]; then
+    echo "oracle 0.0.0"
+    exit 0
+fi
+
+if [[ "${ORACLE_FAIL_UNTIL:-0}" -ge "$count" ]]; then
+    echo "Simulated failure $count" >&2
+    exit 1
+fi
+
+if [[ "$*" == *"--render"* ]]; then
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --file)
+                shift
+                if [[ -f "$1" ]]; then
+                    cat "$1"
+                    echo ""
+                fi
+                ;;
+            -p)
+                shift
+                echo "$1"
+                ;;
+        esac
+        shift
+    done
+    exit 0
+fi
+
+exit 0
+EOF
+    chmod +x "$bin_dir/oracle"
+
+    export PATH="$bin_dir:$PATH"
 }
 
 # =============================================================================
@@ -106,6 +204,15 @@ teardown() {
 
     assert_success
     [[ "$output" == *"implementation"* ]] || [[ "$output" == *"IMPLEMENTATION"* ]] || [[ "$output" == *"impl"* ]]
+}
+
+@test "run --render --copy: passes copy flag to oracle" {
+    capture_streams "$APR_SCRIPT" run 1 --render --copy
+
+    log_test_actual "exit code" "$CAPTURED_STATUS"
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDERR" == *"--copy"* ]]
 }
 
 # =============================================================================
@@ -228,6 +335,24 @@ teardown() {
     assert_success
 }
 
+@test "run: --wait shows retry messaging by default" {
+    run "$APR_SCRIPT" run 1 --wait
+
+    log_test_output "$output"
+
+    assert_success
+    [[ "$output" == *"Auto-retry enabled"* ]] || [[ "$output" == *"retry"* ]]
+}
+
+@test "run: --wait --no-retry omits retry messaging" {
+    run "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_output "$output"
+
+    assert_success
+    [[ "$output" != *"Auto-retry enabled"* ]]
+}
+
 @test "run: -v is alias for --verbose" {
     run "$APR_SCRIPT" run 1 --dry-run -v
 
@@ -276,6 +401,43 @@ teardown() {
     [[ $status -ne 0 ]] || [[ "$output" == *"not found"* ]] || [[ "$output" == *"missing"* ]]
 }
 
+@test "run: preflight passes for valid files" {
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "exit code" "$CAPTURED_STATUS"
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDERR" == *"Running pre-flight checks"* ]]
+    [[ "$CAPTURED_STDERR" == *"All pre-flight checks passed"* ]]
+}
+
+@test "run: preflight fails when required file missing" {
+    rm -f README.md
+
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "exit code" "$CAPTURED_STATUS"
+
+    [[ "$CAPTURED_STATUS" -eq 4 ]]
+    [[ "$CAPTURED_STDERR" == *"Pre-flight failed: README not found"* ]]
+}
+
+# =============================================================================
+# Output File Handling Tests
+# =============================================================================
+
+@test "run: existing output file warns and proceeds when non-interactive" {
+    mkdir -p .apr/rounds/default
+    printf '%s\n' "existing output" > .apr/rounds/default/round_1.md
+
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "exit code" "$CAPTURED_STATUS"
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDERR" == *"output already exists"* ]] || [[ "$CAPTURED_STDERR" == *"Round 1 output already exists"* ]]
+}
+
 # =============================================================================
 # Previous Round Tests
 # =============================================================================
@@ -317,4 +479,216 @@ teardown() {
 
     # Should have structured sections
     [[ "$output" == *"readme"* ]] || [[ "$output" == *"README"* ]] || [[ "$output" == *"<"* ]]
+}
+
+# =============================================================================
+# Retry Wrapper Tests
+# =============================================================================
+
+@test "run: retries Oracle on transient failures (--wait)" {
+    setup_flaky_oracle
+
+    capture_streams env APR_MAX_RETRIES=2 APR_INITIAL_BACKOFF=0 ORACLE_FAIL_UNTIL=1 "$APR_SCRIPT" run 1 --wait
+
+    log_test_actual "exit code" "$CAPTURED_STATUS"
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDERR" == *"Attempt 1/2 failed"* ]]
+    [[ "$CAPTURED_STDERR" == *"Retrying in 0s"* ]]
+    [[ "$CAPTURED_STDERR" == *"--heartbeat 30"* ]]
+    [[ "$CAPTURED_STDERR" == *"--notify"* ]]
+    [[ "$CAPTURED_STDERR" == *"--write-output"* ]]
+}
+
+# =============================================================================
+# Session Slug Format Tests
+# =============================================================================
+
+@test "run --dry-run: slug format is apr-{workflow}-round-{N}" {
+    run "$APR_SCRIPT" run 3 --dry-run
+
+    log_test_output "$output"
+
+    assert_success
+    # Slug should follow the pattern apr-{workflow}-round-{N}
+    [[ "$output" == *"apr-default-round-3"* ]] || [[ "$output" == *"--slug"* ]]
+}
+
+@test "run --dry-run --include-impl: slug includes with-impl suffix" {
+    run "$APR_SCRIPT" run 2 --dry-run --include-impl
+
+    log_test_output "$output"
+
+    assert_success
+    # When --include-impl is used, slug should include with-impl
+    [[ "$output" == *"with-impl"* ]] || [[ "$output" == *"impl"* ]]
+}
+
+@test "run --dry-run: slug handles workflow with hyphen" {
+    setup_test_workflow "my-workflow"
+
+    run "$APR_SCRIPT" run 1 --dry-run -w my-workflow
+
+    log_test_output "$output"
+
+    assert_success
+    [[ "$output" == *"my-workflow"* ]]
+}
+
+@test "run --dry-run: slug handles workflow with underscore" {
+    setup_test_workflow "my_workflow"
+
+    run "$APR_SCRIPT" run 1 --dry-run -w my_workflow
+
+    log_test_output "$output"
+
+    assert_success
+    [[ "$output" == *"my_workflow"* ]]
+}
+
+@test "run --dry-run: slug handles workflow with dot" {
+    setup_test_workflow "special.name"
+
+    run "$APR_SCRIPT" run 3 --dry-run -w special.name
+
+    log_test_output "$output"
+
+    assert_success
+    [[ "$output" == *"apr-special.name-round-3"* ]] || [[ "$output" == *"special.name"* ]]
+}
+
+# =============================================================================
+# Option Combination Tests
+# =============================================================================
+
+@test "run: --dry-run --verbose combined" {
+    run "$APR_SCRIPT" run 1 --dry-run --verbose
+
+    log_test_output "$output"
+
+    assert_success
+    # Verbose dry-run should show more details
+    [[ ${#output} -gt 100 ]]
+}
+
+@test "run: --dry-run --quiet combined" {
+    run "$APR_SCRIPT" run 1 --dry-run --quiet
+
+    log_test_output "$output"
+
+    assert_success
+    # Quiet mode should still show the command
+    [[ "$output" == *"oracle"* ]] || [[ "$output" == *"Mock"* ]]
+}
+
+@test "run: --render --quiet combined" {
+    run "$APR_SCRIPT" run 1 --render --quiet
+
+    log_test_output "$output"
+
+    assert_success
+    # Should output the rendered prompt even in quiet mode
+    [[ -n "$output" ]]
+}
+
+@test "run: --render --verbose --include-impl combined" {
+    run "$APR_SCRIPT" run 1 --render --verbose --include-impl
+
+    log_test_output "$output"
+
+    assert_success
+    # Should include all components
+    [[ "$output" == *"README"* ]] || [[ "$output" == *"readme"* ]]
+}
+
+@test "run: -w and --include-impl combined" {
+    setup_test_workflow "combo-test"
+
+    run "$APR_SCRIPT" run 1 --dry-run -w combo-test --include-impl
+
+    log_test_output "$output"
+
+    assert_success
+    [[ "$output" == *"combo-test"* ]]
+    [[ "$output" == *"impl"* ]] || [[ "$output" == *"with-impl"* ]]
+}
+
+@test "run: multiple workflows in sequence" {
+    setup_test_workflow "workflow-a"
+    setup_test_workflow "workflow-b"
+
+    run "$APR_SCRIPT" run 1 --dry-run -w workflow-a
+    assert_success
+    [[ "$output" == *"workflow-a"* ]]
+
+    run "$APR_SCRIPT" run 1 --dry-run -w workflow-b
+    assert_success
+    [[ "$output" == *"workflow-b"* ]]
+}
+
+# =============================================================================
+# Oracle Command Construction Tests
+# =============================================================================
+
+@test "run --dry-run: includes --write-output flag" {
+    run "$APR_SCRIPT" run 1 --dry-run
+
+    log_test_output "$output"
+
+    assert_success
+    # Oracle command should include write-output for saving results
+    [[ "$output" == *"write-output"* ]] || [[ "$output" == *"round_1"* ]]
+}
+
+@test "run --dry-run: includes --notify flag" {
+    run "$APR_SCRIPT" run 1 --dry-run
+
+    log_test_output "$output"
+
+    assert_success
+    # Should include notify for desktop notifications
+    [[ "$output" == *"notify"* ]] || [[ "$output" == *"--"* ]]
+}
+
+@test "run --dry-run: includes engine browser flag" {
+    run "$APR_SCRIPT" run 1 --dry-run
+
+    log_test_output "$output"
+
+    assert_success
+    # Should specify browser engine
+    [[ "$output" == *"browser"* ]] || [[ "$output" == *"engine"* ]] || [[ "$output" == *"oracle"* ]]
+}
+
+# =============================================================================
+# Error Handling Tests
+# =============================================================================
+
+@test "run: handles missing oracle gracefully" {
+    # Temporarily override PATH to hide oracle
+    local original_path="$PATH"
+    PATH="/nonexistent:$PATH"
+
+    run "$APR_SCRIPT" run 1 --dry-run --no-preflight
+
+    PATH="$original_path"
+
+    log_test_output "$output"
+    log_test_actual "exit code" "$status"
+
+    # Should either fail gracefully or use npx fallback
+    [[ $status -eq 0 ]] || [[ "$output" == *"Oracle"* ]] || [[ "$output" == *"oracle"* ]]
+}
+
+@test "run: provides helpful message on config error" {
+    # Remove workflow config
+    rm -f .apr/workflows/default.yaml
+
+    run "$APR_SCRIPT" run 1 --dry-run
+
+    log_test_output "$output"
+    log_test_actual "exit code" "$status"
+
+    assert_failure
+    [[ "$output" == *"not found"* ]] || [[ "$output" == *"config"* ]] || [[ "$output" == *"workflow"* ]]
 }

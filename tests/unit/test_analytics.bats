@@ -525,12 +525,8 @@ OUTER
 }
 
 @test "calculate_output_trend_signal: detects decreasing trend" {
-    # Decreasing char counts across 3 rounds
-    local metrics_json='{"rounds":[
-        {"round":1,"output":{"char_count":1000}},
-        {"round":2,"output":{"char_count":800}},
-        {"round":3,"output":{"char_count":600}}
-    ]}'
+    # Decreasing char counts across 3 rounds (single line JSON)
+    local metrics_json='{"rounds":[{"round":1,"output":{"char_count":1000}},{"round":2,"output":{"char_count":800}},{"round":3,"output":{"char_count":600}}]}'
 
     local result
     result=$(calculate_output_trend_signal "$metrics_json")
@@ -543,11 +539,8 @@ OUTER
 }
 
 @test "calculate_change_velocity_signal: returns 0 for insufficient data" {
-    # Function takes JSON with rounds array
-    local metrics_json='{"rounds":[
-        {"round":1},
-        {"round":2,"changes_from_previous":{"diff_ratio":0.1}}
-    ]}'
+    # Function takes JSON with rounds array (2 rounds = insufficient)
+    local metrics_json='{"rounds":[{"round":1},{"round":2,"changes_from_previous":{"diff_ratio":0.1}}]}'
 
     local result
     result=$(calculate_change_velocity_signal "$metrics_json")
