@@ -298,6 +298,61 @@ teardown() {
 }
 
 # =============================================================================
+# apr status / attach Tests
+# =============================================================================
+
+@test "apr status: calls oracle status with hours" {
+    setup_mock_oracle
+
+    capture_streams "$APR_SCRIPT" status --hours 12
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STDERR" == *"Mock Oracle called with: status --hours 12"* ]]
+}
+
+@test "apr attach: calls oracle session with --render" {
+    setup_mock_oracle
+
+    capture_streams "$APR_SCRIPT" attach apr-test-session
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STDERR" == *"Mock Oracle called with: session apr-test-session --render"* ]]
+}
+
+# =============================================================================
+# apr integrate Tests
+# =============================================================================
+
+@test "apr integrate: outputs prompt to stdout" {
+    create_mock_round 1 "default"
+
+    run "$APR_SCRIPT" integrate 1 --quiet
+
+    log_test_output "$output"
+
+    assert_success
+    [[ "$output" == *"Now integrate the following feedback"* ]]
+    [[ "$output" == *"Round 1"* ]]
+}
+
+@test "apr integrate: writes prompt to file with --output" {
+    create_mock_round 1 "default"
+
+    local output_file="$TEST_PROJECT/integration_prompt.md"
+
+    run "$APR_SCRIPT" integrate 1 --output "$output_file"
+
+    log_test_output "$output"
+
+    assert_success
+    assert_file_exists "$output_file"
+    run grep -n "Round 1" "$output_file"
+    assert_success
+}
+
+# =============================================================================
 # Stream Separation Tests
 # =============================================================================
 

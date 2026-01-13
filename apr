@@ -4576,10 +4576,14 @@ robot_help() {
             "apr robot workflows",
             "apr robot validate 1 -w myspec",
             "apr robot run 1",
-            "apr robot run 2 -w myspec --include-impl",
+            "apr robot show 3 -w myspec",
+            "apr robot diff 3 -w myspec",
+            "apr robot diff 3 2 -w myspec",
+            "apr robot integrate 3 -w myspec",
             "apr robot history -w myspec",
             "apr robot stats -w myspec"
-        ]
+        ],
+        quick_start: "For agents: 1) apr robot status (check setup), 2) apr robot show <N> (read round), 3) apr robot integrate <N> (get prompt), 4) apr robot stats (check convergence)"
     }')
 
     robot_json true "ok" "$data"
@@ -4652,6 +4656,15 @@ cmd_robot() {
             ;;
         run)
             robot_run "${robot_args[0]:-}"
+            ;;
+        show)
+            robot_show "${robot_args[0]:-}"
+            ;;
+        diff)
+            robot_diff "${robot_args[0]:-}" "${robot_args[1]:-}"
+            ;;
+        integrate)
+            robot_integrate "${robot_args[0]:-}"
             ;;
         history)
             robot_history
