@@ -1357,9 +1357,14 @@ run_round() {
     local prompt
     prompt=$(build_revision_prompt "$include_impl" "$config_path")
     if [[ -z "$prompt" ]]; then
-        print_error "Prompt template is empty"
-        print_info "Add 'template' or 'template_with_impl' to $config_path"
-        exit $EXIT_CONFIG_ERROR
+        if [[ "$ROBOT_MODE" == "true" ]]; then
+            robot_json false "validation_failed" '{"errors":["Prompt template is empty"]}' \
+                "Add 'template' or 'template_with_impl' to workflow"
+        else
+            print_error "Prompt template is empty"
+            print_info "Add 'template' or 'template_with_impl' to $config_path"
+        fi
+        return 1
     fi
 
     # Dry run mode
@@ -1644,33 +1649,42 @@ show_history() {
     fi
 
     # Collect all round files and find the latest
-    local round_files=()
+    local round_entries=()
     local latest_round=0
     for round_file in "$rounds_dir"/round_*.md; do
         [[ -f "$round_file" ]] || continue
-        round_files+=("$round_file")
         local num
         num=$(basename "$round_file" .md | sed 's/round_//')
-        if [[ "$num" =~ ^[0-9]+$ ]] && (( num > latest_round )); then
-            latest_round=$num
+        if [[ "$num" =~ ^[0-9]+$ ]]; then
+            round_entries+=("${num}|${round_file}")
+            if (( num > latest_round )); then
+                latest_round=$num
+            fi
         fi
     done
 
-    if [[ ${#round_files[@]} -eq 0 ]]; then
+    if [[ ${#round_entries[@]} -eq 0 ]]; then
         print_warning "No rounds recorded yet for workflow '$workflow'"
         print_info "Run 'apr run 1' to start your first revision round"
         exit $EXIT_SUCCESS
     fi
 
+    local sorted_entries=()
+    mapfile -t sorted_entries < <(printf '%s\n' "${round_entries[@]}" | sort -n -t '|' -k1,1)
+
     # Display each round with enhanced info
-    for round_file in "${round_files[@]}"; do
-        local round_num size mod_date first_line is_latest=""
-        round_num=$(basename "$round_file" .md | sed 's/round_//')
+    for entry in "${sorted_entries[@]}"; do
+        local round_num round_file size mod_date mod_ts first_line is_latest=""
+        round_num=${entry%%|*}
+        round_file=${entry#*|}
         size=$(du -h "$round_file" 2>/dev/null | cut -f1)
-        # Cross-platform date: try GNU stat, then BSD stat, then ls fallback
-        mod_date=$(stat -c '%Y-%m-%d %H:%M' "$round_file" 2>/dev/null || \
-                   stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$round_file" 2>/dev/null || \
-                   ls -l "$round_file" 2>/dev/null | awk '{print $6, $7, $8}')
+        # Cross-platform date: try GNU stat, then BSD stat, then date fallback
+        mod_ts=$(stat -c '%Y' "$round_file" 2>/dev/null || stat -f '%m' "$round_file" 2>/dev/null || echo "")
+        if [[ -n "$mod_ts" && "$mod_ts" =~ ^[0-9]+$ ]]; then
+            mod_date=$(date -d "@$mod_ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$mod_ts" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "N/A")
+        else
+            mod_date="N/A"
+        fi
 
         # Get first non-empty line as preview
         first_line=$(grep -m1 '.' "$round_file" 2>/dev/null | head -c 60 | tr '\n' ' ')
@@ -1692,7 +1706,7 @@ show_history() {
     done
 
     # Summary
-    print_dim "Total: ${#round_files[@]} round(s). Use 'apr show <round>' to view content."
+    print_dim "Total: ${#round_entries[@]} round(s). Use 'apr show <round>' to view content."
 }
 
 # -----------------------------------------------------------------------------
@@ -1841,10 +1855,14 @@ generate_integration() {
     # Get workflow config
     local spec_path
     spec_path=$(get_config_value "spec" "$workflow_file" | tr -d '"')
-
     if [[ -z "$spec_path" ]]; then
         print_error "Spec path not configured in workflow '$workflow'"
-        print_info "Workflow file: $workflow_file"
+        print_info "Check 'spec:' in $workflow_file"
+        exit $EXIT_CONFIG_ERROR
+    fi
+    if [[ ! -f "$spec_path" ]]; then
+        print_error "Spec file not found: $spec_path"
+        print_info "Check 'spec:' in $workflow_file"
         exit $EXIT_CONFIG_ERROR
     fi
 
@@ -1951,20 +1969,31 @@ show_stats() {
     local total_size=0
     local round_data=()
     local sizes=()
+    local round_entries=()
 
-    # Get round files sorted numerically (glob gives lexicographic: 1, 10, 11, 2, ...)
-    # We need numeric order for correct trend detection
-    local sorted_files=()
-    while IFS= read -r round_file; do
-        sorted_files+=("$round_file")
-    done < <(find "$rounds_dir" -maxdepth 1 -name "round_*.md" -type f 2>/dev/null | sort -t_ -k2 -n)
-
-    for round_file in "${sorted_files[@]}"; do
+    for round_file in "$rounds_dir"/round_*.md; do
         [[ -f "$round_file" ]] || continue
+        local round_num
+        round_num=$(basename "$round_file" .md | sed 's/round_//')
+        [[ "$round_num" =~ ^[0-9]+$ ]] || continue
+        round_entries+=("${round_num}|${round_file}")
+    done
+
+    if [[ ${#round_entries[@]} -eq 0 ]]; then
+        print_warning "No rounds recorded yet for workflow '$workflow'"
+        print_info "Run 'apr run 1' to start your first revision round"
+        exit $EXIT_SUCCESS
+    fi
+
+    local sorted_entries=()
+    mapfile -t sorted_entries < <(printf '%s\n' "${round_entries[@]}" | sort -n -t '|' -k1,1)
+
+    for entry in "${sorted_entries[@]}"; do
+        local round_num round_file size_bytes size_human mod_ts
+        round_num=${entry%%|*}
+        round_file=${entry#*|}
         ((total_rounds++))
 
-        local round_num size_bytes size_human mod_ts
-        round_num=$(basename "$round_file" .md | sed 's/round_//')
         size_bytes=$(stat -c '%s' "$round_file" 2>/dev/null || stat -f '%z' "$round_file" 2>/dev/null || echo "0")
         size_human=$(du -h "$round_file" 2>/dev/null | cut -f1)
         mod_ts=$(stat -c '%Y' "$round_file" 2>/dev/null || stat -f '%m' "$round_file" 2>/dev/null || echo "0")
@@ -1973,12 +2002,6 @@ show_stats() {
         sizes+=("$size_bytes")
         round_data+=("$round_num|$size_human|$size_bytes|$mod_ts")
     done
-
-    if [[ $total_rounds -eq 0 ]]; then
-        print_warning "No rounds recorded yet for workflow '$workflow'"
-        print_info "Run 'apr run 1' to start your first revision round"
-        exit $EXIT_SUCCESS
-    fi
 
     # Calculate statistics
     local avg_size=$((total_size / total_rounds))
@@ -2815,7 +2838,18 @@ main() {
         exit $EXIT_SUCCESS
     fi
 
-    if [[ "$command" != "help" && "$command" != "update" && "$command" != "robot" && "$command" != "--help" && "$command" != "-h" ]]; then
+    local oracle_required=false
+    if [[ "$command" =~ ^[0-9]+$ ]]; then
+        oracle_required=true
+    else
+        case "$command" in
+            run|status|attach)
+                oracle_required=true
+                ;;
+        esac
+    fi
+
+    if [[ "$oracle_required" == "true" ]]; then
         if ! check_oracle; then
             print_error "Oracle not found"
             print_info "Install with: npm install -g @steipete/oracle"

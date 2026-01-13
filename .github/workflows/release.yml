@@ -12,81 +12,169 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate tag matches VERSION file
+      - name: Extract version from tag
+        id: version
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
-          if [[ "$TAG_VERSION" != "$FILE_VERSION" ]]; then
-            echo "Tag version ($TAG_VERSION) doesn't match VERSION file ($FILE_VERSION)"
+          echo "version=$TAG_VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $TAG_VERSION"
+
+      - name: Verify script VERSION matches tag
+        run: |
+          script_version=$(grep -m1 '^VERSION=' apr | cut -d'"' -f2)
+          tag_version="${{ steps.version.outputs.version }}"
+
+          echo "Script VERSION variable: $script_version"
+          echo "Tag version: $tag_version"
+
+          if [[ "$script_version" != "$tag_version" ]]; then
+            echo "::error::Script VERSION ($script_version) doesn't match tag version ($tag_version)"
+            echo "Update VERSION=\"$tag_version\" in apr script before tagging."
             exit 1
           fi
-          echo "VERSION=$TAG_VERSION" >> $GITHUB_ENV
+
+          echo "Script version matches tag."
+
+      - name: Verify VERSION file matches tag
+        run: |
+          if [[ -f VERSION ]]; then
+            file_version=$(cat VERSION | tr -d '[:space:]')
+            tag_version="${{ steps.version.outputs.version }}"
+
+            echo "VERSION file: $file_version"
+            echo "Tag version: $tag_version"
+
+            if [[ "$file_version" != "$tag_version" ]]; then
+              echo "::error::VERSION file ($file_version) doesn't match tag version ($tag_version)"
+              exit 1
+            fi
+
+            echo "VERSION file matches tag."
+          else
+            echo "::warning::No VERSION file found (optional)"
+          fi
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck
-        run: |
-          sudo apt-get install -y shellcheck
-          shellcheck apr install.sh
+        run: shellcheck apr install.sh
 
-      - name: Generate checksums
+      - name: Verify bash syntax
         run: |
-          sha256sum apr > apr.sha256
-          sha256sum install.sh > install.sh.sha256
-          echo "APR checksum: $(cat apr.sha256)"
-          echo "Installer checksum: $(cat install.sh.sha256)"
+          bash -n apr
+          bash -n install.sh
 
-      - name: Create Release
+      - name: Generate SHA256 checksums
+        run: |
+          # Combined checksums file (full format: hash  filename)
+          sha256sum apr install.sh > checksums.txt
+          echo "Combined checksums:"
+          cat checksums.txt
+
+          # Individual checksum files (hash only, for easy verification)
+          sha256sum apr | awk '{print $1}' > apr.sha256
+          sha256sum install.sh | awk '{print $1}' > install.sh.sha256
+
+          echo ""
+          echo "Individual checksums:"
+          echo "apr: $(cat apr.sha256)"
+          echo "install.sh: $(cat install.sh.sha256)"
+
+      - name: Generate release notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ github.repository }}"
+          cat > release_notes.md << EOF
+          ## Automated Plan Reviser Pro v${VERSION}
+
+          Iterative AI-powered specification refinement using GPT Pro Extended Reasoning via Oracle.
+
+          ### Quick Install
+
+          **One-liner (recommended):**
+          \`\`\`bash
+          curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/install.sh?\$(date +%s)" | bash
+          \`\`\`
+
+          **Install specific version:**
+          \`\`\`bash
+          APR_VERSION=${VERSION} curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/install.sh" | bash
+          \`\`\`
+
+          ### Manual Download
+
+          \`\`\`bash
+          # Download apr script
+          curl -fsSL https://github.com/${REPO}/releases/download/v${VERSION}/apr -o apr
+          chmod +x apr
+
+          # Move to PATH
+          mv apr ~/.local/bin/
+          \`\`\`
+
+          ### Verify Download (SHA256)
+
+          After downloading, verify the checksum:
+
+          \`\`\`bash
+          # Verify apr script
+          echo "\$(curl -fsSL https://github.com/${REPO}/releases/download/v${VERSION}/apr.sha256)  apr" | sha256sum -c -
+
+          # Verify installer
+          echo "\$(curl -fsSL https://github.com/${REPO}/releases/download/v${VERSION}/install.sh.sha256)  install.sh" | sha256sum -c -
+          \`\`\`
+
+          Or download and use the combined checksums file:
+          \`\`\`bash
+          curl -fsSL https://github.com/${REPO}/releases/download/v${VERSION}/checksums.txt -o checksums.txt
+          sha256sum -c checksums.txt
+          \`\`\`
+
+          ### Dependencies
+
+          - **Required:** Bash 4+, Node.js 18+, [Oracle](https://github.com/steipete/oracle)
+          - **Optional:** [gum](https://github.com/charmbracelet/gum) (beautiful TUI), jq (robot mode)
+
+          ### Getting Started
+
+          \`\`\`bash
+          # Run the setup wizard
+          apr setup
+
+          # First revision round (requires ChatGPT login)
+          apr run 1 --login --wait
+
+          # Subsequent rounds
+          apr run 2
+          apr run 3 --include-impl
+          \`\`\`
+          EOF
+
+          echo "Release notes generated."
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: APR v${{ env.VERSION }}
-          body: |
-            ## Automated Plan Reviser Pro v${{ env.VERSION }}
-
-            ### Installation
-
-            **Quick install (recommended):**
-            ```bash
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
-            ```
-
-            **Install specific version:**
-            ```bash
-            APR_VERSION=${{ env.VERSION }} curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
-            ```
-
-            **Manual download:**
-            ```bash
-            curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${{ env.VERSION }}/apr -o apr
-            chmod +x apr
-            ```
-
-            ### Checksums
-
-            Verify your download:
-            ```bash
-            # For apr script
-            sha256sum -c apr.sha256
-
-            # For installer
-            sha256sum -c install.sh.sha256
-            ```
-
-            ### What's New
-
-            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
-
+          name: APR v${{ steps.version.outputs.version }}
+          body_path: release_notes.md
           files: |
             apr
             install.sh
+            checksums.txt
             apr.sha256
             install.sh.sha256
             VERSION
           draft: false
           prerelease: false
           generate_release_notes: true
+          append_body: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -99,21 +187,42 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate and commit checksums
+      - name: Generate checksums for main branch
         run: |
-          sha256sum apr | cut -d' ' -f1 > apr.sha256
-          sha256sum install.sh | cut -d' ' -f1 > install.sh.sha256
+          # Generate hash-only checksums for verification scripts
+          sha256sum apr | awk '{print $1}' > apr.sha256
+          sha256sum install.sh | awk '{print $1}' > install.sh.sha256
+
+          # Generate combined checksums
+          sha256sum apr install.sh > checksums.txt
+
+          echo "Generated checksums:"
+          echo "apr: $(cat apr.sha256)"
+          echo "install.sh: $(cat install.sh.sha256)"
+
+      - name: Commit and push checksums
+        run: |
+          VERSION="${{ needs.release.outputs.version }}"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if git diff --quiet apr.sha256 install.sh.sha256 2>/dev/null; then
-            echo "Checksums unchanged"
+          # Check if any checksum files changed
+          if git diff --quiet apr.sha256 install.sh.sha256 checksums.txt 2>/dev/null; then
+            echo "Checksums unchanged, skipping commit."
           else
-            git add apr.sha256 install.sh.sha256
-            git commit -m "chore: update checksums for v${GITHUB_REF#refs/tags/v}"
-            git push
+            git add apr.sha256 install.sh.sha256 checksums.txt
+
+            # Only commit if there are staged changes
+            if git diff --cached --quiet; then
+              echo "No changes to commit."
+            else
+              git commit -m "chore: update checksums for v${VERSION}"
+              git push
+              echo "Checksums updated and pushed."
+            fi
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

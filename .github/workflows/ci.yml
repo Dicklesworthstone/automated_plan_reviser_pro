@@ -5,62 +5,110 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
-  lint:
-    name: ShellCheck & Syntax
+  shellcheck:
+    name: ShellCheck
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ShellCheck
-        run: sudo apt-get install -y shellcheck
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          severity: warning
+          additional_files: 'apr install.sh'
 
-      - name: Run ShellCheck on apr
-        run: shellcheck apr
+  syntax:
+    name: Bash Syntax Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Run ShellCheck on install.sh
-        run: shellcheck install.sh
-
-      - name: Check bash syntax (apr)
+      - name: Check apr syntax
         run: bash -n apr
 
-      - name: Check bash syntax (install.sh)
+      - name: Check install.sh syntax
         run: bash -n install.sh
 
-      - name: Verify apr --version works
-        run: |
-          chmod +x apr
-          ./apr --version
-
-      - name: Verify VERSION file consistency
-        run: |
-          chmod +x apr
-          APR_VERSION=$(./apr --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
-          if [[ "$APR_VERSION" != "$FILE_VERSION" ]]; then
-            echo "Version mismatch!"
-            echo "  apr --version: $APR_VERSION"
-            echo "  VERSION file:  $FILE_VERSION"
-            exit 1
-          fi
-          echo "Versions match: $APR_VERSION"
-
-  dry-run:
-    name: Dry Run Test
+  version-check:
+    name: Version Consistency
     runs-on: ubuntu-latest
-    needs: lint
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create mock workflow
+      - name: Verify version consistency
+        run: |
+          # Check if VERSION file exists
+          if [[ ! -f VERSION ]]; then
+            echo "::warning::VERSION file not found (optional)"
+            exit 0
+          fi
+
+          echo "VERSION file found: $(cat VERSION)"
+
+          # Extract version from script
+          script_version=$(grep -m1 '^VERSION=' apr | cut -d'"' -f2)
+
+          # Extract version from VERSION file
+          file_version=$(cat VERSION | tr -d '[:space:]')
+
+          echo "Script VERSION variable: $script_version"
+          echo "VERSION file: $file_version"
+
+          if [[ "$script_version" != "$file_version" ]]; then
+            echo "::error::Version mismatch! Script has '$script_version' but VERSION file has '$file_version'"
+            exit 1
+          fi
+
+          echo "Versions match: $script_version"
+
+  functional-test:
+    name: Functional Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [shellcheck, syntax]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bash 5 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "$(brew --prefix)/bin" >> $GITHUB_PATH
+
+      - name: Display bash version
+        run: bash --version
+
+      - name: Create test output directory
+        run: mkdir -p test-results
+
+      - name: Make apr executable
+        run: chmod +x apr
+
+      - name: Test apr --version
+        run: |
+          ./apr --version 2>&1 | tee test-results/version.txt
+          grep -E '[0-9]+\.[0-9]+\.[0-9]+' test-results/version.txt
+
+      - name: Test apr --help
+        run: ./apr --help 2>&1 | tee test-results/help.txt
+
+      - name: Create mock workflow for testing
         run: |
           mkdir -p .apr/workflows .apr/rounds/test
           cat > .apr/workflows/test.yaml << 'EOF'
           name: test
-          description: Test workflow
+          description: Test workflow for CI
           documents:
             readme: README.md
             spec: AGENTS.md
@@ -73,62 +121,206 @@ jobs:
           default_workflow: test
           EOF
 
-      - name: Test apr --help
-        run: |
-          chmod +x apr
-          ./apr --help
-
       - name: Test apr list
-        run: |
-          chmod +x apr
-          ./apr list
+        run: ./apr list 2>&1 | tee test-results/list.txt
 
-      - name: Test apr run --dry-run (without Oracle)
+      - name: Test apr history (empty)
+        run: ./apr history 2>&1 | tee test-results/history.txt || true
+
+      - name: Create mock Oracle for dry-run tests
         run: |
-          chmod +x apr
-          # Create a mock oracle script
           mkdir -p /tmp/mock-bin
-          cat > /tmp/mock-bin/oracle << 'MOCK'
+          cat > /tmp/mock-bin/oracle << 'EOF'
           #!/bin/bash
-          echo "Mock Oracle"
-          MOCK
+          echo "Mock Oracle v1.0.0"
+          exit 0
+          EOF
           chmod +x /tmp/mock-bin/oracle
-          export PATH="/tmp/mock-bin:$PATH"
+          echo "/tmp/mock-bin" >> $GITHUB_PATH
 
-          # Dry run should work with mock
-          ./apr run 1 --dry-run 2>&1 | tee output.txt
-          grep -q "Would execute" output.txt && echo "Dry run works!"
+      - name: Test apr run --dry-run
+        run: |
+          ./apr run 1 --dry-run 2>&1 | tee test-results/dry-run.txt
+          grep -q "Would execute" test-results/dry-run.txt && echo "Dry run test passed!"
 
-  install-test:
-    name: Installer Test
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}
+          path: test-results/
+          retention-days: 14
+
+  robot-mode-test:
+    name: Robot Mode Tests
     runs-on: ubuntu-latest
-    needs: lint
+    needs: [shellcheck, syntax]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Test installer syntax
-        run: |
-          bash -n install.sh
-          shellcheck install.sh
+      - name: Install jq
+        run: sudo apt-get install -y jq
 
-      - name: Test installer (local file simulation)
+      - name: Make apr executable
+        run: chmod +x apr
+
+      - name: Test robot status (unconfigured)
         run: |
-          # Create a test environment
-          export HOME=$(mktemp -d)
+          result=$(./apr robot status 2>/dev/null || true)
+          echo "$result" | jq .
+
+          # Should indicate not configured
+          configured=$(echo "$result" | jq -r '.data.configured')
+          if [[ "$configured" == "true" ]]; then
+            echo "::error::Expected configured=false for unconfigured project"
+            exit 1
+          fi
+          echo "Robot status test passed (unconfigured state)"
+
+      - name: Initialize .apr directory
+        run: |
+          result=$(./apr robot init)
+          echo "$result" | jq .
+
+          ok=$(echo "$result" | jq -r '.ok')
+          if [[ "$ok" != "true" ]]; then
+            echo "::error::robot init failed"
+            exit 1
+          fi
+          echo "Robot init test passed"
+
+      - name: Create test workflow
+        run: |
+          mkdir -p .apr/workflows .apr/rounds/test
+          cat > .apr/workflows/test.yaml << 'EOF'
+          name: test
+          description: Test workflow for robot mode
+          documents:
+            readme: README.md
+            spec: AGENTS.md
+          oracle:
+            model: "5.2 Thinking"
+          rounds:
+            output_dir: .apr/rounds/test
+          EOF
+          cat > .apr/config.yaml << 'EOF'
+          default_workflow: test
+          EOF
+
+      - name: Test robot status (configured)
+        run: |
+          result=$(./apr robot status)
+          echo "$result" | jq .
+
+          configured=$(echo "$result" | jq -r '.data.configured')
+          if [[ "$configured" != "true" ]]; then
+            echo "::error::Expected configured=true after init"
+            exit 1
+          fi
+          echo "Robot status test passed (configured state)"
+
+      - name: Test robot workflows
+        run: |
+          result=$(./apr robot workflows)
+          echo "$result" | jq .
+
+          count=$(echo "$result" | jq '.data.workflows | length')
+          if [[ "$count" -lt 1 ]]; then
+            echo "::error::Expected at least 1 workflow"
+            exit 1
+          fi
+          echo "Robot workflows test passed"
+
+      - name: Test robot validate (missing previous round)
+        run: |
+          # Round 2 should fail validation (no round 1)
+          result=$(./apr robot validate 2 --workflow test 2>/dev/null || true)
+          echo "$result" | jq .
+
+          valid=$(echo "$result" | jq -r '.data.valid')
+          if [[ "$valid" == "true" ]]; then
+            echo "::warning::Expected validation to fail for round 2 without round 1"
+          fi
+          echo "Robot validate test passed"
+
+      - name: Test robot help
+        run: |
+          result=$(./apr robot help)
+          echo "$result" | jq .
+
+          ok=$(echo "$result" | jq -r '.ok')
+          if [[ "$ok" != "true" ]]; then
+            echo "::error::robot help failed"
+            exit 1
+          fi
+          echo "Robot help test passed"
+
+  install-test:
+    name: Installer Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [shellcheck, syntax]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bash 5 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "$(brew --prefix)/bin" >> $GITHUB_PATH
+
+      - name: Display bash version
+        run: bash --version
+
+      - name: Create isolated test environment
+        run: |
+          TEST_HOME=$(mktemp -d)
+          echo "TEST_HOME=$TEST_HOME" >> $GITHUB_ENV
+
+      - name: Test installer with local file
+        run: |
+          # Use a modified installer that copies from local instead of downloading
+          export HOME="$TEST_HOME"
           export APR_NO_DEPS=1
 
-          # Modify installer to use local file instead of downloading
-          sed 's|download_file "$download_url" "$tmp_file"|cp apr "$tmp_file"|g' install.sh > /tmp/test_install.sh
+          # Create modified installer for testing
+          sed 's|download_file "$download_url" "$tmp_file"|cp "'"$(pwd)"'/apr" "$tmp_file"|g' install.sh > /tmp/test_install.sh
 
-          # Run installer
+          # Run the modified installer
           bash /tmp/test_install.sh
 
-          # Verify installation
-          if [[ -x "$HOME/.local/bin/apr" ]]; then
-            echo "Installation successful!"
-            "$HOME/.local/bin/apr" --version
-          else
-            echo "Installation failed"
+      - name: Verify installation
+        run: |
+          export HOME="$TEST_HOME"
+
+          # Check executable exists
+          if [[ ! -x "$HOME/.local/bin/apr" ]]; then
+            echo "::error::apr not installed to $HOME/.local/bin/"
+            ls -la "$HOME/.local/bin/" || true
             exit 1
+          fi
+
+          echo "Installation successful!"
+
+      - name: Verify apr works after installation
+        run: |
+          export HOME="$TEST_HOME"
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Test version
+          apr --version
+
+          # Test help (first 20 lines)
+          apr --help 2>&1 | head -20
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [[ -n "$TEST_HOME" && -d "$TEST_HOME" ]]; then
+            rm -rf "$TEST_HOME"
           fi

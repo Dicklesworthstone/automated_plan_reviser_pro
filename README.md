@@ -1038,6 +1038,9 @@ apr (bash script, ~1950 LOC)
 └── .last_update_check    # Daily update check timestamp
 ```
 
+Workflow YAMLs can include `template` and `template_with_impl` block scalars to
+override the Oracle prompt. If omitted, APR uses the built-in default prompt.
+
 ### File Locations
 
 | Path | Purpose |
