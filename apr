@@ -1515,9 +1515,9 @@ metrics_write_atomic() {
     verbose "Wrote metrics to $metrics_path"
 }
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Document Metrics Collection (fzi.3)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 collect_document_metrics() {
     local file_path="$1"
@@ -1528,10 +1528,10 @@ collect_document_metrics() {
         return 1
     fi
 
-    verbose "Collecting metrics for $doc_type: $file_path"
+    verbose "Collecting metrics for $doc_type: ${file_path:-<empty>}"
 
     if [[ -z "$file_path" || ! -f "$file_path" ]]; then
-        verbose "File not found for $doc_type: $file_path"
+        verbose "File not found for $doc_type: ${file_path:-<empty>}"
         echo "null"
         return 0
     fi
@@ -1552,11 +1552,11 @@ collect_document_metrics() {
         print_warning "Large $doc_type file (>1MB): $file_path"
     fi
 
-    heading_count=$(grep -c '^#' "$file_path" 2>/dev/null || echo 0)
-    raw_code_blocks=$(grep -c '^```' "$file_path" 2>/dev/null || echo 0)
+    heading_count=$(grep -c '^#' "$file_path" 2>/dev/null || true)
+    raw_code_blocks=$(grep -c '^```' "$file_path" 2>/dev/null || true)
     code_block_count=$((raw_code_blocks / 2))
-    link_count=$(grep -oE '\[([^\]]+)\]\([^)]+\)' "$file_path" 2>/dev/null | wc -l | tr -d ' ')
-    list_item_count=$(grep -cE '^[[:space:]]*([-*]|[0-9]+\.)' "$file_path" 2>/dev/null || echo 0)
+    link_count=$({ grep -oE '\[([^\]]+)\]\([^)]+\)' "$file_path" 2>/dev/null || true; } | wc -l | tr -d ' ')
+    list_item_count=$(grep -cE '^[[:space:]]*([-*]|[0-9]+\.)' "$file_path" 2>/dev/null || true)
 
     verbose "Structure metrics: headings=$heading_count code_blocks=$code_block_count links=$link_count lists=$list_item_count"
 
@@ -1591,6 +1591,7 @@ collect_round_document_metrics() {
     local readme_path="$3"
     local spec_path="$4"
     local impl_path="${5:-}"
+    local output_path="${6:-}"
 
     if ! command -v jq &>/dev/null; then
         print_error "jq is required for analytics metrics"
@@ -1602,14 +1603,20 @@ collect_round_document_metrics() {
     verbose "  Spec:   $spec_path"
     verbose "  Impl:   ${impl_path:-<none>}"
 
+    if [[ -z "$output_path" ]]; then
+        output_path="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
+    fi
+    verbose "  Output: $output_path"
+
     local readme_metrics spec_metrics impl_metrics output_metrics
     readme_metrics=$(collect_document_metrics "$readme_path" "readme")
     spec_metrics=$(collect_document_metrics "$spec_path" "spec")
-    impl_metrics=$(collect_document_metrics "$impl_path" "implementation")
-
-    local output_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
-    verbose "  Output: $output_file"
-    output_metrics=$(collect_document_metrics "$output_file" "output")
+    if [[ -n "$impl_path" ]]; then
+        impl_metrics=$(collect_document_metrics "$impl_path" "implementation")
+    else
+        impl_metrics="null"
+    fi
+    output_metrics=$(collect_document_metrics "$output_path" "output")
 
     verbose "All document metrics collected, building aggregate JSON"
 
@@ -1624,6 +1631,141 @@ collect_round_document_metrics() {
             implementation: $impl,
             output: $output
         }'
+}
+
+# ---------------------------------------------------------------------------
+# Inter-Round Change Analysis (fzi.4)
+# ---------------------------------------------------------------------------
+
+calculate_change_metrics() {
+    local old_file="$1"
+    local new_file="$2"
+
+    local start_ts end_ts elapsed_ms
+    start_ts=$(date +%s 2>/dev/null || echo 0)
+
+    verbose "Calculating change metrics"
+    verbose "  Old: $old_file"
+    verbose "  New: $new_file"
+
+    # Handle missing files
+    if [[ -z "$old_file" || ! -f "$old_file" ]]; then
+        verbose "Old file not found, returning null"
+        echo "null"
+        return 0
+    fi
+
+    if [[ -z "$new_file" || ! -f "$new_file" ]]; then
+        verbose "New file not found, returning null"
+        echo "null"
+        return 0
+    fi
+
+    # Fast path: files are identical
+    if cmp -s "$old_file" "$new_file"; then
+        verbose "Files are identical (fast path)"
+        end_ts=$(date +%s 2>/dev/null || echo 0)
+        elapsed_ms=$(( (end_ts - start_ts) * 1000 ))
+        verbose "calculate_change_metrics completed in ${elapsed_ms}ms"
+        jq -nc '{
+            lines_added: 0,
+            lines_deleted: 0,
+            lines_modified: 0,
+            total_changes: 0,
+            diff_ratio: 0,
+            similarity_score: 1.0,
+            identical: true
+        }'
+        return 0
+    fi
+
+    verbose "Files differ, computing metrics..."
+
+    local lines_added lines_deleted total_changes
+    local total_lines diff_ratio similarity_score
+
+    # Get diff output
+    local diff_output
+    diff_output=$(diff "$old_file" "$new_file" 2>/dev/null || true)
+
+    # Count changes
+    lines_added=$(echo "$diff_output" | grep -c '^>' 2>/dev/null || echo 0)
+    lines_deleted=$(echo "$diff_output" | grep -c '^<' 2>/dev/null || echo 0)
+    total_changes=$((lines_added + lines_deleted))
+
+    verbose "Diff counts: +$lines_added -$lines_deleted (total: $total_changes)"
+
+    # Calculate diff ratio
+    total_lines=$(wc -l < "$new_file" | tr -d ' ')
+    if [[ "$total_lines" =~ ^[0-9]+$ ]] && [[ $total_lines -gt 0 ]]; then
+        diff_ratio=$(echo "scale=4; $total_changes / $total_lines" | bc 2>/dev/null || echo "0")
+    else
+        diff_ratio="0"
+    fi
+
+    verbose "Diff ratio: $diff_ratio ($total_changes / $total_lines)"
+
+    # Calculate similarity score using line-based Jaccard
+    local common_lines total_unique
+    common_lines=$(comm -12 <(sort "$old_file") <(sort "$new_file") 2>/dev/null | wc -l | tr -d ' ')
+    total_unique=$(cat <(sort -u "$old_file") <(sort -u "$new_file") 2>/dev/null | sort -u | wc -l | tr -d ' ')
+
+    if [[ "$total_unique" =~ ^[0-9]+$ ]] && [[ $total_unique -gt 0 ]]; then
+        similarity_score=$(echo "scale=4; $common_lines / $total_unique" | bc 2>/dev/null || echo "1.0")
+    else
+        similarity_score="1.0"
+    fi
+
+    verbose "Similarity: $similarity_score ($common_lines common / $total_unique unique)"
+
+    end_ts=$(date +%s 2>/dev/null || echo 0)
+    elapsed_ms=$(( (end_ts - start_ts) * 1000 ))
+    verbose "calculate_change_metrics completed in ${elapsed_ms}ms"
+
+    # Build JSON result
+    jq -nc \
+        --argjson lines_added "$lines_added" \
+        --argjson lines_deleted "$lines_deleted" \
+        --argjson total_changes "$total_changes" \
+        --arg diff_ratio "$diff_ratio" \
+        --arg similarity_score "$similarity_score" \
+        '{
+            lines_added: $lines_added,
+            lines_deleted: $lines_deleted,
+            lines_modified: 0,
+            total_changes: $total_changes,
+            diff_ratio: ($diff_ratio | tonumber),
+            similarity_score: ($similarity_score | tonumber),
+            identical: false
+        }'
+}
+
+calculate_round_changes() {
+    local workflow="$1"
+    local current_round="$2"
+
+    local prev_round=$((current_round - 1))
+
+    verbose "Calculating round changes: round $current_round vs round $prev_round"
+
+    # No previous round
+    if [[ $prev_round -lt 1 ]]; then
+        verbose "No previous round (current is round 1), returning null"
+        echo "null"
+        return 0
+    fi
+
+    # Compare OUTPUT files (GPT responses), not spec files
+    # The spec changes are made by the USER after each round
+    # We track GPT output changes to detect convergence
+    local prev_output="$CONFIG_DIR/rounds/$workflow/round_${prev_round}.md"
+    local curr_output="$CONFIG_DIR/rounds/$workflow/round_${current_round}.md"
+
+    verbose "Comparing outputs:"
+    verbose "  Previous: $prev_output"
+    verbose "  Current:  $curr_output"
+
+    calculate_change_metrics "$prev_output" "$curr_output"
 }
 
 # -----------------------------------------------------------------------------
@@ -2072,6 +2214,45 @@ run_round() {
         if [[ $oracle_exit -eq 0 ]]; then
             print_success "Review complete! (${elapsed_fmt} elapsed)"
             print_info "Output saved to: $output_file"
+
+            # Best-effort metrics collection
+            if command -v jq &>/dev/null; then
+                local doc_metrics round_record
+                doc_metrics=$(collect_round_document_metrics "$workflow" "$round_num" \
+                    "$readme_path" "$spec_path" "$impl_path" "$output_file") || {
+                    print_warning "Metrics collection failed; continuing without analytics"
+                }
+
+                if [[ -n "${doc_metrics:-}" ]]; then
+                    round_record=$(jq -nc \
+                        --argjson num "$round_num" \
+                        --arg ts "$(iso_timestamp)" \
+                        --argjson docs "$doc_metrics" \
+                        '{
+                            round: $num,
+                            timestamp: $ts,
+                            documents: {
+                                readme: $docs.readme,
+                                spec: $docs.spec,
+                                implementation: $docs.implementation
+                            },
+                            output: $docs.output,
+                            changes_from_previous: null
+                        }') || {
+                        print_warning "Failed to build round metrics record"
+                    }
+
+                    if [[ -n "${round_record:-}" ]]; then
+                        if metrics_write_round "$workflow" "$round_num" "$round_record"; then
+                            verbose "Metrics written for round $round_num"
+                        else
+                            print_warning "Failed to write round metrics"
+                        fi
+                    fi
+                fi
+            else
+                print_warning "jq not available; skipping metrics collection"
+            fi
         else
             print_error "Oracle failed after ${elapsed_fmt} (exit code: $oracle_exit)"
             exit $oracle_exit
