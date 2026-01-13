@@ -75,6 +75,7 @@ jobs:
         run: |
           # Combined checksums file (full format: hash  filename)
           sha256sum apr install.sh > checksums.txt
+          sha256sum apr install.sh > CHECKSUMS.sha256
           echo "Combined checksums:"
           cat checksums.txt
 
@@ -168,6 +169,7 @@ jobs:
             apr
             install.sh
             checksums.txt
+            CHECKSUMS.sha256
             apr.sha256
             install.sh.sha256
             VERSION
@@ -197,6 +199,7 @@ jobs:
 
           # Generate combined checksums
           sha256sum apr install.sh > checksums.txt
+          sha256sum apr install.sh > CHECKSUMS.sha256
 
           echo "Generated checksums:"
           echo "apr: $(cat apr.sha256)"
@@ -210,10 +213,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # Check if any checksum files changed
-          if git diff --quiet apr.sha256 install.sh.sha256 checksums.txt 2>/dev/null; then
+          if git diff --quiet apr.sha256 install.sh.sha256 checksums.txt CHECKSUMS.sha256 2>/dev/null; then
             echo "Checksums unchanged, skipping commit."
           else
-            git add apr.sha256 install.sh.sha256 checksums.txt
+            git add apr.sha256 install.sh.sha256 checksums.txt CHECKSUMS.sha256
 
             # Only commit if there are staged changes
             if git diff --cached --quiet; then

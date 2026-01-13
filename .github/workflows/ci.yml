@@ -8,6 +8,21 @@ on:
   workflow_dispatch:
 
 jobs:
+  checksums:
+    name: Checksum Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify checksums match scripts
+        run: |
+          set -euo pipefail
+          sha256sum -c checksums.txt
+          sha256sum -c CHECKSUMS.sha256
+          echo "$(cat apr.sha256)  apr" | sha256sum -c -
+          echo "$(cat install.sh.sha256)  install.sh" | sha256sum -c -
+
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest
@@ -287,6 +302,9 @@ jobs:
           # Use a modified installer that copies from local instead of downloading
           export HOME="$TEST_HOME"
           export APR_NO_DEPS=1
+          # The installer normally verifies against main-branch checksums; in CI we install from the
+          # checked-out workspace copy, and checksums are validated separately above.
+          export APR_SKIP_VERIFY=1
 
           # Create modified installer for testing
           sed 's|download_file "$download_url" "$tmp_file"|cp "'"$(pwd)"'/apr" "$tmp_file"|g' install.sh > /tmp/test_install.sh
