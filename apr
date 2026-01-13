@@ -1515,6 +1515,117 @@ metrics_write_atomic() {
     verbose "Wrote metrics to $metrics_path"
 }
 
+# ---------------------------------------------------------------------------
+# Document Metrics Collection (fzi.3)
+# ---------------------------------------------------------------------------
+
+collect_document_metrics() {
+    local file_path="$1"
+    local doc_type="${2:-document}"
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for analytics metrics"
+        return 1
+    fi
+
+    verbose "Collecting metrics for $doc_type: $file_path"
+
+    if [[ -z "$file_path" || ! -f "$file_path" ]]; then
+        verbose "File not found for $doc_type: $file_path"
+        echo "null"
+        return 0
+    fi
+
+    local start_ts end_ts elapsed_ms
+    start_ts=$(date +%s 2>/dev/null || echo 0)
+
+    local char_count word_count line_count
+    local heading_count raw_code_blocks code_block_count link_count list_item_count
+
+    char_count=$(wc -c < "$file_path" | tr -d ' ')
+    word_count=$(wc -w < "$file_path" | tr -d ' ')
+    line_count=$(wc -l < "$file_path" | tr -d ' ')
+
+    verbose "Basic metrics: chars=$char_count words=$word_count lines=$line_count"
+
+    if [[ "$char_count" =~ ^[0-9]+$ ]] && [[ "$char_count" -gt 1048576 ]]; then
+        print_warning "Large $doc_type file (>1MB): $file_path"
+    fi
+
+    heading_count=$(grep -c '^#' "$file_path" 2>/dev/null || echo 0)
+    raw_code_blocks=$(grep -c '^```' "$file_path" 2>/dev/null || echo 0)
+    code_block_count=$((raw_code_blocks / 2))
+    link_count=$(grep -oE '\[([^\]]+)\]\([^)]+\)' "$file_path" 2>/dev/null | wc -l | tr -d ' ')
+    list_item_count=$(grep -cE '^[[:space:]]*([-*]|[0-9]+\.)' "$file_path" 2>/dev/null || echo 0)
+
+    verbose "Structure metrics: headings=$heading_count code_blocks=$code_block_count links=$link_count lists=$list_item_count"
+
+    end_ts=$(date +%s 2>/dev/null || echo 0)
+    elapsed_ms=$(( (end_ts - start_ts) * 1000 ))
+    verbose "collect_document_metrics completed in ${elapsed_ms}ms"
+
+    jq -nc \
+        --arg path "$file_path" \
+        --argjson char_count "$char_count" \
+        --argjson word_count "$word_count" \
+        --argjson line_count "$line_count" \
+        --argjson heading_count "$heading_count" \
+        --argjson code_block_count "$code_block_count" \
+        --argjson link_count "$link_count" \
+        --argjson list_item_count "$list_item_count" \
+        '{
+            path: $path,
+            char_count: $char_count,
+            word_count: $word_count,
+            line_count: $line_count,
+            heading_count: $heading_count,
+            code_block_count: $code_block_count,
+            link_count: $link_count,
+            list_item_count: $list_item_count
+        }'
+}
+
+collect_round_document_metrics() {
+    local workflow="$1"
+    local round_num="$2"
+    local readme_path="$3"
+    local spec_path="$4"
+    local impl_path="${5:-}"
+
+    if ! command -v jq &>/dev/null; then
+        print_error "jq is required for analytics metrics"
+        return 1
+    fi
+
+    verbose "Collecting round $round_num document metrics for workflow: $workflow"
+    verbose "  README: $readme_path"
+    verbose "  Spec:   $spec_path"
+    verbose "  Impl:   ${impl_path:-<none>}"
+
+    local readme_metrics spec_metrics impl_metrics output_metrics
+    readme_metrics=$(collect_document_metrics "$readme_path" "readme")
+    spec_metrics=$(collect_document_metrics "$spec_path" "spec")
+    impl_metrics=$(collect_document_metrics "$impl_path" "implementation")
+
+    local output_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
+    verbose "  Output: $output_file"
+    output_metrics=$(collect_document_metrics "$output_file" "output")
+
+    verbose "All document metrics collected, building aggregate JSON"
+
+    jq -nc \
+        --argjson readme "$readme_metrics" \
+        --argjson spec "$spec_metrics" \
+        --argjson impl "$impl_metrics" \
+        --argjson output "$output_metrics" \
+        '{
+            readme: $readme,
+            spec: $spec,
+            implementation: $impl,
+            output: $output
+        }'
+}
+
 # -----------------------------------------------------------------------------
 # Interactive Setup Wizard
 # -----------------------------------------------------------------------------
@@ -2482,7 +2593,7 @@ show_stats() {
         local round_num round_file size_bytes size_human mod_ts
         round_num=${entry%%|*}
         round_file=${entry#*|}
-        ((total_rounds++))
+        ((++total_rounds))
 
         size_bytes=$(stat -c '%s' "$round_file" 2>/dev/null || stat -f '%z' "$round_file" 2>/dev/null || echo "0")
         size_human=$(du -h "$round_file" 2>/dev/null | cut -f1)
@@ -2518,7 +2629,7 @@ show_stats() {
             else
                 second_half_avg=$((second_half_avg + size))
             fi
-            ((i++))
+            ((++i))
         done
         first_half_avg=$((first_half_avg / half))
         second_half_avg=$((second_half_avg / (total_rounds - half)))
