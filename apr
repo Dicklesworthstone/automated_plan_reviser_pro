@@ -627,12 +627,17 @@ oracle_detect_features() {
         return 0
     fi
 
-    if "${ORACLE_CMD[@]}" --help 2>&1 | grep -q -- '--notify'; then
+    # Check if --notify actually works with real commands (not just appears in help).
+    # Oracle 0.8.4 has a bug where --notify appears in help but is rejected by the parser
+    # when used with actual prompts. Test by checking if the flag produces an error.
+    local _notify_test
+    _notify_test=$("${ORACLE_CMD[@]}" -p "test" --notify --render 2>&1)
+    if echo "$_notify_test" | /usr/bin/grep -q "unknown option"; then
+        ORACLE_SUPPORTS_NOTIFY=false
+        verbose "oracle_detect_features: Oracle --notify rejected by parser (Oracle bug)"
+    else
         ORACLE_SUPPORTS_NOTIFY=true
         verbose "oracle_detect_features: Oracle supports --notify"
-    else
-        ORACLE_SUPPORTS_NOTIFY=false
-        verbose "oracle_detect_features: Oracle does not support --notify"
     fi
 
     ORACLE_FEATURES_DETECTED=true
@@ -2884,13 +2889,14 @@ run_round() {
     fi
 
     # Parse config (simple grep-based for now)
-    local readme_path spec_path impl_path model output_dir impl_every_n
+    local readme_path spec_path impl_path model output_dir impl_every_n thinking_time
     readme_path=$(yaml_unquote "$(get_config_value "readme" "$config_path")")
     spec_path=$(yaml_unquote "$(get_config_value "spec" "$config_path")")
     impl_path=$(yaml_unquote "$(get_config_value "implementation" "$config_path")")
     model=$(yaml_unquote "$(get_config_value "model" "$config_path")")
     output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$config_path")")
     impl_every_n=$(yaml_unquote "$(get_config_value "impl_every_n" "$config_path")")
+    thinking_time=$(yaml_unquote "$(get_config_value "thinking_time" "$config_path")")
 
     # Auto-include implementation every N rounds if configured
     if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]]; then
@@ -2919,6 +2925,7 @@ run_round() {
     verbose "  Model: $model"
     verbose "  Output dir: $output_dir"
     verbose "  impl_every_n: ${impl_every_n:-<not configured>}"
+    verbose "  thinking_time: ${thinking_time:-<not configured>}"
 
     if [[ -z "$model" ]]; then
         print_error "Model not configured in $config_path"
@@ -3031,7 +3038,12 @@ run_round() {
 
     # Best-effort Oracle feature detection for accurate dry-run output and
     # to enable optional flags when preflight is skipped.
+    # Note: In dry-run/render mode, preflight_check doesn't run, so check_oracle
+    # hasn't set ORACLE_CMD yet. Call it here if needed.
     if [[ "$render" != "true" ]]; then
+        if [[ ${#ORACLE_CMD[@]} -eq 0 ]]; then
+            check_oracle || true
+        fi
         if [[ "$dry_run" == "true" ]]; then
             oracle_detect_features fast || true
         else
@@ -3056,6 +3068,7 @@ run_round() {
         [[ "$manual_login" == "true" ]] && echo "    --browser-manual-login \\" >&2
         [[ "$keep_browser" == "true" ]] && echo "    --browser-keep-browser \\" >&2
         [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && echo "    --notify \\" >&2
+        [[ -n "$thinking_time" ]] && echo "    --browser-thinking-time \"$thinking_time\" \\" >&2
         echo "    --heartbeat 30 \\" >&2
         echo "    -p \"<prompt>\"" >&2
         exit $EXIT_SUCCESS
@@ -3093,6 +3106,7 @@ run_round() {
     [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && oracle_args+=(--notify)
     [[ "$manual_login" == "true" ]] && oracle_args+=(--browser-manual-login)
     [[ "$keep_browser" == "true" ]] && oracle_args+=(--browser-keep-browser)
+    [[ -n "$thinking_time" ]] && oracle_args+=(--browser-thinking-time "$thinking_time")
     oracle_args+=(-p "$prompt")
 
     verbose "Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
