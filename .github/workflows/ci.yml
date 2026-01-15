@@ -11,6 +11,9 @@ jobs:
   checksums:
     name: Checksum Consistency
     runs-on: ubuntu-latest
+    # Only run on PRs - pushes to main are handled by auto-checksum.yml workflow
+    # This avoids race conditions where CI and auto-checksum run concurrently
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
