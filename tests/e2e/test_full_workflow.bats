@@ -289,12 +289,15 @@ EOF
 @test "e2e: robot mode error handling" {
     setup_test_workflow "default"
 
-    # Try invalid command
-    run "$APR_SCRIPT" robot invalid-command
+    # Try invalid command (capture_streams separates stdout from stderr
+    # because robot_fail emits APR_ERROR_CODE=... to stderr)
+    capture_streams "$APR_SCRIPT" robot invalid-command
+    output="$CAPTURED_STDOUT"
+    status="$CAPTURED_STATUS"
 
     log_test_output "$output"
 
-    assert_failure
+    [[ "$status" -ne 0 ]]  # assert_failure equivalent
     assert_valid_json "$output"
     [[ "$output" == *'"ok":false'* ]] || [[ "$output" == *'"ok": false'* ]]
 }
