@@ -6,7 +6,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-1.2.2-blue?style=for-the-badge)](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue?style=for-the-badge)](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blueviolet?style=for-the-badge)](https://github.com/Dicklesworthstone/automated_plan_reviser_pro)
 [![Runtime](https://img.shields.io/badge/runtime-Bash%204+-purple?style=for-the-badge)](https://github.com/Dicklesworthstone/automated_plan_reviser_pro)
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue-the-badge)](./LICENSE)

@@ -8,9 +8,7 @@ Repository: <https://github.com/Dicklesworthstone/automated_plan_reviser_pro>
 
 ---
 
-## [Unreleased]
-
-Changes on `main` after the v1.2.2 tag (2026-01-15). No GitHub Release yet.
+## [v1.3.0](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases/tag/v1.3.0) -- 2026-08-25
 
 ### Robot Mode -- TOON Output Format
 
