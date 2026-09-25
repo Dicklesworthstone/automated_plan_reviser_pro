@@ -93,6 +93,29 @@ teardown() {
     [[ -d ".apr/rounds" ]] || [[ "$output" == *"rounds"* ]] || [[ "$output" == *"Created"* ]]
 }
 
+@test "setup: Custom / Other records any Oracle model id (GH #5)" {
+    # name, description, README, spec, menu option 4, model id (the impl-doc
+    # confirm does not read stdin when it is not a terminal)
+    run "$APR_SCRIPT" setup <<< $'customflow\nDesc\nREADME.md\nSPECIFICATION.md\n4\n  gemini-3-pro  \n'
+
+    log_test_output "$output"
+
+    assert_success
+    assert_file_exists ".apr/workflows/customflow.yaml"
+    run grep -n '^  model: "gemini-3-pro"$' .apr/workflows/customflow.yaml
+    assert_success
+}
+
+@test "setup: Custom / Other rejects an empty model id (GH #5)" {
+    run "$APR_SCRIPT" setup <<< $'emptyflow\nDesc\nREADME.md\nSPECIFICATION.md\n4\n\n'
+
+    log_test_output "$output"
+
+    assert_failure
+    [[ "$output" == *"A model id is required"* ]]
+    [[ ! -f ".apr/workflows/emptyflow.yaml" ]]
+}
+
 # =============================================================================
 # Setup with Existing Configuration Tests
 # =============================================================================

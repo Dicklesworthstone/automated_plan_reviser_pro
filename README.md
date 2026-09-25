@@ -585,10 +585,11 @@ Select implementation file: docs/fcp_model_connectors_rust.md
 ✓ Implementation: docs/fcp_model_connectors_rust.md
 
 [6/6] Review preferences
-Select GPT model for reviews:
+Select model for reviews:
   > 5.2 Thinking (Extended Reasoning)
     gpt-5.2-pro
     gpt-5.2
+    Custom / Other (any Oracle model id)
 
 ╭────────────────────────────────────────────────────────────╮
 │  ✓ Workflow 'fcp-spec' created successfully!               │
@@ -1695,6 +1696,7 @@ These control how APR patches Oracle to tolerate GPT Pro Extended Thinking pause
 | `APR_ORACLE_SHORT_STABLE_MS` | Shorter threshold for non-extended responses | `15000` |
 | `APR_ORACLE_SETTLE_WINDOW_MS` | Completion detection window | `30000` |
 | `APR_ORACLE_STABLE_CYCLES` | Polling cycles required for stability | `12` |
+| `APR_RECOVERY_WAIT_SECS` | Seconds to wait before reattaching to recover a truncated answer (`0` skips the wait) | `30` |
 
 ### Status & Monitoring
 

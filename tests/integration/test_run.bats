@@ -381,6 +381,37 @@ EOF
     assert_success
 }
 
+@test "run: APR_RECOVERY_WAIT_SECS sets the truncation recovery wait (GH #5)" {
+    # The mock Oracle writes no output file, so the recovery path runs.
+    export APR_RECOVERY_WAIT_SECS=1
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STDERR" == *"Waiting 1s for 5.2 Thinking to complete generation"* ]]
+    [[ "$CAPTURED_STDERR" != *"Waiting 30s"* ]]
+}
+
+@test "run: APR_RECOVERY_WAIT_SECS=0 skips the recovery wait (GH #5)" {
+    export APR_RECOVERY_WAIT_SECS=0
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STDERR" == *"Attempting automatic recovery"* ]]
+    [[ "$CAPTURED_STDERR" != *"to complete generation"* ]]
+}
+
+@test "run: invalid APR_RECOVERY_WAIT_SECS warns and uses the default (GH #5)" {
+    export APR_RECOVERY_WAIT_SECS=soon
+    capture_streams "$APR_SCRIPT" run 1 --dry-run
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDERR" == *"APR_RECOVERY_WAIT_SECS must be a non-negative integer, got 'soon'"* ]]
+}
+
 # =============================================================================
 # Preflight Tests
 # =============================================================================

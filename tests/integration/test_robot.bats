@@ -325,6 +325,21 @@ teardown() {
     [[ "$output" == *"specification"* ]] || [[ "$output" == *"SPECIFICATION.md"* ]]
 }
 
+@test "apr robot integrate: prompt names the configured model (GH #5)" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot"
+
+    run "$APR_SCRIPT" robot integrate 1 -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    local prompt
+    prompt=$(echo "$output" | jq -r '.data.prompt')
+    [[ "$prompt" == *"feedback from the APR reviewer model (5.2 Thinking)"* ]]
+    [[ "$prompt" != *"GPT Pro 5.2"* ]]
+}
+
 @test "apr robot integrate: returns stats" {
     setup_test_workflow "robot"
     create_mock_round 1 "robot" "Some content here"

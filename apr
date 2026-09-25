@@ -58,6 +58,7 @@
 #   APR_ORACLE_SETTLE_WINDOW_MS  Settle window for completion detection (default: 30000ms)
 #   APR_ORACLE_STABLE_CYCLES     Required stable polling cycles (default: 12)
 #   APR_NO_ORACLE_PATCH          Disable Oracle patching (set to 1)
+#   APR_RECOVERY_WAIT_SECS       Wait before reattaching to recover a truncated answer (default: 30)
 #
 # More info: https://github.com/Dicklesworthstone/automated_plan_reviser_pro
 
@@ -178,6 +179,15 @@ for _apr_var in APR_ORACLE_MIN_STABLE_MS APR_ORACLE_SHORT_STABLE_MS APR_ORACLE_S
     fi
 done
 unset _apr_var _apr_val
+
+# Seconds to wait before reattaching to the Oracle session when an answer looks
+# truncated. Deep-thinking models can keep generating for minutes. 0 = no wait.
+APR_RECOVERY_WAIT_SECS="${APR_RECOVERY_WAIT_SECS:-30}"
+if ! [[ "$APR_RECOVERY_WAIT_SECS" =~ ^[0-9]+$ ]]; then
+    echo "Warning: APR_RECOVERY_WAIT_SECS must be a non-negative integer, got '$APR_RECOVERY_WAIT_SECS'. Using default." >&2
+    APR_RECOVERY_WAIT_SECS=30
+fi
+APR_RECOVERY_WAIT_SECS=$((10#$APR_RECOVERY_WAIT_SECS))
 
 # Temp directory for cleanup on exit
 APR_TEMP_DIR=""
@@ -1488,6 +1498,18 @@ yaml_quote() {
     value=${value//\\/\\\\}
     value=${value//\"/\\\"}
     printf '"%s"' "$value"
+}
+
+# Describe the workflow's reviewer model for integration prompts.
+# Usage: integration_reviewer_label <workflow_file>
+integration_reviewer_label() {
+    local model
+    model=$(yaml_unquote "$(get_config_value "model" "$1" 2>/dev/null || true)")
+    if [[ -n "$model" ]]; then
+        printf 'the APR reviewer model (%s)' "$model"
+    else
+        printf 'the APR reviewer model'
+    fi
 }
 
 yaml_unquote() {
@@ -2906,14 +2928,25 @@ run_setup() {
     # Step 5: Review preferences
     print_step 5 5 "Review preferences"
     local model
-    model=$(choose "Select GPT model for reviews:" \
+    model=$(choose "Select model for reviews:" \
         "5.2 Thinking (Extended Reasoning)" \
         "gpt-5.2-pro" \
-        "gpt-5.2")
+        "gpt-5.2" \
+        "Custom / Other (any Oracle model id)")
 
     # Extract model name
     case "$model" in
         "5.2 Thinking"*) model="5.2 Thinking" ;;
+        "Custom / Other"*)
+            model=$(input "Oracle model id (as passed to 'oracle -m', e.g. gemini-3-pro)")
+            # Trim surrounding whitespace; the value is written into YAML below.
+            model="${model#"${model%%[![:space:]]*}"}"
+            model="${model%"${model##*[![:space:]]}"}"
+            if [[ -z "$model" || "$model" == *$'\n'* ]]; then
+                print_error "A model id is required"
+                exit $EXIT_CONFIG_ERROR
+            fi
+            ;;
         *) ;;
     esac
 
@@ -2938,7 +2971,7 @@ documents:
   implementation: $(yaml_quote "${impl_path:-}")
 
 oracle:
-  model: "$model"
+  model: $(yaml_quote "$model")
   thinking_time: heavy
 
 rounds:
@@ -3307,9 +3340,11 @@ run_round() {
                 local recovery_success=false
                 local recovery_output_file="${output_file}.recovery"
 
-                # Wait a bit for ChatGPT to complete if it's still generating
-                print_dim "Waiting 30s for ChatGPT to complete generation..."
-                sleep 30
+                # Wait a bit for the model to finish if it's still generating
+                if (( APR_RECOVERY_WAIT_SECS > 0 )); then
+                    print_dim "Waiting ${APR_RECOVERY_WAIT_SECS}s for $model to complete generation (APR_RECOVERY_WAIT_SECS)..."
+                    sleep "$APR_RECOVERY_WAIT_SECS"
+                fi
 
                 # Try to get the full output via session reattach
                 if "${ORACLE_CMD[@]}" session "$slug" --write-output "$recovery_output_file" 2>/dev/null; then
@@ -3853,6 +3888,8 @@ generate_integration() {
         print_info "Check 'spec:' in $workflow_file"
         exit $EXIT_CONFIG_ERROR
     fi
+    local reviewer
+    reviewer=$(integration_reviewer_label "$workflow_file")
 
     local round_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
     if [[ ! -f "$round_file" ]]; then
@@ -3872,7 +3909,7 @@ and understand ALL of both! Then use your code investigation agent mode
 to fully understand the code and technical architecture of the project.
 Read ALL of the specification document at: $spec_path
 
-Now integrate the following feedback from GPT Pro 5.2 Extended Reasoning
+Now integrate the following feedback from $reviewer
 (Round $round_num of the APR iterative refinement process). For each
 suggestion, carefully evaluate whether you agree with the proposed change.
 Then apply the changes you endorse to the specification document.
@@ -6124,6 +6161,8 @@ robot_integrate() {
         robot_fail "config_error" '{"field":"spec"}' "Spec path not configured in workflow"
         return $?
     fi
+    local reviewer
+    reviewer=$(integration_reviewer_label "$workflow_file")
 
     local round_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
     if [[ ! -f "$round_file" ]]; then
@@ -6146,7 +6185,7 @@ PROMPT_HEADER
     prompt+="
 Read ALL of the specification document at: $spec_path
 
-Now integrate the following feedback from GPT Pro 5.2 Extended Reasoning
+Now integrate the following feedback from $reviewer
 (Round $round_num of the APR iterative refinement process). For each
 suggestion, carefully evaluate whether you agree with the proposed change.
 Then apply the changes you endorse to the specification document.

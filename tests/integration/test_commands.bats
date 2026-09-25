@@ -481,6 +481,18 @@ teardown() {
     [[ "$output" == *"Round 1"* ]]
 }
 
+@test "apr integrate: names the workflow's configured model (GH #5)" {
+    create_mock_round 1 "default"
+
+    run "$APR_SCRIPT" integrate 1 --quiet
+
+    log_test_output "$output"
+
+    assert_success
+    [[ "$output" == *"feedback from the APR reviewer model (5.2 Thinking)"* ]]
+    [[ "$output" != *"GPT Pro 5.2"* ]]
+}
+
 @test "apr integrate: writes prompt to file with --output" {
     create_mock_round 1 "default"
 
