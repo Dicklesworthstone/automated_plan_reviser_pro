@@ -1186,6 +1186,41 @@ validate_output_file() {
     return 0
 }
 
+# Oracle turns --slug into a unique session ID: when <slug> is already taken
+# (an earlier run of the same round, an earlier retry attempt, or another
+# project with the same workflow name) the new session is <slug>-2, <slug>-3...
+# Recovery must harvest the session THIS run created, never an older one, or
+# it would overwrite the round with a stale answer.
+# Usage: resolve_oracle_session_id <slug> <marker_file>
+# Prints the <slug>/<slug>-N session whose meta.json changed after the marker
+# (created just before Oracle started), preferring the highest suffix. Prints
+# nothing when that cannot be determined.
+resolve_oracle_session_id() {
+    local slug="$1" marker="$2"
+    local sessions_dir="${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions"
+    [[ -n "$slug" && -n "$marker" && -e "$marker" && -d "$sessions_dir" ]] || return 0
+
+    local best="" best_n=0 dir name n
+    for dir in "$sessions_dir/$slug" "$sessions_dir/$slug"-*; do
+        [[ -f "$dir/meta.json" ]] || continue
+        name="${dir##*/}"
+        if [[ "$name" == "$slug" ]]; then
+            n=1
+        else
+            n="${name#"$slug"-}"
+            [[ "$n" =~ ^[0-9]{1,9}$ ]] || continue
+            n=$((10#$n))
+        fi
+        [[ "$dir/meta.json" -nt "$marker" ]] || continue
+        if (( n > best_n )); then
+            best_n=$n
+            best="$name"
+        fi
+    done
+    [[ -n "$best" ]] && printf '%s\n' "$best"
+    return 0
+}
+
 # -----------------------------------------------------------------------------
 # Styled Output Functions
 # -----------------------------------------------------------------------------
@@ -3311,6 +3346,11 @@ run_round() {
         local start_time oracle_exit=0
         start_time=$(date +%s)
 
+        # Timestamp marker so truncation recovery can tell which Oracle
+        # session this run created (see resolve_oracle_session_id).
+        local session_marker=""
+        session_marker=$(mktemp "${TMPDIR:-/tmp}/apr-oracle-start.XXXXXX" 2>/dev/null) || session_marker=""
+
         # Use auto-retry wrapper if enabled
         if [[ "$enable_retry" == "true" ]]; then
             run_oracle_with_retry "${oracle_args[@]}" || oracle_exit=$?
@@ -3328,6 +3368,10 @@ run_round() {
             elapsed_fmt=$(printf '%d:%02d' $((elapsed_secs/60)) $((elapsed_secs%60)))
         fi
         echo "" >&2
+
+        if [[ $oracle_exit -ne 0 && -n "$session_marker" ]]; then
+            rm -f "$session_marker"
+        fi
 
         if [[ $oracle_exit -eq 0 ]]; then
             # Validate output file for completeness
@@ -3353,7 +3397,24 @@ run_round() {
                 # which would flood the terminal, so stdout is discarded;
                 # stderr is kept so a failure says why.
                 local recovery_err_file="${output_file}.recovery.err"
-                if "${ORACLE_CMD[@]}" session "$slug" --harvest --write-output "$recovery_output_file" \
+                local session_id stale_session=false
+                session_id=$(resolve_oracle_session_id "$slug" "$session_marker")
+                if [[ -z "$session_id" ]]; then
+                    session_id="$slug"
+                    # The plain slug exists but predates this run: harvesting
+                    # it would bring back an older answer.
+                    local slug_meta="${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions/$slug/meta.json"
+                    if [[ -n "$session_marker" && -f "$slug_meta" && ! "$slug_meta" -nt "$session_marker" ]]; then
+                        stale_session=true
+                    fi
+                    verbose "Could not identify this run's Oracle session; trying slug: $slug"
+                elif [[ "$session_id" != "$slug" ]]; then
+                    print_dim "Oracle session for this run: $session_id"
+                fi
+                if [[ "$stale_session" == "true" ]]; then
+                    print_warning "Could not find the Oracle session this run created; not harvesting '$slug' (it belongs to an earlier run)"
+                    session_id="<session-id from 'oracle status'>"
+                elif "${ORACLE_CMD[@]}" session "$session_id" --harvest --write-output "$recovery_output_file" \
                         >/dev/null 2>"$recovery_err_file"; then
                     rm -f "$recovery_err_file"
                     if validate_output_file "$recovery_output_file"; then
@@ -3369,12 +3430,15 @@ run_round() {
                 else
                     # Clean up any partial recovery file that might have been created
                     rm -f "$recovery_output_file" 2>/dev/null
-                    print_warning "Oracle session reattach failed for slug: $slug"
+                    print_warning "Oracle session reattach failed for session: $session_id"
                     if [[ -s "$recovery_err_file" ]]; then
                         print_dim "Oracle said:"
                         # Last lines only: the reason comes last, and a
                         # browser-automation trace can run long.
                         tail -n 20 "$recovery_err_file" | sed 's/^/    /' >&2
+                        if grep -q "unknown option '--harvest'" "$recovery_err_file" 2>/dev/null; then
+                            print_warning "This Oracle is too old for 'session --harvest'; upgrade it: npm install -g @steipete/oracle@latest"
+                        fi
                     fi
                     rm -f "$recovery_err_file"
                 fi
@@ -3386,13 +3450,16 @@ run_round() {
                     echo "" >&2
                     print_info "Manual recovery options:"
                     print_info "  1. Re-run the round: apr run $round_num --wait"
-                    print_info "  2. Harvest the answer by hand: oracle session $slug --harvest --write-output \"$output_file\""
-                    print_info "  3. Check the Oracle session: apr attach $slug"
+                    print_info "  2. Harvest the answer by hand: oracle session $session_id --harvest --write-output \"$output_file\""
+                    print_info "  3. Check the Oracle session: apr attach $session_id"
                     print_info "  4. File an issue if this persists: https://github.com/steipete/oracle/issues"
                     echo "" >&2
                     print_info "Partial output saved to: $output_file"
                     # Continue but mark as incomplete for metrics
                 fi
+            fi
+            if [[ -n "$session_marker" ]]; then
+                rm -f "$session_marker"
             fi
 
             if [[ -z "$OUTPUT_VALIDATION_REASON" ]]; then

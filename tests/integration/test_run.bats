@@ -404,6 +404,8 @@ EOF
 
 # Mirrors Oracle 0.21.x `session`: --write-output is refused unless --harvest or
 # --live is given. The round itself writes nothing, so recovery always runs.
+# A run reserves its session ID like Oracle does: --slug, or --slug-2, -3, ...
+# when that ID is already taken.
 setup_session_oracle() {
     local bin_dir="$TEST_DIR/session_oracle"
     mkdir -p "$bin_dir"
@@ -411,13 +413,27 @@ setup_session_oracle() {
     cat > "$bin_dir/oracle" << 'EOF'
 #!/usr/bin/env bash
 echo "Session Oracle args: $*" >> "${TEST_DIR:-/tmp}/session_oracle_calls"
+sessions="${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions"
 case "${1:-}" in
     --version) echo "oracle 0.21.3"; exit 0 ;;
     --help) echo "Usage: oracle [options]"; echo "  --notify"; exit 0 ;;
     session) ;;
-    *) exit 0 ;;
+    *)
+        slug=""
+        while [[ $# -gt 0 ]]; do
+            [[ "$1" == "--slug" ]] && { shift; slug="$1"; }
+            shift
+        done
+        if [[ -n "$slug" && -z "${SESSION_ORACLE_NO_STORE:-}" ]]; then
+            mkdir -p "$sessions"
+            id="$slug" n=2
+            while ! mkdir "$sessions/$id" 2>/dev/null; do id="$slug-$n"; n=$((n + 1)); done
+            echo '{"status":"completed"}' > "$sessions/$id/meta.json"
+        fi
+        exit 0 ;;
 esac
 shift
+id="${1:-}"
 harvest=false live=false out=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -435,7 +451,8 @@ if [[ -n "${ORACLE_HARVEST_ERROR:-}" ]]; then
     echo "$ORACLE_HARVEST_ERROR" >&2
     exit 1
 fi
-answer="$(for i in $(seq 1 60); do echo "Line $i of the complete harvested review answer."; done)"
+answer="$(for i in $(seq 1 60); do echo "Line $i of the complete harvested review answer."; done)
+Harvested from session $id."
 [[ -n "$out" ]] && printf '%s\n' "$answer" > "$out"
 printf '%s\n' "$answer"
 EOF
@@ -457,6 +474,76 @@ EOF
     [[ "$CAPTURED_STDOUT" != *"complete harvested review answer"* ]]
     grep -q "Line 60 of the complete harvested review answer." .apr/rounds/default/round_1.md
     [[ ! -e .apr/rounds/default/round_1.md.recovery.err ]]
+}
+
+@test "run: truncation recovery harvests this run's session, not an older one with the same slug (GH #6)" {
+    setup_session_oracle
+    export APR_RECOVERY_WAIT_SECS=0
+    # An earlier run of round 1 already holds the plain slug, so Oracle names
+    # this run's session apr-default-round-1-2.
+    local old="$HOME/.oracle/sessions/apr-default-round-1"
+    mkdir -p "$old"
+    echo '{"status":"completed"}' > "$old/meta.json"
+    touch -t 202001010000 "$old/meta.json"
+
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    grep -q "session apr-default-round-1-2 --harvest --write-output" "$TEST_DIR/session_oracle_calls"
+    ! grep -q "session apr-default-round-1 --harvest" "$TEST_DIR/session_oracle_calls"
+    grep -q "Harvested from session apr-default-round-1-2." .apr/rounds/default/round_1.md
+}
+
+@test "run: truncation recovery never harvests an older session when this run's is not found (GH #6)" {
+    setup_session_oracle
+    export APR_RECOVERY_WAIT_SECS=0 SESSION_ORACLE_NO_STORE=1
+    local old="$HOME/.oracle/sessions/apr-default-round-1"
+    mkdir -p "$old"
+    echo '{"status":"completed"}' > "$old/meta.json"
+    touch -t 202001010000 "$old/meta.json"
+
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    ! grep -q -- "--harvest" "$TEST_DIR/session_oracle_calls"
+    [[ "$CAPTURED_STDERR" == *"belongs to an earlier run"* ]]
+    [[ "$CAPTURED_STDERR" == *"Automatic recovery failed"* ]]
+    ! grep -q "Harvested from session" .apr/rounds/default/round_1.md 2>/dev/null
+}
+
+@test "run: truncation recovery with an Oracle lacking --harvest says to upgrade (GH #6)" {
+    local bin_dir="$TEST_DIR/old_oracle"
+    mkdir -p "$bin_dir"
+    cat > "$bin_dir/oracle" << 'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    --version) echo "0.8.4"; exit 0 ;;
+    --help) echo "Usage: oracle [options]"; exit 0 ;;
+    session)
+        for a in "$@"; do
+            if [[ "$a" == --harvest || "$a" == --write-output ]]; then
+                echo "error: unknown option '$a'" >&2
+                echo "(use --help for usage)" >&2
+                exit 1
+            fi
+        done
+        exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod +x "$bin_dir/oracle"
+    export PATH="$bin_dir:$PATH" APR_RECOVERY_WAIT_SECS=0
+
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STDERR" == *"Automatic recovery failed"* ]]
+    [[ "$CAPTURED_STDERR" == *"unknown option '--harvest'"* ]]
+    [[ "$CAPTURED_STDERR" == *"npm install -g @steipete/oracle@latest"* ]]
 }
 
 @test "run: failed truncation recovery shows Oracle's reason (GH #6)" {
