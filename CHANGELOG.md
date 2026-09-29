@@ -8,6 +8,21 @@ Repository: <https://github.com/Dicklesworthstone/automated_plan_reviser_pro>
 
 ---
 
+## [v1.3.1](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases/tag/v1.3.1) -- 2026-09-29
+
+### Fixed: recovering a truncated answer
+
+- When Oracle's answer came back cut off, apr's automatic recovery never worked: it asked Oracle to write out the saved session without `--harvest`, which current Oracle refuses, and the error was hidden. Recovery now reattaches with `oracle session <id> --harvest --write-output <file>` and, if that fails, shows why (GH #6, [0bbc5a1](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/0bbc5a16c3e02f976de773f3fa2dc73378958193))
+- Recovery now picks up the session started by this run, not an older one. Oracle names a repeated session `<slug>-2`, `<slug>-3` and so on, and apr used to fetch the plain `<slug>`, which could silently replace the truncated round with an old answer. If apr cannot tell which session is this run's, it refuses to guess and says so. With an Oracle too old to support `--harvest`, apr tells you to upgrade it. The manual-recovery hints name the right session (GH #6, [82c9029](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/82c9029b993dd2c8541f6e615ef6f550c68f6913))
+
+### Added
+
+- `apr setup` offers "Custom / Other" in the model menu, so any model id Oracle accepts can be chosen without editing YAML (GH #5, [b553256](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/b55325689bd1370c79bfee159a80d8baff4bd0ec))
+- The wait before truncation recovery is set by `APR_RECOVERY_WAIT_SECS` (default 30, `0` skips it), and the message names the workflow's model instead of "ChatGPT" (GH #5)
+- The `integrate` prompt names the workflow's configured model instead of a hardcoded GPT model (GH #5)
+
+---
+
 ## [v1.3.0](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases/tag/v1.3.0) -- 2026-08-25
 
 ### Robot Mode -- TOON Output Format
