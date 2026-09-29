@@ -3346,8 +3346,16 @@ run_round() {
                     sleep "$APR_RECOVERY_WAIT_SECS"
                 fi
 
-                # Try to get the full output via session reattach
-                if "${ORACLE_CMD[@]}" session "$slug" --write-output "$recovery_output_file" 2>/dev/null; then
+                # Try to get the full output via session reattach. Oracle only
+                # writes a session's output with --harvest (re-read the bound
+                # browser tab) or --live; plain `session --write-output` is
+                # rejected (GH #6). Harvest also prints the answer on stdout,
+                # which would flood the terminal, so stdout is discarded;
+                # stderr is kept so a failure says why.
+                local recovery_err_file="${output_file}.recovery.err"
+                if "${ORACLE_CMD[@]}" session "$slug" --harvest --write-output "$recovery_output_file" \
+                        >/dev/null 2>"$recovery_err_file"; then
+                    rm -f "$recovery_err_file"
                     if validate_output_file "$recovery_output_file"; then
                         # Recovery successful - replace truncated output
                         mv "$recovery_output_file" "$output_file"
@@ -3361,7 +3369,14 @@ run_round() {
                 else
                     # Clean up any partial recovery file that might have been created
                     rm -f "$recovery_output_file" 2>/dev/null
-                    verbose "Oracle session reattach failed for slug: $slug"
+                    print_warning "Oracle session reattach failed for slug: $slug"
+                    if [[ -s "$recovery_err_file" ]]; then
+                        print_dim "Oracle said:"
+                        # Last lines only: the reason comes last, and a
+                        # browser-automation trace can run long.
+                        tail -n 20 "$recovery_err_file" | sed 's/^/    /' >&2
+                    fi
+                    rm -f "$recovery_err_file"
                 fi
 
                 if [[ "$recovery_success" != "true" ]]; then
@@ -3371,8 +3386,9 @@ run_round() {
                     echo "" >&2
                     print_info "Manual recovery options:"
                     print_info "  1. Re-run the round: apr run $round_num --wait"
-                    print_info "  2. Check the Oracle session: apr attach $slug"
-                    print_info "  3. File an issue if this persists: https://github.com/steipete/oracle/issues"
+                    print_info "  2. Harvest the answer by hand: oracle session $slug --harvest --write-output \"$output_file\""
+                    print_info "  3. Check the Oracle session: apr attach $slug"
+                    print_info "  4. File an issue if this persists: https://github.com/steipete/oracle/issues"
                     echo "" >&2
                     print_info "Partial output saved to: $output_file"
                     # Continue but mark as incomplete for metrics

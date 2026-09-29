@@ -916,7 +916,7 @@ APR automatically patches Oracle's stability detection thresholds at runtime to 
 
 The patch is applied during pre-flight checks and persists until Oracle is updated. A backup of the original file is preserved for restoration.
 
-**Automatic recovery:** If truncation is detected despite patching (output ends mid-word), APR waits 30 seconds and attempts to reattach to the Oracle session to capture the complete response.
+**Automatic recovery:** If truncation is detected despite patching (output ends mid-word), APR waits 30 seconds (`APR_RECOVERY_WAIT_SECS`) and harvests the Oracle session (`oracle session <slug> --harvest --write-output ...`) to capture the complete response. If that fails, Oracle's own error is shown.
 
 ### Session Locking
 

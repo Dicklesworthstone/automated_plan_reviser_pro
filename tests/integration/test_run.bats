@@ -402,6 +402,75 @@ EOF
     [[ "$CAPTURED_STDERR" != *"to complete generation"* ]]
 }
 
+# Mirrors Oracle 0.21.x `session`: --write-output is refused unless --harvest or
+# --live is given. The round itself writes nothing, so recovery always runs.
+setup_session_oracle() {
+    local bin_dir="$TEST_DIR/session_oracle"
+    mkdir -p "$bin_dir"
+
+    cat > "$bin_dir/oracle" << 'EOF'
+#!/usr/bin/env bash
+echo "Session Oracle args: $*" >> "${TEST_DIR:-/tmp}/session_oracle_calls"
+case "${1:-}" in
+    --version) echo "oracle 0.21.3"; exit 0 ;;
+    --help) echo "Usage: oracle [options]"; echo "  --notify"; exit 0 ;;
+    session) ;;
+    *) exit 0 ;;
+esac
+shift
+harvest=false live=false out=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --harvest) harvest=true ;;
+        --live) live=true ;;
+        --write-output) shift; out="$1" ;;
+    esac
+    shift
+done
+if [[ -n "$out" && "$harvest" != "true" && "$live" != "true" ]]; then
+    echo "The --write-output flag requires --harvest or --live." >&2
+    exit 1
+fi
+if [[ -n "${ORACLE_HARVEST_ERROR:-}" ]]; then
+    echo "$ORACLE_HARVEST_ERROR" >&2
+    exit 1
+fi
+answer="$(for i in $(seq 1 60); do echo "Line $i of the complete harvested review answer."; done)"
+[[ -n "$out" ]] && printf '%s\n' "$answer" > "$out"
+printf '%s\n' "$answer"
+EOF
+    chmod +x "$bin_dir/oracle"
+    export PATH="$bin_dir:$PATH" TEST_DIR
+}
+
+@test "run: truncation recovery harvests the Oracle session (GH #6)" {
+    setup_session_oracle
+    export APR_RECOVERY_WAIT_SECS=0
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    grep -q "session apr-default-round-1 --harvest --write-output" "$TEST_DIR/session_oracle_calls"
+    [[ "$CAPTURED_STDERR" == *"Recovery successful"* ]]
+    # The harvested answer goes to the round file, not to the terminal.
+    [[ "$CAPTURED_STDOUT" != *"complete harvested review answer"* ]]
+    grep -q "Line 60 of the complete harvested review answer." .apr/rounds/default/round_1.md
+    [[ ! -e .apr/rounds/default/round_1.md.recovery.err ]]
+}
+
+@test "run: failed truncation recovery shows Oracle's reason (GH #6)" {
+    setup_session_oracle
+    export APR_RECOVERY_WAIT_SECS=0 ORACLE_HARVEST_ERROR="No session found with ID apr-default-round-1."
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+
+    [[ "$CAPTURED_STDERR" == *"Automatic recovery failed"* ]]
+    [[ "$CAPTURED_STDERR" == *"No session found with ID apr-default-round-1."* ]]
+    [[ ! -e .apr/rounds/default/round_1.md.recovery.err ]]
+}
+
 @test "run: invalid APR_RECOVERY_WAIT_SECS warns and uses the default (GH #5)" {
     export APR_RECOVERY_WAIT_SECS=soon
     capture_streams "$APR_SCRIPT" run 1 --dry-run
