@@ -902,6 +902,20 @@ export APR_INITIAL_BACKOFF=15
 
 The exponential backoff (multiplier of 3) prevents hammering the service while giving transient issues time to resolve.
 
+APR recognizes Oracle's failing stderr diagnostics `ERROR: busy` and
+`User error (browser-automation): busy` as single-flight contention. Foreground
+runs return exit 12 with `APR_ERROR_CODE=busy`; a robot worker that exhausts its
+attempts before the launch check returns the JSON `busy` code. A worker still
+retrying remains `running`. The final attempt determines the result, so an
+earlier busy response cannot relabel a later authentication or network error.
+Successful output, stdout prose and unrelated errors such as “device busy” are
+not busy signals. Retry counts and delays retain the settings above.
+If the worker has already completed successfully at the launch check, APR
+validates and retains its output instead of reporting a startup failure; robot
+mode returns `status: "completed"`. An incomplete or missing output is never
+reported as completed. Diagnostic-capture failures stop without launching a
+duplicate review.
+
 ### GPT Pro Extended Thinking Stability
 
 GPT Pro Extended Thinking can pause for 10-30+ seconds during its reasoning phase. Without adjustment, Oracle's browser automation might interpret these pauses as "response complete" and capture truncated output.

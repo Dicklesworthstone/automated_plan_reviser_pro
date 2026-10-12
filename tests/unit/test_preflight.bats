@@ -12,7 +12,7 @@ setup() {
     setup_test_environment
     load_apr_functions
     log_test_start "${BATS_TEST_NAME}"
-    cd "$TEST_PROJECT"
+    cd "$TEST_PROJECT" || return
 }
 
 teardown() {
@@ -23,6 +23,71 @@ teardown() {
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+# A real local process implementing only the documented Oracle CLI boundary.
+# It never contacts a model/browser. Probe invocations do not count as launches.
+create_oracle_failure_fixture() {
+    mkdir -p "$TEST_DIR/oracle-bin"
+    cat > "$TEST_DIR/oracle-bin/oracle" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+    --version) printf '%s\n' 'oracle 1.0.0'; exit 0 ;;
+    --help) printf '%s\n' '--notify --browser-attachments --write-output'; exit 0 ;;
+esac
+for arg in "$@"; do
+    if [[ "$arg" == --render ]]; then
+        printf '%s\n' 'Offline notification capability preview.'
+        exit 0
+    fi
+done
+count=0
+[[ ! -f "$APR_FIXTURE_COUNT" ]] || count=$(cat "$APR_FIXTURE_COUNT")
+count=$((count + 1))
+printf '%s\n' "$count" > "$APR_FIXTURE_COUNT"
+case "$APR_FIXTURE_MODE" in
+    busy) printf '%s\n' 'ERROR: busy: another review is active' >&2; exit 1 ;;
+    browser_busy) printf '%s\n' 'User error (browser-automation): busy' >&2; exit 7 ;;
+    busy_success|busy_auth)
+        if [[ "$count" -eq 1 ]]; then
+            printf '%s\n' 'ERROR: busy' >&2
+            exit 1
+        fi
+        if [[ "$APR_FIXTURE_MODE" == busy_auth ]]; then
+            printf '%s\n' 'ERROR: authentication failed' >&2
+            exit 19
+        fi
+        ;;
+    numeric_12) printf '%s\n' 'ERROR: authentication failed' >&2; exit 12 ;;
+    unrelated) printf '%s\n' 'ERROR: device or resource busy' >&2; exit 23 ;;
+    stdout_busy) printf '%s\n' 'ERROR: busy'; printf '%s\n' 'ERROR: authentication failed' >&2; exit 19 ;;
+    success_busy) printf '%s\n' 'ERROR: busy' >&2 ;;
+    slow_success) sleep 2 ;;
+esac
+printf 'Useful stdout\r\n'
+printf 'Useful stderr\r\n' >&2
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --write-output ]]; then
+        shift
+        case "$APR_FIXTURE_MODE" in
+            missing_output) ;;
+            incomplete_output) printf '%s\n' 'Incomplete response.' > "$1" ;;
+            *) for ((i=0; i<100; i++)); do printf '%s\n' 'A complete deterministic local fixture response.'; done > "$1" ;;
+        esac
+    fi
+    shift
+done
+EOF
+    chmod +x "$TEST_DIR/oracle-bin/oracle"
+    export APR_FIXTURE_COUNT="$TEST_DIR/oracle-count"
+    export APR_FIXTURE_MODE="${1:-busy}"
+    export PATH="$TEST_DIR/oracle-bin:$PATH"
+    export APR_NO_NPX=1
+    ORACLE_CMD=("$TEST_DIR/oracle-bin/oracle")
+    MAX_RETRY_ATTEMPTS=1
+    INITIAL_BACKOFF=0
+    [[ -x "${ORACLE_CMD[0]}" && "$MAX_RETRY_ATTEMPTS" -eq 1 && "$INITIAL_BACKOFF" -eq 0 ]]
+}
 
 create_docs() {
     local dir="${1:-$TEST_PROJECT}"
@@ -414,4 +479,201 @@ assert_json_array_contains() {
     assert_json_value "$CAPTURED_STDOUT" ".ok" "true"
     assert_json_value "$CAPTURED_STDOUT" ".code" "ok"
     [[ -z "$CAPTURED_STDERR" ]]
+}
+@test "Oracle busy classifier accepts explicit failing stderr signatures only" {
+    local diagnostic="$TEST_DIR/diagnostic"
+    local text
+    for text in 'ERROR: busy' ' ERROR: busy: another review is active' 'User error (browser-automation): busy' 'error: BUSY' $'\033[31mERROR: busy\033[0m'; do
+        printf '%s\n' "$text" > "$diagnostic"
+        run oracle_failure_kind 1 "$diagnostic"
+        [[ "$status" -eq 0 && "$output" == busy ]]
+        run oracle_failure_kind 0 "$diagnostic"
+        [[ "$status" -eq 0 && "$output" == ok ]]
+    done
+}
+
+@test "Oracle busy classifier rejects unrelated errors and word-boundary near misses" {
+    local diagnostic="$TEST_DIR/diagnostic"
+    local text
+    for text in 'ERROR: device or resource busy' 'ERROR: busybox missing' 'ERROR: business rule failed' 'User error (browser-automation): business failure' 'A document quotes ERROR: busy' 'ERROR: authentication failed' 'ERROR: busy_retry_unavailable'; do
+        printf '%s\n' "$text" > "$diagnostic"
+        run oracle_failure_kind 12 "$diagnostic"
+        [[ "$status" -eq 0 && "$output" == oracle_error ]]
+    done
+    run oracle_failure_kind 1 "$TEST_DIR/missing"
+    [[ "$status" -eq 0 && "$output" == oracle_error ]]
+}
+
+@test "Oracle success preserves exact stdout stderr and one real process invocation" {
+    create_oracle_failure_fixture success
+    printf 'Useful stdout\r\n' > "$TEST_DIR/expected-out"
+    printf 'Useful stderr\r\n' > "$TEST_DIR/expected-err"
+    run_oracle_with_retry > "$TEST_DIR/actual-out" 2> "$TEST_DIR/actual-err"
+    cmp "$TEST_DIR/expected-out" "$TEST_DIR/actual-out"
+    cmp "$TEST_DIR/expected-err" "$TEST_DIR/actual-err"
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+}
+
+@test "Oracle busy maps to APR exit12 while retaining the native status and stderr" {
+    create_oracle_failure_fixture browser_busy
+    capture_streams run_oracle_with_retry
+    [[ "$CAPTURED_STATUS" -eq 12 && "$ORACLE_EXIT_CODE" -eq 7 && "$ORACLE_FAILURE_KIND" == busy ]]
+    [[ -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'User error (browser-automation): busy'* ]]
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+}
+
+@test "Oracle successful stderr and failing stdout lookalikes never establish busy" {
+    create_oracle_failure_fixture success_busy
+    capture_streams run_oracle_with_retry
+    [[ "$CAPTURED_STATUS" -eq 0 && "$ORACLE_FAILURE_KIND" == ok ]]
+    APR_FIXTURE_MODE=stdout_busy
+    capture_streams run_oracle_with_retry
+    [[ "$CAPTURED_STATUS" -eq 19 && "$ORACLE_FAILURE_KIND" == oracle_error ]]
+    [[ "$CAPTURED_STDOUT" == 'ERROR: busy' && "$CAPTURED_STDERR" == *'ERROR: authentication failed'* ]]
+}
+
+@test "Oracle busy followed by success clears the earlier classification" {
+    create_oracle_failure_fixture busy_success
+    MAX_RETRY_ATTEMPTS=2
+    capture_streams run_oracle_with_retry
+    [[ "$CAPTURED_STATUS" -eq 0 && "$ORACLE_EXIT_CODE" -eq 0 && "$ORACLE_FAILURE_KIND" == ok ]]
+    [[ "$CAPTURED_STDOUT" == $'Useful stdout\r' && "$CAPTURED_STDERR" == *'ERROR: busy'* ]]
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 2 ]]
+}
+
+@test "Oracle final authentication failure cannot reuse an earlier busy classification" {
+    create_oracle_failure_fixture busy_auth
+    MAX_RETRY_ATTEMPTS=2
+    capture_streams run_oracle_recorded "$TEST_DIR/result" true
+    [[ "$CAPTURED_STATUS" -eq 19 && "$ORACLE_FAILURE_KIND" == oracle_error ]]
+    [[ "$(cat "$TEST_DIR/result")" == $'19\noracle_error' ]]
+    [[ "$CAPTURED_STDERR" == *'ERROR: busy'* && "$CAPTURED_STDERR" == *'ERROR: authentication failed'* ]]
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 2 ]]
+}
+
+@test "Oracle diagnostic sink failure never relaunches a successful producer" {
+    create_oracle_failure_fixture success
+    MAX_RETRY_ATTEMPTS=3
+    [[ "$MAX_RETRY_ATTEMPTS" -eq 3 ]]
+    tee() { cat >&2; return 1; }
+    capture_streams run_oracle_with_retry
+    [[ "$CAPTURED_STATUS" -eq 1 && "$ORACLE_EXIT_CODE" -eq 0 && "$ORACLE_FAILURE_KIND" == capture_error ]]
+    [[ "$CAPTURED_STDOUT" == $'Useful stdout\r' && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+}
+
+@test "human foreground no-retry reports Oracle busy with the semantic exit" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture busy
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 12 && "$CAPTURED_STDERR" == *'APR_ERROR_CODE=busy'* ]]
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 1 && ! -f .apr/rounds/default/round_1.md ]]
+}
+
+@test "human immediate background busy does not report a successful launch" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture busy
+    capture_streams bash "$APR_SCRIPT" run 1 --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 12 && "$CAPTURED_STDERR" == *'APR_ERROR_CODE=busy'* ]]
+    [[ "$CAPTURED_STDERR" != *'Oracle running in background'* ]]
+}
+
+@test "robot immediate busy returns typed JSON with the real native exit and log" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture browser_busy
+    export APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 12 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.code' busy
+    assert_json_value "$CAPTURED_STDOUT" '.ok' false
+    assert_json_value "$CAPTURED_STDOUT" '.data.oracle_exit' 7
+    local log_file
+    log_file=$(jq -r '.data.log_file' <<< "$CAPTURED_STDOUT")
+    [[ -f "$log_file" && "$(cat "$log_file")" == *'User error (browser-automation): busy'* ]]
+}
+
+@test "human completed background success retains the actual output and returns success" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture success
+    capture_streams bash "$APR_SCRIPT" run 1 --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 0 && "$CAPTURED_STDERR" == *'Oracle completed; output retained'* ]]
+    [[ -s .apr/rounds/default/round_1.md && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+    [[ "$(head -n 1 .apr/rounds/default/round_1.md)" == 'A complete deterministic local fixture response.' ]]
+}
+
+@test "robot completed success and busy-then-success return real output once" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture busy_success
+    export APR_MAX_RETRIES=2 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.code' ok
+    assert_json_value "$CAPTURED_STDOUT" '.ok' true
+    assert_json_value "$CAPTURED_STDOUT" '.data.status' completed
+    [[ -s .apr/rounds/default/round_1.md && "$(cat "$APR_FIXTURE_COUNT")" -eq 2 ]]
+    [[ "$CAPTURED_STDERR" != *'APR_ERROR_CODE=busy'* ]]
+}
+
+@test "human completed process without complete output remains a failure" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture incomplete_output
+    capture_streams bash "$APR_SCRIPT" run 1 --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -ne 0 && "$CAPTURED_STDERR" != *'Oracle completed; output retained'* ]]
+    [[ "$(cat .apr/rounds/default/round_1.md)" == 'Incomplete response.' ]]
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+}
+
+@test "robot completed process without output never reports completed" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture missing_output
+    export APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 1 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.code' internal_error
+    [[ ! -f .apr/rounds/default/round_1.md && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+}
+
+@test "robot ongoing worker remains running and eventually retains useful output" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture slow_success
+    export APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.status' running
+    local attempt
+    for ((attempt=0; attempt<30; attempt++)); do
+        [[ -s .apr/rounds/default/round_1.md ]] && break
+        sleep 0.1
+    done
+    [[ -s .apr/rounds/default/round_1.md && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+    [[ "$(head -n 1 .apr/rounds/default/round_1.md)" == 'A complete deterministic local fixture response.' ]]
+}
+
+@test "robot immediate numeric exit12 without busy stderr stays a distinct failure" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture numeric_12
+    export APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 1 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.code' internal_error
+    [[ "$CAPTURED_STDERR" != *'APR_ERROR_CODE=busy'* && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+}
+
+@test "robot completed retry sequence exposes only its final unrelated failure" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture busy_auth
+    export APR_MAX_RETRIES=2 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 1 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.code' internal_error
+    [[ "$CAPTURED_STDERR" != *'APR_ERROR_CODE=busy'* && "$(cat "$APR_FIXTURE_COUNT")" -eq 2 ]]
 }

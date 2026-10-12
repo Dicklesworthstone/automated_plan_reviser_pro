@@ -1079,6 +1079,57 @@ if ! is_non_negative_int "$INITIAL_BACKOFF"; then
     INITIAL_BACKOFF=10
 fi
 
+# Only Oracle's explicit failing stderr diagnostics establish a busy result.
+# A successful answer, stdout prose, and unrelated OS errors are not busy.
+oracle_failure_kind() {
+    local exit_code="$1" stderr_file="$2"
+    if [[ "$exit_code" == "0" ]]; then
+        printf '%s\n' "ok"
+    elif [[ -r "$stderr_file" ]] &&
+        LC_ALL=C sed -E $'s/\033\\[[0-9;]*m//g' "$stderr_file" |
+        LC_ALL=C grep -Ei '^[[:space:]]*(ERROR:[[:space:]]*busy|User error[[:space:]]*\(browser-automation\):[[:space:]]*busy)([[:space:]:;.,()]|$)' >/dev/null; then
+        printf '%s\n' "busy"
+    else
+        printf '%s\n' "oracle_error"
+    fi
+}
+
+ORACLE_FAILURE_KIND="ok"
+ORACLE_EXIT_CODE=0
+
+# Preserve both live streams and the actual Oracle exit, independently of tee.
+run_oracle_once() {
+    local stderr_file
+    ORACLE_FAILURE_KIND="capture_error"
+    ORACLE_EXIT_CODE=1
+    if ! stderr_file=$(mktemp "${TMPDIR:-/tmp}/apr-oracle-stderr.XXXXXX"); then
+        print_error "Cannot capture Oracle diagnostics; Oracle was not started"
+        return 1
+    fi
+
+    local pipeline_status=()
+    {
+        if "${ORACLE_CMD[@]}" "$@" 2>&1 1>&3 3>&- | tee "$stderr_file" >&2; then
+            pipeline_status=("${PIPESTATUS[@]}")
+        else
+            pipeline_status=("${PIPESTATUS[@]}")
+        fi
+    } 3>&1
+    ORACLE_EXIT_CODE="${pipeline_status[0]}"
+    ORACLE_FAILURE_KIND=$(oracle_failure_kind "$ORACLE_EXIT_CODE" "$stderr_file")
+    rm -f "$stderr_file"
+
+    if [[ "${pipeline_status[1]}" -ne 0 ]]; then
+        ORACLE_FAILURE_KIND="capture_error"
+        print_error "Failed to retain or stream Oracle diagnostics"
+        return 1
+    fi
+    if [[ "$ORACLE_FAILURE_KIND" == "busy" ]]; then
+        return "$EXIT_BUSY_ERROR"
+    fi
+    return "$ORACLE_EXIT_CODE"
+}
+
 # Run Oracle with auto-retry on transient failures
 # Usage: run_oracle_with_retry oracle_args...
 # Returns: Oracle exit code
@@ -1092,11 +1143,15 @@ run_oracle_with_retry() {
     while [[ $attempt -le $MAX_RETRY_ATTEMPTS ]]; do
         verbose "Oracle attempt $attempt/$MAX_RETRY_ATTEMPTS"
 
-        # Run Oracle command
-        set +e
-        "${ORACLE_CMD[@]}" "$@"
-        exit_code=$?
-        set -e
+        # Classification belongs to this attempt, never to an accumulated log.
+        exit_code=0
+        run_oracle_once "$@" || exit_code=$?
+
+        # A failed diagnostic sink is not permission to launch Oracle again:
+        # it may already have produced useful output or charged for the run.
+        if [[ "$ORACLE_FAILURE_KIND" == "capture_error" ]]; then
+            return "$exit_code"
+        fi
 
         verbose "Oracle attempt $attempt exit_code=$exit_code"
 
@@ -1121,6 +1176,20 @@ run_oracle_with_retry() {
 
     print_error "All $MAX_RETRY_ATTEMPTS attempts failed"
     return "$exit_code"
+}
+
+# A detached worker's globals are not visible to its parent. Record only the
+# completed final attempt in the unique result file allocated for this launch.
+run_oracle_recorded() {
+    local result_file="$1" enable_retry="$2" result_exit=0
+    shift 2
+    if [[ "$enable_retry" == "true" ]]; then
+        run_oracle_with_retry "$@" || result_exit=$?
+    else
+        run_oracle_once "$@" || result_exit=$?
+    fi
+    printf '%s\n%s\n' "$ORACLE_EXIT_CODE" "$ORACLE_FAILURE_KIND" > "$result_file"
+    return "$result_exit"
 }
 
 # -----------------------------------------------------------------------------
@@ -3355,7 +3424,7 @@ run_round() {
         if [[ "$enable_retry" == "true" ]]; then
             run_oracle_with_retry "${oracle_args[@]}" || oracle_exit=$?
         else
-            "${ORACLE_CMD[@]}" "${oracle_args[@]}" || oracle_exit=$?
+            run_oracle_once "${oracle_args[@]}" || oracle_exit=$?
         fi
 
         local end_time elapsed_secs elapsed_fmt
@@ -3539,19 +3608,26 @@ run_round() {
                 print_warning "jq not available; skipping metrics collection"
             fi
         else
-            print_error "Oracle failed after ${elapsed_fmt} (exit code: $oracle_exit)"
+            if [[ "$ORACLE_FAILURE_KIND" == "busy" ]]; then
+                print_error "Oracle is busy after ${elapsed_fmt}; retry when the active review completes"
+                printf '%s\n' "APR_ERROR_CODE=busy" >&2
+            else
+                print_error "Oracle failed after ${elapsed_fmt} (exit code: $oracle_exit)"
+            fi
             exit $oracle_exit
         fi
     else
+        local result_file
+        if ! mkdir -p "$CONFIG_DIR/logs" ||
+            ! result_file=$(mktemp "$CONFIG_DIR/logs/oracle_${slug}.result.XXXXXX"); then
+            print_error "Cannot retain the Oracle launch result; Oracle was not started"
+            exit "$EXIT_CONFIG_ERROR"
+        fi
         (
             # Bash will SIGHUP background jobs on shell exit. Ignore HUP so the
             # background run keeps going after `apr run` returns.
             trap "" HUP
-            if [[ "$enable_retry" == "true" ]]; then
-                run_oracle_with_retry "${oracle_args[@]}"
-            else
-                "${ORACLE_CMD[@]}" "${oracle_args[@]}"
-            fi
+            run_oracle_recorded "$result_file" "$enable_retry" "${oracle_args[@]}"
         ) &
         local oracle_pid=$!
 
@@ -3560,7 +3636,24 @@ run_round() {
 
         # Verify the process is actually running
         if ! kill -0 "$oracle_pid" 2>/dev/null; then
+            local result_exit=0 result_kind="" result_oracle_exit=""
+            wait "$oracle_pid" || result_exit=$?
+            if [[ -r "$result_file" ]]; then
+                {
+                    IFS= read -r result_oracle_exit || true
+                    IFS= read -r result_kind || true
+                } < "$result_file"
+            fi
             release_lock 2>/dev/null || true
+            if [[ "$result_exit" -eq 0 && "$result_kind" == "ok" ]] && validate_output_file "$output_file"; then
+                print_success "Oracle completed; output retained at $output_file"
+                return 0
+            fi
+            if [[ "$result_exit" -ne 0 && "$result_kind" == "busy" ]]; then
+                print_error "Oracle is busy (Oracle exit ${result_oracle_exit:-unknown}); retry when the active review completes"
+                printf '%s\n' "APR_ERROR_CODE=busy" >&2
+                exit "$EXIT_BUSY_ERROR"
+            fi
             print_error "Oracle process failed to start"
             print_info "Try running with --wait to see error output"
             exit $EXIT_DEPENDENCY_ERROR
@@ -5908,12 +6001,18 @@ robot_run() {
     if mkdir -p "$logs_dir" 2>/dev/null; then
         oracle_log="$logs_dir/oracle_${slug}.log"
     fi
+    local result_file
+    if ! result_file=$(mktemp "$logs_dir/oracle_${slug}.result.XXXXXX"); then
+        release_lock 2>/dev/null || true
+        robot_fail "config_error" '{"reason":"result_capture_failed"}' "Cannot retain the Oracle launch result"
+        return $?
+    fi
 
     (
         # Bash will SIGHUP background jobs on shell exit. Ignore HUP so the
         # detached robot run can survive after `apr` exits.
         trap "" HUP
-        run_oracle_with_retry "${oracle_args[@]}"
+        run_oracle_recorded "$result_file" "true" "${oracle_args[@]}"
     ) >"$oracle_log" 2>&1 &
     local oracle_pid=$!
 
@@ -5921,13 +6020,31 @@ robot_run() {
     sleep 0.5
 
     # Verify the process is actually running
+    local launch_status="running"
     if ! kill -0 "$oracle_pid" 2>/dev/null; then
+        local result_exit=0 result_kind="" result_oracle_exit=""
+        wait "$oracle_pid" || result_exit=$?
+        if [[ -r "$result_file" ]]; then
+            {
+                IFS= read -r result_oracle_exit || true
+                IFS= read -r result_kind || true
+            } < "$result_file"
+        fi
         release_lock 2>/dev/null || true
-        robot_fail "internal_error" '{"reason":"process_start_failed"}' "Oracle process failed to start immediately"
-        return $?
+        if [[ "$result_exit" -eq 0 && "$result_kind" == "ok" ]] && validate_output_file "$output_file"; then
+            launch_status="completed"
+        elif [[ "$result_exit" -ne 0 && "$result_kind" == "busy" ]]; then
+            robot_fail "busy" "$(jq -nc --arg log "$oracle_log" --arg exit "$result_oracle_exit" \
+                '{reason:"oracle_busy", log_file:$log, oracle_exit:($exit | tonumber)}')" \
+                "Oracle is busy; retry when the active review completes"
+            return $?
+        else
+            robot_fail "internal_error" '{"reason":"process_start_failed"}' "Oracle process failed to start immediately"
+            return $?
+        fi
+    else
+        background_lock_detach_parent "$oracle_pid"
     fi
-
-    background_lock_detach_parent "$oracle_pid"
 
     # Return session info
     local data
@@ -5938,6 +6055,7 @@ robot_run() {
         --arg log_file "$oracle_log" \
         --arg workflow "$workflow" \
         --arg round "$round_num" \
+        --arg status "$launch_status" \
         --argjson include_impl "$include_impl" \
         '{
             slug: $slug,
@@ -5947,7 +6065,7 @@ robot_run() {
             workflow: $workflow,
             round: ($round | tonumber),
             include_impl: $include_impl,
-            status: "running"
+            status: $status
         }')
 
     robot_json true "ok" "$data" "Use 'apr status' or 'apr attach $slug' to monitor"
