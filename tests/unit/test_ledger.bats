@@ -341,3 +341,326 @@ EOF
     [[ $(wc -l < "$APR_TEST_COUNT") -eq 1 ]]
     [[ "$APR_ATTEMPTS_COUNT" -eq 1 && "$APR_RETRIES_COUNT" -eq 0 && "$APR_RETRY_REASONS" == '[]' ]]
 }
+
+runtime_cli_fixture() {
+    setup_test_workflow default
+    mkdir -p "$TEST_DIR/oracle-bin"
+    cat > "$TEST_DIR/oracle-bin/oracle" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+    --version) printf 'oracle 1.0.0\n'; exit 0 ;;
+    --help) printf '%s\n' '--notify --browser-attachments --write-output'; exit 0 ;;
+    status) exit 0 ;;
+    session)
+        if [[ "$APR_CLI_MODE" == harvest_success ]]; then
+            while [[ $# -gt 0 ]]; do
+                if [[ "$1" == --write-output ]]; then
+                    for ((i=0;i<100;i++)); do printf 'A complete useful recovered review response.\n'; done > "$2"
+                    exit 0
+                fi
+                shift
+            done
+        fi
+        if [[ "$APR_CLI_MODE" == harvest_partial ]]; then
+            while [[ $# -gt 0 ]]; do
+                if [[ "$1" == --write-output ]]; then
+                    printf 'Useful separately harvested partial answer.\n' > "$2"
+                    printf 'Retained harvest failure diagnostics.\n' >&2
+                    break
+                fi
+                shift
+            done
+        fi
+        exit 19 ;;
+esac
+for arg in "$@"; do [[ "$arg" != --render ]] || exit 0; done
+count=0
+[[ ! -f "$APR_CLI_COUNT" ]] || count=$(cat "$APR_CLI_COUNT")
+count=$((count+1)); printf '%s\n' "$count" > "$APR_CLI_COUNT"
+output=''
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --write-output) output="$2"; shift ;;
+        -p) printf '%s' "$2" > "$APR_CLI_COUNT.prompt"; shift ;;
+    esac
+    shift
+done
+if [[ -f .apr/rounds/default/round_1.meta.json ]]; then
+    cp .apr/rounds/default/round_1.meta.json "$APR_CLI_COUNT.started"
+fi
+case "$APR_CLI_MODE" in
+    busy) printf 'ERROR: busy: another review is active\n' >&2; exit 7 ;;
+    missing) exit 0 ;;
+    truncated|harvest_partial|harvest_success) printf 'Incomplete response.\n' > "$output"; exit 0 ;;
+    slow) sleep 2 ;;
+esac
+for ((i=0;i<100;i++)); do printf 'A complete deterministic useful review response.\n'; done > "$output"
+[[ "$APR_CLI_MODE" != native_partial ]] || exit 19
+EOF
+    chmod +x "$TEST_DIR/oracle-bin/oracle"
+    export PATH="$TEST_DIR/oracle-bin:$PATH"
+    export APR_CLI_COUNT="$TEST_DIR/cli-count" APR_CLI_MODE="${1:-success}"
+    export APR_NO_NPX=1 APR_NO_ORACLE_PATCH=1 APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0 APR_RECOVERY_WAIT_SECS=0
+}
+
+@test "ledger integration: foreground observes started inputs before one real producer and records success" {
+    runtime_cli_fixture
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 0 && $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    local ledger=.apr/rounds/default/round_1.meta.json
+    ledger_validate < "$ledger"
+    jq -e '.state=="started" and .inputs.status=="complete" and .outcome.ok==null' "$APR_CLI_COUNT.started"
+    jq -e '.state=="finished" and .execution.attempts_count==1 and .outcome.exit_code==0 and .outcome.oracle_exit_code==0' "$ledger"
+    [[ $(jq -r .inputs.prompt_hash "$ledger") == "$(document_sha256_stdin < "$APR_CLI_COUNT.prompt")" ]]
+    [[ $(jq -r .outcome.output_path "$ledger") == .apr/rounds/default/round_1.md ]]
+    validate_output_file .apr/rounds/default/round_1.md
+}
+
+@test "ledger integration: robot completed result and terminal record agree on owned output and run identity" {
+    runtime_cli_fixture
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 && $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    assert_json_value "$CAPTURED_STDOUT" .data.status completed
+    local ledger
+    ledger=$(jq -r .data.ledger_path <<< "$CAPTURED_STDOUT")
+    ledger_validate < "$ledger"
+    [[ $(jq -r .data.run_id <<< "$CAPTURED_STDOUT") == "$(jq -r .run_id "$ledger")" ]]
+    jq -e '.state=="finished" and .invocation.thinking_time=="heavy" and .execution.attempts_count==1' "$ledger"
+    [[ $(jq -r .inputs.prompt_hash "$ledger") == "$(document_sha256_stdin < "$APR_CLI_COUNT.prompt")" ]]
+}
+
+@test "ledger integration: detached worker owns started trace and finalizes after parent launch acknowledgement" {
+    runtime_cli_fixture slow
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_json_value "$CAPTURED_STDOUT" .data.status running
+    local ledger=.apr/rounds/default/round_1.meta.json attempt owner
+    jq -e '.state=="started" and .finished_at==null and .outcome.ok==null' "$ledger"
+    owner=$(jq -r .owner_pid "$ledger")
+    kill -0 "$owner"
+    for ((attempt=0;attempt<50;attempt++)); do
+        [[ $(jq -r .state "$ledger") == started ]] || break
+        sleep 0.1
+    done
+    ledger_validate < "$ledger"
+    jq -e '.state=="finished" and .execution.attempts_count==1' "$ledger"
+    [[ $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    validate_output_file .apr/rounds/default/round_1.md
+}
+
+@test "ledger integration: native success with truncated unrecovered output is an honest foreground failure" {
+    runtime_cli_fixture truncated
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 1 && $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    local ledger=.apr/rounds/default/round_1.meta.json
+    ledger_validate < "$ledger"
+    jq -e '.state=="failed" and .outcome.ok==false and .outcome.exit_code==1 and .outcome.oracle_exit_code==0' "$ledger"
+    [[ $(cat .apr/rounds/default/round_1.md) == 'Incomplete response.' ]]
+    [[ -f $(jq -r .outcome.output_path "$ledger") ]]
+}
+
+@test "ledger integration: native zero without fresh output cannot reuse a valid older answer" {
+    runtime_cli_fixture missing
+    for ((i=0;i<100;i++)); do printf 'An earlier complete useful answer that must survive.\n'; done > .apr/rounds/default/round_1.md
+    cp .apr/rounds/default/round_1.md "$TEST_DIR/prior-answer"
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 1 && $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    cmp "$TEST_DIR/prior-answer" .apr/rounds/default/round_1.md
+    local ledger=.apr/rounds/default/round_1.meta.json id
+    ledger_validate < "$ledger"
+    jq -e '.state=="failed" and .outcome.oracle_exit_code==0 and .outcome.ok==false' "$ledger"
+    id=$(jq -r .run_id "$ledger")
+    cmp "$TEST_DIR/prior-answer" ".apr/runs/default/$id/prior.output.md"
+}
+
+@test "ledger integration: early unreadable required input records failure without producer launch" {
+    runtime_cli_fixture
+    chmod 000 README.md
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry
+    [[ "$CAPTURED_STATUS" -eq 4 && ! -f "$APR_CLI_COUNT" ]]
+    local ledger=.apr/rounds/default/round_1.meta.json
+    ledger_validate < "$ledger"
+    jq -e '.state=="failed" and .inputs.status=="failed" and .execution.attempts_count==0 and .outcome.oracle_exit_code==null and .outcome.exit_code==4' "$ledger"
+}
+
+@test "ledger integration: busy contender preserves the live canonical and its own refused trace" {
+    runtime_cli_fixture slow
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    local ledger=.apr/rounds/default/round_1.meta.json id attempt
+    id=$(jq -r .run_id "$ledger")
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 12 ]]
+    assert_json_value "$CAPTURED_STDOUT" .code busy
+    [[ $(jq -r .run_id "$ledger") == "$id" ]]
+    local refused=0 record
+    for record in .apr/runs/default/*/attempt.meta.json; do
+        [[ -f "$record" ]] || continue
+        ledger_validate < "$record"
+        jq -e '.state=="failed" and .outcome.code=="busy" and .outcome.exit_code==12 and .execution.attempts_count==0' "$record"
+        refused=$((refused+1))
+    done
+    [[ "$refused" -eq 1 ]]
+    for ((attempt=0;attempt<50;attempt++)); do
+        [[ $(jq -r .state "$ledger") == started ]] || break
+        sleep 0.1
+    done
+    jq -e '.state=="finished"' "$ledger"
+    [[ $(cat "$APR_CLI_COUNT") -eq 1 ]]
+}
+
+@test "ledger integration: human and robot native busy preserve caller12 native7 and distinct attempt history" {
+    runtime_cli_fixture busy
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 12 && $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    local ledger=.apr/rounds/default/round_1.meta.json first
+    ledger_validate < "$ledger"
+    jq -e '.state=="failed" and .outcome.code=="busy" and .outcome.exit_code==12 and .outcome.oracle_exit_code==7 and .execution.attempts_count==1' "$ledger"
+    first=$(jq -r .run_id "$ledger")
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 12 && $(cat "$APR_CLI_COUNT") -eq 2 ]]
+    assert_json_value "$CAPTURED_STDOUT" .code busy
+    ledger_validate < "$ledger"
+    jq -e '.state=="failed" and .outcome.code=="busy" and .outcome.exit_code==12 and .outcome.oracle_exit_code==7 and .execution.attempts_count==1' "$ledger"
+    [[ $(jq -r .run_id "$ledger") != "$first" ]]
+    local current
+    current=$(jq -r .run_id "$ledger")
+    [[ $(jq -r .run_id ".apr/runs/default/$current/prior.meta.json") == "$first" ]]
+}
+
+@test "ledger integration: closing round ownership retains its inode and allows the next real process" {
+    local lock inode
+    acquire_lock default 1
+    lock="$APR_LOCK_FILE"
+    inode=$(stat -f '%i' "$lock" 2>/dev/null || stat -c '%i' "$lock")
+    run bash -c 'source "$1"; acquire_lock default 1' _ "$TEST_DIR/apr_functions.bash"
+    [[ "$status" -eq 12 ]]
+    release_lock
+    [[ -f "$lock" ]]
+    run bash -c 'source "$1"; acquire_lock default 1; release_lock' _ "$TEST_DIR/apr_functions.bash"
+    [[ "$status" -eq 0 ]]
+    [[ "$inode" == "$(stat -f '%i' "$lock" 2>/dev/null || stat -c '%i' "$lock")" ]]
+}
+
+@test "ledger integration: failed producer cannot replace an earlier good canonical answer" {
+    runtime_cli_fixture native_partial
+    for ((i=0;i<100;i++)); do printf 'An earlier correct useful answer that must survive.\n'; done > .apr/rounds/default/round_1.md
+    cp .apr/rounds/default/round_1.md "$TEST_DIR/prior-answer"
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 19 && $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    cmp "$TEST_DIR/prior-answer" .apr/rounds/default/round_1.md
+    local ledger=.apr/rounds/default/round_1.meta.json
+    ledger_validate < "$ledger"
+    jq -e '.state=="failed" and .outcome.oracle_exit_code==19 and .outcome.exit_code==19' "$ledger"
+    validate_output_file "$(jq -r .outcome.output_path "$ledger")"
+}
+
+@test "ledger integration: successful rerun retains canonical answer and publishes a distinct useful version" {
+    runtime_cli_fixture
+    for ((i=0;i<100;i++)); do printf 'An earlier complete useful answer that must survive.\n'; done > .apr/rounds/default/round_1.md
+    cp .apr/rounds/default/round_1.md "$TEST_DIR/prior-answer"
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 0 && $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    cmp "$TEST_DIR/prior-answer" .apr/rounds/default/round_1.md
+    local output ledger=.apr/rounds/default/round_1.meta.json id
+    output=$(jq -r .outcome.output_path "$ledger")
+    [[ "$output" != .apr/rounds/default/round_1.md ]]
+    validate_output_file "$output"
+    id=$(jq -r .run_id "$ledger")
+    cmp "$ledger" ".apr/runs/default/$id/terminal.meta.json"
+    cmp "$TEST_DIR/prior-answer" ".apr/runs/default/$id/prior.output.md"
+}
+
+@test "ledger integration: real foreign file arriving during output copy is never overwritten" {
+    setup_test_workflow default
+    apr_run_begin default 1 apr-default-round-1 .apr/workflows/default.yaml .apr/rounds/default/round_1.md
+    bind_runtime_ledger
+    for ((i=0;i<100;i++)); do printf 'A new complete useful answer.\n'; done > "$APR_RUN_OUTPUT"
+    export APR_FOREIGN_OUTPUT="$APR_RUN_OUTPUT_PATH"
+    cp() {
+        if [[ "$2" == */.apr-output.* ]]; then
+            bash -c 'printf "Useful peer bytes arriving after the initial path check.\n" > "$APR_FOREIGN_OUTPUT"'
+        fi
+        command cp "$@"
+    }
+    capture_streams apr_run_finish 0
+    [[ "$CAPTURED_STATUS" -eq 12 ]]
+    [[ $(cat "$APR_RUN_OUTPUT_PATH") == 'Useful peer bytes arriving after the initial path check.' ]]
+    validate_output_file "$APR_RUN_OUTPUT"
+    jq -e '.state=="failed" and .outcome.code=="busy" and .outcome.exit_code==12 and .outcome.oracle_exit_code==0' "$APR_LEDGER_FILE"
+}
+
+@test "ledger integration: missing Oracle records actual dependency failure in human and robot paths" {
+    setup_test_workflow default
+    local shell_path jq_path isolated_bin="$TEST_DIR/no-oracle-bin"
+    shell_path=$(command -v bash); jq_path=$(command -v jq)
+    mkdir -p "$isolated_bin"
+    ln -s "$jq_path" "$isolated_bin/jq"
+    export APR_NO_NPX=1 APR_NO_ORACLE_PATCH=1
+    capture_streams env PATH="$isolated_bin:/usr/bin:/bin:/usr/sbin" "$shell_path" "$APR_SCRIPT" run 1 --wait
+    [[ "$CAPTURED_STATUS" -eq 3 ]]
+    ledger_validate < .apr/rounds/default/round_1.meta.json
+    jq -e '.state=="failed" and .outcome.code=="dependency_missing" and .outcome.exit_code==3 and .outcome.oracle_exit_code==null and .execution.attempts_count==0' .apr/rounds/default/round_1.meta.json
+    capture_streams env PATH="$isolated_bin:/usr/bin:/bin:/usr/sbin" "$shell_path" "$APR_SCRIPT" robot run 2 --compact
+    [[ "$CAPTURED_STATUS" -eq 3 ]]
+    assert_json_value "$CAPTURED_STDOUT" .code dependency_missing
+    ledger_validate < .apr/rounds/default/round_2.meta.json
+    jq -e '.state=="failed" and .outcome.code=="dependency_missing" and .outcome.exit_code==3 and .outcome.oracle_exit_code==null and .execution.attempts_count==0' .apr/rounds/default/round_2.meta.json
+}
+
+@test "ledger integration: early human prompt rejection keeps validation category and legacy caller exit" {
+    runtime_cli_fixture
+    cp .apr/workflows/default.yaml "$TEST_DIR/valid-workflow.yaml"
+    cat > .apr/workflows/default.yaml <<'EOF'
+name: default
+documents:
+  readme: README.md
+  spec: SPECIFICATION.md
+oracle:
+  model: "5.2 Thinking"
+rounds:
+  output_dir: .apr/rounds/default
+template: |
+  {{README}}
+EOF
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 1 && ! -f "$APR_CLI_COUNT" ]]
+    [[ "$CAPTURED_STDERR" == *APR_ERROR_CODE=validation_failed* ]]
+    ledger_validate < .apr/rounds/default/round_1.meta.json
+    jq -e '.state=="failed" and .outcome.code=="validation_failed" and .outcome.exit_code==1 and .execution.attempts_count==0' .apr/rounds/default/round_1.meta.json
+}
+
+@test "ledger integration: failed harvest keeps producer partial recovery partial stderr and session marker" {
+    runtime_cli_fixture harvest_partial
+    cat > "$TEST_DIR/audit-retention.bash" <<'EOF'
+rm() { printf '%s\0' "$@" >> "$APR_REMOVE_AUDIT"; return 0; }
+rmdir() { printf '%s\0' "$@" >> "$APR_REMOVE_AUDIT"; return 0; }
+export -f rm rmdir
+EOF
+    export APR_REMOVE_AUDIT="$TEST_DIR/removal-requests"
+    capture_streams env BASH_ENV="$TEST_DIR/audit-retention.bash" bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 1 && $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    local ledger=.apr/rounds/default/round_1.meta.json id directory
+    id=$(jq -r .run_id "$ledger"); directory=".apr/runs/default/$id"
+    [[ $(cat "$directory/output.md") == 'Incomplete response.' ]]
+    [[ $(cat "$directory/output.md.recovery") == 'Useful separately harvested partial answer.' ]]
+    [[ $(cat "$directory/output.md.recovery.err") == 'Retained harvest failure diagnostics.' ]]
+    local markers=("$directory"/oracle-start.*) diagnostics=("$directory"/apr-oracle-stderr.*)
+    [[ -f "${markers[0]}" && -f "${diagnostics[0]}" ]]
+    [[ ! -s "$APR_REMOVE_AUDIT" ]]
+}
+
+@test "ledger integration: successful harvest keeps both source answers and publishes recovered output once" {
+    runtime_cli_fixture harvest_success
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 0 && $(cat "$APR_CLI_COUNT") -eq 1 ]]
+    local ledger=.apr/rounds/default/round_1.meta.json id directory
+    id=$(jq -r .run_id "$ledger"); directory=".apr/runs/default/$id"
+    [[ $(cat "$directory/producer.partial.md") == 'Incomplete response.' ]]
+    validate_output_file "$directory/output.md.recovery"
+    cmp "$directory/output.md.recovery" .apr/rounds/default/round_1.md
+    cmp "$ledger" "$directory/terminal.meta.json"
+    ledger_validate < "$ledger"
+    jq -e '.state=="finished" and .execution.attempts_count==1 and .outcome.oracle_exit_code==0' "$ledger"
+}

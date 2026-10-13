@@ -97,6 +97,7 @@ readonly EXIT_BUSY_ERROR=12       # Single-flight / busy (e.g. lock already held
 #   APR_ERROR_CODE=<code>
 apr_emit_error_code_tag() {
     local code="${1:-internal_error}"
+    APR_RUN_ERROR_CODE="$code"
     # ASCII-only, stable tag for automation.
     printf 'APR_ERROR_CODE=%s\n' "$code" >&2
 }
@@ -240,8 +241,9 @@ acquire_lock() {
 
     local lock_path="$lock_dir/${workflow}_round_${round}.lock"
 
-    # Use flock if available (preferred - atomic and robust)
-    if command -v flock &>/dev/null; then
+    # Kernel descriptor ownership survives the parent-to-worker handoff. Keep
+    # the inode after release so contenders cannot acquire replacement inodes.
+    if command -v flock &>/dev/null || command -v lockf &>/dev/null; then
         # Open file descriptor without truncating. Only update the PID file after the lock is acquired,
         # otherwise failed attempts can clobber the running process' PID info.
         if ! exec {APR_LOCK_FD}<>"$lock_path"; then
@@ -249,12 +251,14 @@ acquire_lock() {
             APR_LOCK_FD=""
             return 1
         fi
-        if ! flock -n "$APR_LOCK_FD"; then
+        local lock_result=0
+        apr_kernel_lock "$APR_LOCK_FD" || lock_result=$?
+        if [[ "$lock_result" -ne 0 ]]; then
             verbose "acquire_lock: flock failed for FD $APR_LOCK_FD ($lock_path)"
             # Failed to acquire: close FD and return
             { exec {APR_LOCK_FD}>&-; } 2>/dev/null || true
             APR_LOCK_FD=""
-            return 1
+            return "$lock_result"
         fi
         # Success: update PID file content and set global path.
         : > "$lock_path" 2>/dev/null || true
@@ -262,33 +266,8 @@ acquire_lock() {
         APR_LOCK_FILE="$lock_path"
         verbose "acquire_lock: acquired flock on FD $APR_LOCK_FD ($lock_path)"
     else
-        # Fallback: simple file-based locking
-        # Try atomic creation first (noclobber)
-        if (set -C; echo "$$" > "$lock_path") 2>/dev/null; then
-            APR_LOCK_FILE="$lock_path"
-            verbose "acquire_lock: acquired fallback lock ($lock_path)"
-            return 0
-        fi
-
-        # File exists - check if stale
-        local pid
-        pid=$(cat "$lock_path" 2>/dev/null || echo "")
-        # Check if the process is still running
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            verbose "acquire_lock: fallback lock held by PID $pid"
-            return 1
-        fi
-        
-        # Stale lock file - remove and retry once
-        if ! rm -f "$lock_path" 2>/dev/null; then
-            return 1
-        fi
-        if (set -C; echo "$$" > "$lock_path") 2>/dev/null; then
-            APR_LOCK_FILE="$lock_path"
-            verbose "acquire_lock: acquired fallback lock after stale cleanup"
-            return 0
-        fi
-        return 1
+        print_error "Round ownership requires flock or BSD lockf"
+        return "$EXIT_DEPENDENCY_ERROR"
     fi
     return 0
 }
@@ -300,11 +279,7 @@ release_lock() {
         { exec {APR_LOCK_FD}>&-; } 2>/dev/null || true
         APR_LOCK_FD=""
     fi
-    if [[ -n "$APR_LOCK_FILE" && -f "$APR_LOCK_FILE" ]]; then
-        verbose "release_lock: removing file $APR_LOCK_FILE"
-        rm -f "$APR_LOCK_FILE" 2>/dev/null || true
-        APR_LOCK_FILE=""
-    fi
+    APR_LOCK_FILE=""
 }
 
 # In background runs, keep the lock held by the background process and prevent
@@ -1314,10 +1289,13 @@ ORACLE_EXIT_CODE=0
 
 # Preserve both live streams and the actual Oracle exit, independently of tee.
 run_oracle_once() {
-    local stderr_file
+    local stderr_file capture_template="${TMPDIR:-/tmp}/apr-oracle-stderr.XXXXXX"
+    if [[ "${APR_RUN_ACTIVE:-false}" == true && -n "${APR_LEDGER_DIR:-}" ]]; then
+        capture_template="$APR_LEDGER_DIR/apr-oracle-stderr.XXXXXX"
+    fi
     ORACLE_FAILURE_KIND="capture_error"
     ORACLE_EXIT_CODE=1
-    if ! stderr_file=$(mktemp "${TMPDIR:-/tmp}/apr-oracle-stderr.XXXXXX"); then
+    if ! stderr_file=$(mktemp "$capture_template"); then
         print_error "Cannot capture Oracle diagnostics; Oracle was not started"
         return 1
     fi
@@ -1333,7 +1311,6 @@ run_oracle_once() {
     } 3>&1
     ORACLE_EXIT_CODE="${pipeline_status[0]}"
     ORACLE_FAILURE_KIND=$(oracle_failure_kind "$ORACLE_EXIT_CODE" "$stderr_file")
-    rm -f "$stderr_file"
 
     if [[ "${pipeline_status[1]}" -ne 0 ]]; then
         ORACLE_FAILURE_KIND="capture_error"
@@ -2184,6 +2161,7 @@ apr_kernel_lock() {
 
 APR_LEDGER_FILE=""
 APR_LEDGER_RECORD=""
+APR_LEDGER_PENDING=""
 APR_LEDGER_DIR=""
 APR_LEDGER_RUN_ID=""
 APR_ATTEMPTS_COUNT=0
@@ -2242,6 +2220,7 @@ ledger_write_start() {
     canonical_dir="$CONFIG_DIR/rounds/$workflow"
     APR_LEDGER_FILE="$canonical_dir/round_${round}.meta.json"
     APR_LEDGER_RECORD=""
+    APR_LEDGER_PENDING=""
     APR_LEDGER_RUN_ID=""
     APR_LEDGER_DIR=""
     ledger_reset_execution
@@ -2261,6 +2240,7 @@ ledger_write_start() {
           execution:{attempts_count:0,retries_count:0,busy_wait_count:0,busy_wait_total_ms:0,retry_reasons:[]},
           outcome:{ok:null,code:null,exit_code:null,oracle_exit_code:null,output_path:(if $output=="" then null else $output end)}}' \
         > "$candidate" || return "$EXIT_CONFIG_ERROR"
+    APR_LEDGER_PENDING="$candidate"
     ledger_publish "$candidate" true || result=$?
     [[ "$result" -eq 0 ]] || return "$result"
     APR_LEDGER_RECORD="$candidate"
@@ -2365,6 +2345,119 @@ ledger_write_finish_success() {
 
 ledger_write_finish_error() {
     ledger_write_finish failed "$1" "$2" "${3:-}" "${4:-null}"
+}
+
+APR_RUN_ACTIVE=false
+APR_RUN_ROUND=""
+APR_RUN_WORKFLOW=""
+APR_RUN_ERROR_CODE=""
+APR_RUN_OUTPUT=""
+APR_RUN_OUTPUT_PATH=""
+APR_RUN_PRIOR_OUTPUT=""
+
+# A refused attempt never updates another run's started canonical record. Its
+# own terminal trace remains private, with an explicit canonical-path reference.
+apr_run_early_error() {
+    local workflow="$1" round="$2" code="$3" exit_code="$4" result=0 canonical
+    ledger_write_start "$workflow" "$round" "apr-${workflow}-round-${round}" "$CONFIG_DIR/workflows/$workflow.yaml" || result=$?
+    if [[ "$result" -eq "$EXIT_BUSY_ERROR" && -n "$APR_LEDGER_DIR" ]]; then
+        canonical="$APR_LEDGER_FILE"
+        APR_LEDGER_FILE="$APR_LEDGER_DIR/attempt.meta.json"
+        local candidate
+        candidate=$(umask 077; mktemp "$APR_LEDGER_DIR/.attempt.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+        jq -c --arg canonical "$canonical" '.canonical_path=$canonical' "$APR_LEDGER_PENDING" \
+            > "$candidate" || return "$EXIT_CONFIG_ERROR"
+        ledger_publish "$candidate" true || return $?
+        APR_LEDGER_RECORD="$candidate"
+    elif [[ "$result" -ne 0 ]]; then
+        return "$result"
+    fi
+    ledger_write_finish_error "$code" "$exit_code"
+}
+
+apr_run_begin() {
+    local workflow="$1" round="$2" slug="$3" config="$4" output="$5"
+    ledger_write_start "$workflow" "$round" "$slug" "$config" "$output" || return $?
+    APR_RUN_OUTPUT="$APR_LEDGER_DIR/output.md"
+    APR_RUN_OUTPUT_PATH="$output"
+    APR_RUN_PRIOR_OUTPUT=""
+    if [[ -e "$output" || -L "$output" ]]; then
+        [[ -f "$output" && ! -L "$output" ]] || return "$EXIT_CONFIG_ERROR"
+        APR_RUN_PRIOR_OUTPUT="$APR_LEDGER_DIR/prior.output.md"
+        cp -p "$output" "$APR_RUN_PRIOR_OUTPUT" || return "$EXIT_CONFIG_ERROR"
+        APR_RUN_OUTPUT_PATH="${output%.md}.${APR_LEDGER_RUN_ID}.md"
+    fi
+}
+
+# Only this run's fresh sink can qualify an answer. Preserve prior output and
+# the fresh sink before publishing a same-directory copy into the public path.
+apr_run_publish_output() {
+    local producer_exit="${1:-0}"
+    local candidate
+    [[ -f "$APR_RUN_OUTPUT" && ! -L "$APR_RUN_OUTPUT" ]] || return 1
+    [[ ! -L "$APR_RUN_OUTPUT_PATH" ]] || return "$EXIT_BUSY_ERROR"
+    if [[ -n "$APR_RUN_PRIOR_OUTPUT" ]]; then
+        [[ "$producer_exit" -eq 0 ]] || return 1
+        validate_output_file "$APR_RUN_OUTPUT" || return 1
+    elif [[ -e "$APR_RUN_OUTPUT_PATH" || -L "$APR_RUN_OUTPUT_PATH" ]]; then
+        return "$EXIT_BUSY_ERROR"
+    fi
+    candidate=$(umask 077; mktemp "${APR_RUN_OUTPUT_PATH%/*}/.apr-output.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    cp "$APR_RUN_OUTPUT" "$candidate" || return "$EXIT_CONFIG_ERROR"
+    if ! ln -n "$candidate" "$APR_RUN_OUTPUT_PATH"; then
+        if [[ -e "$APR_RUN_OUTPUT_PATH" || -L "$APR_RUN_OUTPUT_PATH" ]]; then
+            return "$EXIT_BUSY_ERROR"
+        fi
+        return "$EXIT_CONFIG_ERROR"
+    fi
+}
+
+apr_run_finish() {
+    local producer_exit="$1" failure_exit="${2:-$1}" result=0 code=internal_error
+    apr_run_publish_output "$producer_exit" || result=$?
+    if [[ "$producer_exit" -eq 0 && "$result" -eq 0 ]] && validate_output_file "$APR_RUN_OUTPUT"; then
+        cmp -s "$APR_RUN_OUTPUT" "$APR_RUN_OUTPUT_PATH" || return "$EXIT_BUSY_ERROR"
+        ledger_write_finish_success "$APR_RUN_OUTPUT_PATH" || return $?
+        ln "$APR_LEDGER_RECORD" "$APR_LEDGER_DIR/terminal.meta.json" || return "$EXIT_CONFIG_ERROR"
+        APR_RUN_ACTIVE=false
+        return 0
+    fi
+    [[ "$failure_exit" -ne 0 ]] || failure_exit=1
+    if [[ "$result" -eq "$EXIT_BUSY_ERROR" ]]; then code=busy; failure_exit=$EXIT_BUSY_ERROR; fi
+    if [[ "$ORACLE_FAILURE_KIND" == busy ]]; then code=busy; failure_exit=$EXIT_BUSY_ERROR; fi
+    ledger_write_finish_error "$code" "$failure_exit" "$APR_RUN_OUTPUT" "$ORACLE_EXIT_CODE" || return $?
+    ln "$APR_LEDGER_RECORD" "$APR_LEDGER_DIR/terminal.meta.json" || return "$EXIT_CONFIG_ERROR"
+    APR_RUN_ACTIVE=false
+    return "$failure_exit"
+}
+
+apr_run_worker_owner() {
+    local candidate result=0
+    candidate=$(umask 077; mktemp "${APR_LEDGER_FILE%/*}/.ledger-owner.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    jq -c --argjson owner "${BASHPID:-$$}" '.owner_pid=$owner' "$APR_LEDGER_RECORD" > "$candidate" || return "$EXIT_CONFIG_ERROR"
+    ledger_publish "$candidate" || result=$?
+    [[ "$result" -eq 0 ]] || return "$result"
+    APR_LEDGER_RECORD="$candidate"
+}
+
+apr_run_cleanup() {
+    local result="$1" code="${APR_RUN_ERROR_CODE:-}" native=null
+    trap - EXIT
+    if [[ "$APR_RUN_ACTIVE" == true && "$result" -ne 0 ]]; then
+        if [[ -z "$code" ]]; then
+            case "$result" in
+                2) code=usage_error ;; 3) code=dependency_missing ;; 4) code=config_error ;;
+                12) code=busy ;; *) code=internal_error ;;
+            esac
+        fi
+        if [[ -n "$APR_LEDGER_RECORD" ]]; then
+            [[ "$APR_ATTEMPTS_COUNT" -eq 0 ]] || native=$ORACLE_EXIT_CODE
+            ledger_write_finish_error "$code" "$result" "$APR_RUN_OUTPUT" "$native" || print_error "Could not finalize this run's ledger; retained its last record"
+        else
+            apr_run_early_error "$APR_RUN_WORKFLOW" "$APR_RUN_ROUND" "$code" "$result" || print_error "Could not persist this refused attempt; existing work was retained"
+        fi
+    fi
+    release_lock 2>/dev/null || true
 }
 
 # -----------------------------------------------------------------------------
@@ -3733,7 +3826,7 @@ EOF
 # Run Revision Round
 # -----------------------------------------------------------------------------
 
-run_round() {
+run_round() (
     local round_num="$1"
     local workflow="${WORKFLOW:-default}"
     local include_impl="${INCLUDE_IMPL:-false}"
@@ -3747,6 +3840,19 @@ run_round() {
     local enable_retry="${ENABLE_RETRY:-true}"
     local show_manifest="${SHOW_MANIFEST:-false}"
     local impl_reason=optional
+
+    APR_RUN_ACTIVE=false
+    APR_LEDGER_RECORD=""
+    APR_RUN_ERROR_CODE=""
+    APR_RUN_OUTPUT=""
+    if [[ "$show_manifest" != true && "$dry_run" != true && "$render" != true ]]; then
+        APR_RUN_ACTIVE=true
+        APR_RUN_ROUND="$round_num"
+        APR_RUN_WORKFLOW="$workflow"
+        trap 'apr_run_cleanup "$?"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+    fi
 
     print_banner
 
@@ -3888,7 +3994,7 @@ run_round() {
         file_size=$(du -h "$output_file" 2>/dev/null | cut -f1)
         print_warning "Round $round_num output already exists ($file_size)"
         if can_prompt; then
-            if ! confirm "Overwrite existing output?"; then
+            if ! confirm "Run again and retain both outputs?"; then
                 print_info "Cancelled. Use a different round number or backup the file."
                 exit $EXIT_SUCCESS
             fi
@@ -3929,6 +4035,8 @@ run_round() {
     local prompt
     prompt=$(build_revision_prompt "$include_impl" "$config_path" "$manifest") || return "$EXIT_CONFIG_ERROR"
     if [[ -z "$prompt" ]]; then
+        APR_RUN_ERROR_CODE=validation_failed
+        apr_emit_error_code_tag validation_failed
         if [[ "$ROBOT_MODE" == "true" ]]; then
             robot_json false "validation_failed" '{"errors":["Prompt template is empty"]}' \
                 "Add 'template' or 'template_with_impl' to workflow"
@@ -3941,6 +4049,8 @@ run_round() {
 
     # Quality gate: refuse to run if the prompt contains obvious unexpanded placeholders.
     if ! prompt_quality_check "$prompt" "$config_path" "prompt"; then
+        APR_RUN_ERROR_CODE=validation_failed
+        apr_emit_error_code_tag validation_failed
         if [[ "$ROBOT_MODE" == "true" ]]; then
             robot_json false "validation_failed" "$(jq -nc --arg err "$PROMPT_QC_REASON" '{errors:[$err]}')" \
                 "Fix workflow template before running"
@@ -4002,11 +4112,26 @@ run_round() {
     fi
 
     # Acquire lock to prevent concurrent runs of the same workflow/round.
-    if ! acquire_lock "$workflow" "$round_num"; then
+    local round_lock_result=0
+    acquire_lock "$workflow" "$round_num" || round_lock_result=$?
+    if [[ "$round_lock_result" -ne 0 ]]; then
         print_error "Another APR process is already running round $round_num for workflow '$workflow'"
         print_info "Wait for it to complete or check 'apr status'"
+        if [[ "$round_lock_result" -eq 3 ]]; then
+            apr_emit_error_code_tag dependency_missing
+            return "$EXIT_DEPENDENCY_ERROR"
+        fi
+        apr_emit_error_code_tag busy
         exit $EXIT_CONFIG_ERROR
     fi
+
+    local begin_result=0
+    apr_run_begin "$workflow" "$round_num" "$slug" "$config_path" "$output_file" || begin_result=$?
+    if [[ "$begin_result" -ne 0 ]]; then
+        apr_emit_error_code_tag "$([[ "$begin_result" -eq 12 ]] && printf busy || printf config_error)"
+        return "$begin_result"
+    fi
+    output_file="$APR_RUN_OUTPUT_PATH"
 
     # Build Oracle command
     local oracle_args=(
@@ -4015,7 +4140,7 @@ run_round() {
         "${file_args[@]}"
         --browser-attachments never  # Paste inline, never upload as files
         --slug "$slug"
-        --write-output "$output_file"
+        --write-output "$APR_RUN_OUTPUT"
         --files-report
         --heartbeat 30
     )
@@ -4025,8 +4150,9 @@ run_round() {
     [[ "$keep_browser" == "true" ]] && oracle_args+=(--browser-keep-browser)
     [[ -n "$thinking_time" ]] && oracle_args+=(--browser-thinking-time "$thinking_time")
     oracle_args+=(-p "$prompt")
+    ledger_bind_inputs "$manifest" "$prompt" "$readme_path" "$spec_path" "$impl_path" "$model" "$thinking_time" "${oracle_args[@]}" || return $?
 
-    verbose "Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
+    verbose "Oracle invocation: $(ledger_redact_args "${oracle_args[@]}")"
     verbose "Output file: $output_file"
     verbose "Session slug: $slug"
 
@@ -4046,6 +4172,8 @@ run_round() {
     fi
 
     if [[ "$wait_mode" == "true" ]]; then
+        local canonical_output_file="$output_file"
+        output_file="$APR_RUN_OUTPUT"
         print_info "Running in foreground (--wait)..."
         [[ "$enable_retry" == "true" ]] && print_dim "Auto-retry enabled (up to $MAX_RETRY_ATTEMPTS attempts)"
         print_dim "Elapsed time will be shown on completion."
@@ -4056,7 +4184,7 @@ run_round() {
         # Timestamp marker so truncation recovery can tell which Oracle
         # session this run created (see resolve_oracle_session_id).
         local session_marker=""
-        session_marker=$(mktemp "${TMPDIR:-/tmp}/apr-oracle-start.XXXXXX" 2>/dev/null) || session_marker=""
+        session_marker=$(mktemp "$APR_LEDGER_DIR/oracle-start.XXXXXX" 2>/dev/null) || session_marker=""
 
         # Use auto-retry wrapper if enabled
         if [[ "$enable_retry" == "true" ]]; then
@@ -4075,10 +4203,6 @@ run_round() {
             elapsed_fmt=$(printf '%d:%02d' $((elapsed_secs/60)) $((elapsed_secs%60)))
         fi
         echo "" >&2
-
-        if [[ $oracle_exit -ne 0 && -n "$session_marker" ]]; then
-            rm -f "$session_marker"
-        fi
 
         if [[ $oracle_exit -eq 0 ]]; then
             # Validate output file for completeness
@@ -4123,20 +4247,21 @@ run_round() {
                     session_id="<session-id from 'oracle status'>"
                 elif "${ORACLE_CMD[@]}" session "$session_id" --harvest --write-output "$recovery_output_file" \
                         >/dev/null 2>"$recovery_err_file"; then
-                    rm -f "$recovery_err_file"
                     if validate_output_file "$recovery_output_file"; then
-                        # Recovery successful - replace truncated output
-                        mv "$recovery_output_file" "$output_file"
+                        # Keep both producer and harvested bytes before selecting
+                        # the recovered answer for this run's final publication.
+                        if [[ -f "$output_file" ]]; then
+                            cp "$output_file" "$APR_LEDGER_DIR/producer.partial.md" || return "$EXIT_CONFIG_ERROR"
+                        fi
+                        cp "$recovery_output_file" "$output_file" || return "$EXIT_CONFIG_ERROR"
                         OUTPUT_VALIDATION_REASON=""
                         recovery_success=true
                         print_success "Recovery successful! Full output retrieved via session reattach."
                     else
-                        rm -f "$recovery_output_file"
                         verbose "Recovery output also invalid: $OUTPUT_VALIDATION_REASON"
                     fi
                 else
-                    # Clean up any partial recovery file that might have been created
-                    rm -f "$recovery_output_file" 2>/dev/null
+                    # Retain partial harvest output and diagnostics for inspection.
                     print_warning "Oracle session reattach failed for session: $session_id"
                     if [[ -s "$recovery_err_file" ]]; then
                         print_dim "Oracle said:"
@@ -4147,7 +4272,6 @@ run_round() {
                             print_warning "This Oracle is too old for 'session --harvest'; upgrade it: npm install -g @steipete/oracle@latest"
                         fi
                     fi
-                    rm -f "$recovery_err_file"
                 fi
 
                 if [[ "$recovery_success" != "true" ]]; then
@@ -4165,9 +4289,10 @@ run_round() {
                     # Continue but mark as incomplete for metrics
                 fi
             fi
-            if [[ -n "$session_marker" ]]; then
-                rm -f "$session_marker"
-            fi
+            local finish_result=0
+            apr_run_finish 0 || finish_result=$?
+            [[ "$finish_result" -eq 0 ]] || return "$finish_result"
+            output_file="$canonical_output_file"
 
             if [[ -z "$OUTPUT_VALIDATION_REASON" ]]; then
                 print_success "Review complete! (${elapsed_fmt} elapsed)"
@@ -4246,6 +4371,7 @@ run_round() {
                 print_warning "jq not available; skipping metrics collection"
             fi
         else
+            apr_run_finish "$oracle_exit" || true
             if [[ "$ORACLE_FAILURE_KIND" == "busy" ]]; then
                 print_error "Oracle is busy after ${elapsed_fmt}; retry when the active review completes"
                 printf '%s\n' "APR_ERROR_CODE=busy" >&2
@@ -4265,7 +4391,10 @@ run_round() {
             # Bash will SIGHUP background jobs on shell exit. Ignore HUP so the
             # background run keeps going after `apr run` returns.
             trap "" HUP
-            run_oracle_recorded "$result_file" "$enable_retry" "${oracle_args[@]}"
+            local worker_exit=0
+            apr_run_worker_owner || exit $?
+            run_oracle_recorded "$result_file" "$enable_retry" "${oracle_args[@]}" || worker_exit=$?
+            apr_run_finish "$worker_exit" "$EXIT_DEPENDENCY_ERROR"
         ) &
         local oracle_pid=$!
 
@@ -4273,9 +4402,10 @@ run_round() {
         sleep 0.5
 
         # Verify the process is actually running
-        if ! kill -0 "$oracle_pid" 2>/dev/null; then
+        if [[ -s "$result_file" ]] || ! kill -0 "$oracle_pid" 2>/dev/null; then
             local result_exit=0 result_kind="" result_oracle_exit=""
             wait "$oracle_pid" || result_exit=$?
+            APR_RUN_ACTIVE=false
             if [[ -r "$result_file" ]]; then
                 {
                     IFS= read -r result_oracle_exit || true
@@ -4298,6 +4428,7 @@ run_round() {
         fi
 
         background_lock_detach_parent "$oracle_pid"
+        APR_RUN_ACTIVE=false
 
         print_success "Oracle running in background (PID: $oracle_pid)"
         echo "" >&2
@@ -4363,7 +4494,7 @@ run_round() {
     elif [[ "$round_num" -ge 5 ]]; then
         print_dim "Tip: After 5+ rounds, look for convergence - similar feedback suggests stability"
     fi
-}
+)
 
 # -----------------------------------------------------------------------------
 # Status & Session Management
@@ -6507,11 +6638,15 @@ robot_validate() {
 }
 
 # Robot: Run - Execute a revision round
-robot_run() {
+robot_run() (
     local round_num="${1:-}"
     local workflow="${WORKFLOW:-default}"
     local include_impl="${INCLUDE_IMPL:-false}"
     local impl_reason=optional
+    APR_RUN_ACTIVE=false
+    APR_LEDGER_RECORD=""
+    APR_RUN_OUTPUT=""
+    APR_RUN_ERROR_CODE=""
     # Preserve robot's ordinary retry policy unless waiting is explicitly
     # requested. A positive budget/infinite opts its worker into the same loop.
     local ORACLE_BUSY_WAIT_SECONDS="$ORACLE_BUSY_WAIT_SECONDS"
@@ -6532,6 +6667,13 @@ robot_run() {
         return $?
     fi
 
+    APR_RUN_ACTIVE=true
+    APR_RUN_ROUND="$round_num"
+    APR_RUN_WORKFLOW="$workflow"
+    trap 'apr_run_cleanup "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     # Check Oracle
     if ! check_oracle; then
         robot_fail "dependency_missing" '{"dependency":"oracle"}' "Oracle not available"
@@ -6547,13 +6689,14 @@ robot_run() {
     fi
 
     # Parse config
-    local readme_path spec_path impl_path model output_dir impl_every_n
+    local readme_path spec_path impl_path model output_dir impl_every_n thinking_time
     readme_path=$(yaml_unquote "$(get_config_value "readme" "$config_path")")
     spec_path=$(yaml_unquote "$(get_config_value "spec" "$config_path")")
     impl_path=$(yaml_unquote "$(get_config_value "implementation" "$config_path")")
     model=$(yaml_unquote "$(get_config_value "model" "$config_path")")
     output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$config_path")")
     impl_every_n=$(yaml_unquote "$(get_config_value "impl_every_n" "$config_path")")
+    thinking_time=$(yaml_unquote "$(get_config_value "thinking_time" "$config_path")")
 
     # Auto-include implementation every N rounds if configured
     if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]]; then
@@ -6602,18 +6745,36 @@ robot_run() {
     fi
 
     # Check if output file already exists (Robot mode safety)
-    if [[ -f "$output_file" ]]; then
+    if [[ -e "$output_file" || -L "$output_file" ]]; then
         robot_fail "validation_failed" "$(jq -nc --arg path "$output_file" '{kind:"output_exists", file: $path}')" "Output file already exists"
         return $?
     fi
 
     # Acquire lock so concurrent robot runs can't trample the same workflow/round.
     local lock_file="$CONFIG_DIR/.locks/${workflow}_round_${round_num}.lock"
-    if ! acquire_lock "$workflow" "$round_num"; then
+    local round_lock_result=0
+    acquire_lock "$workflow" "$round_num" || round_lock_result=$?
+    if [[ "$round_lock_result" -ne 0 ]]; then
         local existing_pid=""
         existing_pid=$(cat "$lock_file" 2>/dev/null || echo "")
-        robot_fail "busy" "$(jq -nc --arg wf "$workflow" --argjson r "$round_num" --arg lock "$lock_file" --arg pid "$existing_pid" '{workflow: $wf, round: $r, lock_file: $lock, pid: $pid}')" \
+        local lock_code=busy
+        [[ "$round_lock_result" -ne 3 ]] || lock_code=dependency_missing
+        [[ "$round_lock_result" -ne 4 ]] || lock_code=config_error
+        robot_fail "$lock_code" "$(jq -nc --arg wf "$workflow" --argjson r "$round_num" --arg lock "$lock_file" --arg pid "$existing_pid" '{workflow: $wf, round: $r, lock_file: $lock, pid: $pid}')" \
             "Another APR process is already running this round"
+        return $?
+    fi
+
+    # Repeat the occupied-path guard under round ownership: another completed
+    # run may have published between the first check and lock acquisition.
+    if [[ -e "$output_file" || -L "$output_file" ]]; then
+        robot_fail validation_failed "$(jq -nc --arg path "$output_file" '{kind:"output_exists",file:$path}')" "Output file already exists"
+        return $?
+    fi
+    local begin_result=0
+    apr_run_begin "$workflow" "$round_num" "$slug" "$config_path" "$output_file" || begin_result=$?
+    if [[ "$begin_result" -ne 0 ]]; then
+        robot_fail "$([[ "$begin_result" -eq 12 ]] && printf busy || printf config_error)" '{"kind":"ledger_start"}' "Cannot acquire run-record ownership"
         return $?
     fi
 
@@ -6655,23 +6816,26 @@ robot_run() {
         "${file_args[@]}"
         --browser-attachments never  # Paste inline, never upload as files
         --slug "$slug"
-        --write-output "$output_file"
+        --write-output "$APR_RUN_OUTPUT"
         --files-report
         --heartbeat 30
         -p "$prompt"
     )
 
     [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && oracle_args+=(--notify)
+    [[ -z "$thinking_time" ]] || oracle_args+=(--browser-thinking-time "$thinking_time")
+    ledger_bind_inputs "$manifest" "$prompt" "$readme_path" "$spec_path" "$impl_path" "$model" "$thinking_time" "${oracle_args[@]}" || return $?
 
-    verbose "robot_run Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
+    verbose "robot_run Oracle invocation: $(ledger_redact_args "${oracle_args[@]}")"
     verbose "robot_run output_file: $output_file"
 
     # Execute in background (always use retry for reliability in robot mode).
     # Important: robot mode must keep output clean; capture all Oracle/retry output to a log file.
     local logs_dir="$CONFIG_DIR/logs"
-    local oracle_log="/dev/null"
-    if mkdir -p "$logs_dir" 2>/dev/null; then
-        oracle_log="$logs_dir/oracle_${slug}.log"
+    local oracle_log
+    if ! mkdir -p "$logs_dir" 2>/dev/null || ! oracle_log=$(mktemp "$logs_dir/oracle_${slug}.log.XXXXXX"); then
+        robot_fail config_error '{"reason":"log_capture_failed"}' "Cannot retain this run's Oracle diagnostics"
+        return $?
     fi
     local result_file
     if ! result_file=$(mktemp "$logs_dir/oracle_${slug}.result.XXXXXX"); then
@@ -6684,7 +6848,10 @@ robot_run() {
         # Bash will SIGHUP background jobs on shell exit. Ignore HUP so the
         # detached robot run can survive after `apr` exits.
         trap "" HUP
-        run_oracle_recorded "$result_file" "true" "${oracle_args[@]}"
+        local worker_exit=0
+        apr_run_worker_owner || exit $?
+        run_oracle_recorded "$result_file" "true" "${oracle_args[@]}" || worker_exit=$?
+        apr_run_finish "$worker_exit" 1
     ) >"$oracle_log" 2>&1 &
     local oracle_pid=$!
 
@@ -6693,9 +6860,10 @@ robot_run() {
 
     # Verify the process is actually running
     local launch_status="running"
-    if ! kill -0 "$oracle_pid" 2>/dev/null; then
+    if [[ -s "$result_file" ]] || ! kill -0 "$oracle_pid" 2>/dev/null; then
         local result_exit=0 result_kind="" result_oracle_exit=""
         wait "$oracle_pid" || result_exit=$?
+        APR_RUN_ACTIVE=false
         if [[ -r "$result_file" ]]; then
             {
                 IFS= read -r result_oracle_exit || true
@@ -6710,12 +6878,17 @@ robot_run() {
                 '{reason:"oracle_busy", busy:true, policy:$policy, log_file:$log, oracle_exit:($exit | tonumber)}')" \
                 "Oracle is busy; retry when the active review completes"
             return $?
+        elif [[ "$result_exit" -eq 12 && -r "$APR_LEDGER_DIR/terminal.meta.json" ]] &&
+            jq -e --arg id "$APR_LEDGER_RUN_ID" '.run_id==$id and .outcome.code=="busy"' "$APR_LEDGER_DIR/terminal.meta.json" >/dev/null; then
+            robot_fail busy '{"reason":"output_conflict"}' "Output path became occupied; inspect this run's retained output before retrying"
+            return $?
         else
             robot_fail "internal_error" '{"reason":"process_start_failed"}' "Oracle process failed to start immediately"
             return $?
         fi
     else
         background_lock_detach_parent "$oracle_pid"
+        APR_RUN_ACTIVE=false
     fi
 
     # Return session info
@@ -6729,6 +6902,7 @@ robot_run() {
         --arg round "$round_num" \
         --arg status "$launch_status" \
         --arg busy_policy "$busy_policy" \
+        --arg ledger "$APR_LEDGER_FILE" --arg run_id "$APR_LEDGER_RUN_ID" --arg record "$APR_LEDGER_DIR/terminal.meta.json" \
         --argjson include_impl "$include_impl" \
         '{
             slug: $slug,
@@ -6739,11 +6913,14 @@ robot_run() {
             round: ($round | tonumber),
             include_impl: $include_impl,
             status: $status,
+            ledger_path: $ledger,
+            run_id: $run_id,
+            run_record_path: $record,
             busy_policy: $busy_policy
         }')
 
     robot_json true "ok" "$data" "Use 'apr status' or 'apr attach $slug' to monitor"
-}
+)
 
 # Robot: History - List revision rounds
 robot_history() {
@@ -7742,6 +7919,14 @@ main() {
                 print_info "APR_NO_NPX is set; unset it to allow npx fallback"
             else
                 print_info "Or ensure npx is available"
+            fi
+            local failed_round=""
+            if [[ "$SHOW_MANIFEST" != true && "$DRY_RUN" != true && "$RENDER" != true ]]; then
+                if [[ "$command_is_round" == true ]]; then failed_round="$command";
+                elif [[ "$command" == run ]]; then failed_round="${positional_args[0]:-}"; fi
+                if is_non_negative_int "$failed_round"; then
+                    (apr_run_early_error "$WORKFLOW" "$failed_round" dependency_missing "$EXIT_DEPENDENCY_ERROR") || print_error "Could not persist the refused run's ledger"
+                fi
             fi
             exit $EXIT_DEPENDENCY_ERROR
         fi

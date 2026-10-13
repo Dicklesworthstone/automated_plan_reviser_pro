@@ -1063,9 +1063,38 @@ The executable `ledger_validate` check and state fixtures exercise this contract
 `ledger_write_start`, `ledger_bind_inputs`, `ledger_write_finish_success` and
 `ledger_write_finish_error` provide the shared writer API. Writer tests exercise
 real files, separate-process interruption, both kernel lock backends, publication
-failure and concurrent readers. Automatic human/robot/queue execution hooks
-remain under the original integration Beads; writer API proof alone does not
-establish those command paths or exact replay of changed document contents.
+failure and concurrent readers. Human and robot execution now write started
+observations before the producer and terminal records after validating its own
+fresh output. Detached launch acknowledgement is separate from terminal success;
+robot launch data includes `ledger_path`, `run_id` and `run_record_path`. The last
+path names the immutable terminal record once the worker finishes. A worker owns finalization
+after its parent exits. Early refused runs retain partial failed records, and a
+busy contender retains a private `attempt.meta.json` without replacing the active
+run. Manifest previews, dry runs and renders create no execution ledger.
+
+Each run writes to its own private output sink. An earlier public answer is copied
+into the new run directory before execution; a producer that writes nothing cannot
+reuse that answer as its own successful result. Useful prior answers and new partial
+answers are retained, including when automatic recovery fails. A successful human
+rerun saves a distinct `round_<N>.<run_id>.md` result while retaining the earlier
+public answer. Publication uses an atomic non-overwriting hard link: an arriving
+peer file blocks publication, and a failed producer cannot replace a good answer. A native
+Oracle success with incomplete output is a failed APR result. Robot diagnostics
+use unique private log files rather than replacing an earlier run's log. These
+checks use APR's existing output-completeness heuristic; they do not establish
+that a live model answered correctly or acknowledged immutable attachments.
+
+Producer stderr, the session marker, harvested answers and harvest diagnostics
+remain in the private run directory. Successful recovery retains the initial
+producer partial and the harvested answer before selecting the latter. Failed
+recovery retains both partial answers. Raw Oracle diagnostics may contain
+sensitive console output; they are private local artifacts and are not embedded
+in the redacted ledger or public JSON.
+
+Actual queue integration and exact replay of changed document contents remain
+under the original integration and reproducibility Beads. Process interruption
+can leave a started record; it must be inspected before launching replacement
+paid work. No automatic replay of an unresolved started run is implied.
 
 ### GPT Pro Extended Thinking Stability
 
