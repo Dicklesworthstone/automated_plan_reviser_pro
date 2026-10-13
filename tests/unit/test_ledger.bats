@@ -94,3 +94,16 @@ ledger_complete_fixture() {
     done
     ledger_complete_fixture | jq '.inputs.files[0].display_path=.inputs.files[0].path | .inputs.files[0].path="/configured/project/README.md"' | ledger_validate
 }
+
+@test "ledger schema: one valid document cannot hide another invalid or duplicate document" {
+    local valid invalid
+    valid=$(ledger_fixture)
+    invalid=$(ledger_fixture | jq '.schema_version="2.0.0"')
+    run ledger_validate <<< "$invalid"$'\n'"$valid"
+    [[ "$status" -ne 0 ]]
+    run ledger_validate <<< "$valid"$'\n'"$invalid"
+    [[ "$status" -ne 0 ]]
+    run ledger_validate <<< "$valid"$'\n'"$valid"
+    [[ "$status" -ne 0 ]]
+    ledger_validate <<< "$valid"
+}
