@@ -88,7 +88,7 @@ ledger_complete_fixture() {
 
 @test "ledger schema: complete file manifest binding rejects extra missing or contradictory rows" {
     local mutation
-    for mutation in '.inputs.files += [.inputs.files[2] | .role="readme"]' 'del(.inputs.files[2].bytes)' 'del(.inputs.files[0].skip_reason)' '.inputs.manifest.files={a:1,b:2,c:3}' '.inputs.manifest.files[0].sha256=("0"*64)' '.inputs.manifest.files[0].reason="optional"'; do
+    for mutation in '.inputs.files += [.inputs.files[2] | .role="readme"]' 'del(.inputs.files[2].bytes)' 'del(.inputs.files[0].skip_reason)' '.inputs.manifest.files={a:1,b:2,c:3}' '.inputs.manifest.files[0].sha256=("0"*64)' '.inputs.manifest.files[0].reason="optional"' '.inputs.files[0].display_path=7 | .inputs.manifest.files[0].path=7'; do
         run ledger_validate <<< "$(ledger_complete_fixture | jq "$mutation")"
         [[ "$status" -ne 0 ]]
     done

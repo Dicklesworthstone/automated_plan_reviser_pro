@@ -2098,6 +2098,7 @@ ledger_validate() {
              has("sha256") and has("included") and has("inclusion_reason") and has("skip_reason")) and
             (.role | IN("readme","spec","implementation")) and
             (.path | type=="string") and (.basename | type=="string") and
+            ((has("display_path") | not) or (.display_path | type=="string")) and
             (.included | type=="boolean") and
             (.inclusion_reason | IN("required","optional","impl_every_n")) and
             (if .included then (.bytes | natural) and (.sha256 | digest) and .skip_reason==null
