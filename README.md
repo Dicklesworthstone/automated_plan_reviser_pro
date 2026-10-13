@@ -990,9 +990,9 @@ and hashing failures. Literal braces in generated JSON-quoted filenames are
 escaped reversibly; unresolved template placeholders still fail prompt QC.
 
 This binding describes local observations before Oracle reads the files. It does
-not establish immutable transmitted bytes or model acknowledgement. Persistent
-ledger recording of the manifest/final prompt hash and queue integration remain
-pending.
+not establish immutable transmitted bytes or model acknowledgement. Human,
+robot and queue execution record these observations and the final prompt hash
+in the persistent run ledger.
 
 ### Run Ledger Contract
 
@@ -1091,10 +1091,70 @@ recovery retains both partial answers. Raw Oracle diagnostics may contain
 sensitive console output; they are private local artifacts and are not embedded
 in the redacted ledger or public JSON.
 
-Actual queue integration and exact replay of changed document contents remain
-under the original integration and reproducibility Beads. Process interruption
-can leave a started record; it must be inspected before launching replacement
-paid work. No automatic replay of an unresolved started run is implied.
+Successful runs also retain `output_observation.sha256` and `bytes`. Queue
+execution adds `queue_entry_id`, binding the actual run to its durable request.
+Input observations still cannot reproduce changed or missing documents;
+immutable sent-bundle replay remains unfinished under its original Bead.
+
+### Persistent Queue and Local Lint
+
+```bash
+apr lint 1 --json                   # Local checks; no Oracle or update probes
+apr queue add 1                    # Prints the stable request ID on stderr
+apr queue add 2 --include-impl
+apr queue status
+apr queue run                      # FIFO until empty; waits for each result
+apr queue run --once                # Process one request
+apr queue run --max 5               # Bound the number processed
+apr queue cancel <entry-id>         # Retain history and any active worker
+apr queue doctor --json             # Inspect state and trailing-record warnings
+apr robot queue add 3 --compact     # Same operations in the robot JSON envelope
+apr robot queue run --until-empty --compact
+```
+
+All commands accept `--workflow NAME`. Human `--json` emits raw data; robot
+commands use `ok/code/data/hint/meta`. Local lint returns typed `errors[]` and
+`warnings[]`, source paths, resolved document selection and observed hashes.
+It checks both template variants, selected files and the assembled prompt.
+The queue uses the same locally validated robot execution path and shared
+ledger/output/busy helpers. Existing `robot validate` retains its older diagnostic
+compatibility surface; broader validation-policy convergence remains unfinished.
+Queue commands reject preview/render/copy flags before executing or changing
+requests; use `lint` or `run --show-manifest` for an offline preview.
+
+History is `.apr/queue/<workflow>.events.jsonl`: version `1.0.0`, UTC timestamp,
+monotonic sequence, event ID, workflow and entry ID on every whole-line event.
+`enqueue` records round and implementation selection; `start` records controller
+identity/time; `bind` pins run identity and private terminal record; `finish`
+and `fail` retain observed outcome, execution counters and diagnostic digest.
+`cancel` preserves scheduling precedence; a started worker may finish and its
+useful result is still audited with `execution_status`. Canceling queued work
+prevents execution. Canceling started work never kills or replays it.
+
+Short mutations serialize on the stable `.apr/.locks/queue.<workflow>.lock`.
+One controller owns `.apr/.locks/queue-runner.<workflow>.lock`; its detached
+worker inherits that ownership through completion. Stable lock files and private
+pending events are retained. Reads tolerate a trailing partial/invalid record
+and warn; writes repair only an exact raw-byte prefix of one retained valid
+next event. Unknown or ambiguous tails, invalid earlier records, symlink logs
+and conflicting run bindings are held without truncating history.
+
+The runner waits for a validated private terminal record, not launch
+acknowledgement. Restart reconciles the same completed queue-bound run and
+checks successful output bytes against its digest without another producer.
+Unresolved started executions or altered completed output block later work
+and preserve useful files. A new request for an already occupied output fails
+before producer execution, preserving the earlier answer.
+
+Queue busy waits default to `infinite`; ordinary human/robot defaults remain
+unchanged. An explicit finite `APR_BUSY_WAIT_SECONDS` exhaustion records a
+`wait` event and keeps the request pending (`running`, `waiting_code: "busy"`),
+stopping later jobs with exit 12. It never silently replays that attempt. Inspect
+its ledger and cancel the held entry before intentionally adding another
+request. An output-publication conflict is a terminal failure rather than an
+Oracle-busy deferral. Batch failures are audited and processing continues; the
+batch returns the first failed exit/code. These are local filesystem/process
+guarantees, not model correctness, live-service or power-loss qualification.
 
 ### GPT Pro Extended Thinking Stability
 

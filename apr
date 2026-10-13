@@ -2060,6 +2060,541 @@ build_revision_prompt() {
     printf '%s\n\n---\n\n%s\n' "$metadata" "$template"
 }
 
+# One local validator for lint and queued execution. It never probes Oracle or
+# updates software. Findings are data; renderers choose stderr or robot JSON.
+validation_add_finding() {
+    local severity="$1" code="$2" message="$3" hint="$4" file="$5" label="$6" details="${7:-}"
+    local finding
+    [[ -n "$details" ]] || details='{}'
+    finding=$(jq -nc --arg code "$code" --arg message "$message" --arg hint "$hint" \
+        --arg file "$file" --arg label "$label" --argjson details "$details" \
+        '{code:$code,message:$message,hint:$hint,source:{file:(if $file=="" then null else $file end),line:null,label:$label},details:$details}') || return "$EXIT_CONFIG_ERROR"
+    if [[ "$severity" == error ]]; then
+        VALIDATION_ERRORS=$(jq -nc --argjson findings "$VALIDATION_ERRORS" --argjson finding "$finding" '$findings+[$finding]')
+    else
+        VALIDATION_WARNINGS=$(jq -nc --argjson findings "$VALIDATION_WARNINGS" --argjson finding "$finding" '$findings+[$finding]')
+    fi
+}
+
+validate_workflow_local() {
+    local workflow="$1" round="${2:-1}" requested="${3:-false}"
+    local VALIDATION_ERRORS='[]' VALIDATION_WARNINGS='[]' resolved='{}'
+    local config="$CONFIG_DIR/workflows/$workflow.yaml" code=ok
+    if ! is_valid_workflow_name "$workflow"; then
+        validation_add_finding error usage_error "Invalid workflow name" "Use letters, digits, dots, hyphens and underscores" "" workflow
+    fi
+    if is_non_negative_int "$round"; then
+        while [[ "${#round}" -gt 1 && "$round" == 0* ]]; do round="${round#0}"; done
+    fi
+    if ! is_non_negative_int "$round" || [[ "${#round}" -gt 9 ]]; then
+        validation_add_finding error usage_error "Round must be a non-negative integer of at most nine digits" "Choose a valid round number" "" round
+    fi
+    if [[ "$requested" != true && "$requested" != false ]]; then
+        validation_add_finding error usage_error "Implementation selection must be boolean" "Use --include-impl to select it" "" include_impl
+    fi
+    if [[ "$VALIDATION_ERRORS" == '[]' ]]; then
+        while [[ "${#round}" -gt 1 && "$round" == 0* ]]; do round="${round#0}"; done
+        if [[ ! -d "$CONFIG_DIR" ]]; then
+            validation_add_finding error not_configured "Not initialized - run 'apr robot init'" "Initialize the project first" "$CONFIG_DIR" config
+        elif [[ ! -f "$config" || ! -r "$config" ]]; then
+            validation_add_finding error config_error "Workflow '$workflow' not found or not readable" "Create or repair the workflow configuration" "$config" config
+        else
+            local fields=(readme spec implementation model thinking_time output_dir impl_every_n)
+            local values=() field value read_failed=false
+            for field in "${fields[@]}"; do
+                if value=$(get_config_value "$field" "$config"); then
+                    value=$(yaml_unquote "$value") || read_failed=true
+                else
+                    read_failed=true
+                fi
+                values+=("$value")
+            done
+            if [[ "$read_failed" == true ]]; then
+                validation_add_finding error config_error "Cannot read workflow configuration" "Check readability and YAML scalar values" "$config" config
+            else
+                local readme="${values[0]}" spec="${values[1]}" impl="${values[2]}" model="${values[3]}"
+                local thinking="${values[4]}" output="${values[5]}" cadence="${values[6]}" include="$requested" reason=optional
+                [[ -n "$model" ]] || validation_add_finding error config_error "Model not configured in workflow" "Set oracle.model" "$config" model
+                [[ -n "$output" ]] || validation_add_finding error config_error "Output directory not configured in workflow" "Set rounds.output_dir" "$config" output_dir
+                if [[ -n "$cadence" ]]; then
+                    if is_non_negative_int "$cadence" && [[ "${#cadence}" -le 9 ]]; then
+                        while [[ "${#cadence}" -gt 1 && "$cadence" == 0* ]]; do cadence="${cadence#0}"; done
+                        if ((10#$cadence > 0 && 10#$round % 10#$cadence == 0)); then include=true; reason=impl_every_n; fi
+                    else
+                        validation_add_finding error config_error "Implementation cadence must be a non-negative integer of at most nine digits" "Set rounds.impl_every_n to a valid integer" "$config" impl_every_n
+                    fi
+                fi
+                local variant template
+                for variant in false true; do
+                    local label=template
+                    [[ "$variant" != true ]] || label=template_with_impl
+                    if ! template=$(build_revision_template "$variant" "$config") || [[ -z "$template" ]]; then
+                        validation_add_finding error validation_failed "Cannot build $label" "Provide a nonempty workflow template" "$config" "$label"
+                    elif ! prompt_quality_check "$template" "$config" "$label"; then
+                        validation_add_finding error validation_failed "$PROMPT_QC_REASON ($label)" "Remove unexpanded placeholders" "$config" "$label"
+                    fi
+                done
+                local manifest='null' prompt='' effective=false manifest_result=0
+                manifest=$(build_document_manifest "$readme" "$spec" "$impl" "$include" "$reason") || manifest_result=$?
+                if [[ "$manifest_result" -ne 0 ]]; then
+                    local manifest_code=config_error
+                    [[ "$manifest_result" -ne 3 ]] || manifest_code=dependency_missing
+                    validation_add_finding error "$manifest_code" "Cannot observe selected document metadata" "Repair required files and requested optional inputs" "$config" documents
+                    manifest='null'
+                else
+                    effective=$(jq -r '.files[] | select(.role=="implementation") | .included' <<< "$manifest") || return "$EXIT_CONFIG_ERROR"
+                    local row role bytes path
+                    while IFS= read -r row; do
+                        role=$(jq -r .role <<< "$row"); bytes=$(jq -r .bytes <<< "$row"); path=$(jq -r .path <<< "$row")
+                        if [[ "$bytes" -eq 0 ]]; then
+                            validation_add_finding error validation_failed "$role document is empty: $path" "Provide useful document content" "$path" "$role" "$(jq -nc --arg role "$role" --argjson bytes "$bytes" '{role:$role,bytes:$bytes}')"
+                        elif [[ "$bytes" -lt 64 ]]; then
+                            validation_add_finding warning validation_failed "$role document is suspiciously small (${bytes} bytes): $path" "Check that the document is complete" "$path" "$role" "$(jq -nc --arg role "$role" --argjson bytes "$bytes" '{role:$role,bytes:$bytes,threshold:64}')"
+                        fi
+                    done < <(jq -c '.files[] | select(.included)' <<< "$manifest")
+                    if ! prompt=$(build_revision_prompt "$effective" "$config" "$manifest") || [[ -z "$prompt" ]]; then
+                        validation_add_finding error validation_failed "Cannot assemble selected prompt" "Check document metadata and workflow template" "$config" prompt
+                    elif ! prompt_quality_check "$prompt" "$config" "assembled prompt"; then
+                        validation_add_finding error validation_failed "$PROMPT_QC_REASON (assembled prompt)" "Remove unexpanded placeholders" "$config" prompt
+                    fi
+                fi
+                local prompt_hash=''
+                [[ -z "$prompt" ]] || prompt_hash=$(printf '%s' "$prompt" | document_sha256_stdin) || return "$EXIT_CONFIG_ERROR"
+                resolved=$(jq -nc --arg workflow "$workflow" --argjson round "$round" --arg config "$config" \
+                    --arg readme "$readme" --arg spec "$spec" --arg impl "$impl" --arg model "$model" --arg thinking "$thinking" --arg output "$output" \
+                    --argjson requested "$requested" --argjson effective "$effective" --arg reason "$reason" --argjson manifest "$manifest" --arg hash "$prompt_hash" \
+                    '{workflow:$workflow,round:$round,config_path:$config,readme_path:$readme,spec_path:$spec,implementation_path:$impl,model:$model,thinking_time:$thinking,
+                      output_dir:$output,include_impl_requested:$requested,include_impl_effective:$effective,impl_reason:$reason,manifest:$manifest,
+                      prompt_hash:(if $hash=="" then null else $hash end)}') || return "$EXIT_CONFIG_ERROR"
+            fi
+        fi
+    fi
+    if [[ "$VALIDATION_ERRORS" != '[]' ]]; then code=$(jq -r '.[0].code' <<< "$VALIDATION_ERRORS"); fi
+    jq -nc --arg code "$code" --argjson errors "$VALIDATION_ERRORS" --argjson warnings "$VALIDATION_WARNINGS" --argjson resolved "$resolved" \
+        '{valid:($errors|length==0),code:$code,errors:$errors,warnings:$warnings,resolved:$resolved}'
+}
+
+render_local_validation() {
+    local result="$1" message
+    while IFS= read -r message; do print_error "$message"; done < <(jq -r '.errors[].message' <<< "$result")
+    while IFS= read -r message; do print_warning "$message"; done < <(jq -r '.warnings[].message' <<< "$result")
+}
+
+cmd_lint() {
+    local round="${1:-1}" result code
+    if ! command -v jq >/dev/null 2>&1; then
+        apr_emit_error_code_tag dependency_missing
+        print_error "Local validation requires jq"
+        return "$EXIT_DEPENDENCY_ERROR"
+    fi
+    result=$(validate_workflow_local "${WORKFLOW:-default}" "$round" "${INCLUDE_IMPL:-false}") || return $?
+    code=$(jq -r .code <<< "$result") || return "$EXIT_CONFIG_ERROR"
+    if [[ "$ROBOT_MODE" == true ]]; then
+        if [[ "$code" != ok ]]; then robot_fail "$code" "$result" "Fix local workflow findings before running"; return $?; fi
+        robot_json true ok "$result"
+    elif [[ "${STATS_JSON:-false}" == true ]]; then
+        printf '%s\n' "$result"
+        [[ "$code" == ok ]] || apr_emit_error_code_tag "$code"
+    else
+        render_local_validation "$result"
+        if [[ "$code" == ok ]]; then print_success "Local workflow validation passed";
+        else apr_emit_error_code_tag "$code"; fi
+    fi
+    return "$(apr_exit_code_for_code "$code")"
+}
+
+# Queue history is append-only. Reads tolerate only a trailing partial/invalid
+# record; mutations recover it only from one exact retained pending event.
+queue_validate_events() {
+    jq -se '
+        def natural: type=="number" and .>=0 and .==floor;
+        def stamp: type=="string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and
+            (try(strptime("%Y-%m-%dT%H:%M:%SZ")|strftime("%Y-%m-%dT%H:%M:%SZ")) catch "")==.;
+        def code: IN("ok","usage_error","not_configured","config_error","validation_failed","dependency_missing","busy","network_error","update_error","attachment_mismatch","not_implemented","internal_error");
+        length==1 and (.[0].events | type=="array" and all(.[];
+            .schema_version=="1.0.0" and (.ts|stamp) and (.sequence|natural and .>0) and
+            (.workflow|type=="string" and test("^[A-Za-z0-9_][A-Za-z0-9._-]*$")) and
+            (.entry_id|type=="string" and test("^[A-Za-z0-9_.-]+$")) and
+            (.event_id|type=="string" and length>0) and
+            (if .event=="enqueue" then (.round|natural) and (.include_impl|type=="boolean")
+             elif .event=="start" then (.runner_id|type=="string" and length>0) and (.started_at|stamp)
+             elif .event=="bind" then (.run_id|type=="string" and length>0) and
+                (.ledger_path|type=="string" and length>0) and (.run_record_path|type=="string" and length>0)
+             elif .event=="wait" then .waiting_code=="busy" and (.waiting_since|stamp) and (.execution|type=="object")
+             elif .event=="finish" then .ok==true and .code=="ok" and .exit_code==0 and
+                (.output_path|type=="string" and length>0) and (.slug|type=="string" and length>0) and (.finished_at|stamp)
+             elif .event=="fail" then .ok==false and (.code|code and .!="ok") and
+                (.exit_code|natural and .>0 and .<=255) and (.finished_at|stamp)
+             elif .event=="cancel" then (.canceled_at|stamp) and (.reason|type=="string")
+             else false end)))
+    ' >/dev/null
+}
+
+queue_load() {
+    local workflow="$1" file="$CONFIG_DIR/queue/$1.events.jsonl" parsed
+    is_valid_workflow_name "$workflow" || return "$EXIT_USAGE_ERROR"
+    if [[ ! -e "$file" && ! -L "$file" ]]; then
+        printf '%s\n' '{"events":[],"partial_tail":null,"tail_terminated":false}'
+        return 0
+    fi
+    [[ -f "$file" && -r "$file" && ! -L "$file" ]] || return "$EXIT_CONFIG_ERROR"
+    parsed=$(jq -Rsc '
+        . as $raw | ($raw|endswith("\n")) as $terminated |
+        ($raw|split("\n")|if $terminated then .[:-1] else . end) as $lines |
+        (if $raw=="" then [] else $lines end) as $records |
+        ($records | map(try fromjson catch null)) as $decoded |
+        ([range(0; $records|length) | select($decoded[.]==null)] ) as $invalid |
+        if ($invalid|length)>1 or (($invalid|length)==1 and $invalid[0]!=($records|length)-1) then error("invalid nontrailing queue event")
+        else
+            (if ($records|length)==0 then false else ($terminated|not) or ($invalid|length)>0 end) as $partial |
+            {events:(if $partial then $decoded[:-1] else $decoded end),
+             partial_tail:(if $partial then $records[-1]+(if $terminated then "\n" else "" end) else null end),tail_terminated:$terminated}
+        end
+    ' "$file") || return "$EXIT_CONFIG_ERROR"
+    queue_validate_events <<< "$parsed" || return "$EXIT_CONFIG_ERROR"
+    jq -e --arg workflow "$workflow" '.events as $events | all(range(0;$events|length); $events[.].workflow==$workflow and $events[.].sequence==(.+1))' \
+        <<< "$parsed" >/dev/null || return "$EXIT_CONFIG_ERROR"
+    printf '%s\n' "$parsed"
+}
+
+queue_fold() {
+    jq -c '
+        def same_binding($prior;$event):
+            all(["run_id","run_record_path","ledger_path"][]; . as $key |
+                ($event[$key]==null or $prior[$key]==null or $event[$key]==$prior[$key]));
+        reduce .events[] as $event ([];
+            ([.[].entry_id]|index($event.entry_id)) as $index |
+            if $event.event=="enqueue" then
+                if $index!=null then error("duplicate queue entry") else .+[$event+{status:"queued",run_id:null,run_record_path:null}] end
+            elif $index==null then error("queue event has no enqueue")
+            elif $event.event=="cancel" then
+                if (.[$index].status|IN("queued","running")) then .[$index]+=$event|.[$index].status="canceled"
+                else error("cancel after terminal outcome") end
+            elif .[$index].status=="done" or .[$index].status=="failed" or .[$index].execution_status!=null then error("event after terminal outcome")
+            elif $event.event=="start" then
+                if .[$index].status!="queued" then error("duplicate start") else .[$index]+=$event|.[$index].status="running" end
+            elif $event.event=="bind" then
+                if .[$index].started_at==null or (same_binding(.[$index];$event)|not) then error("conflicting binding or binding without start")
+                else .[$index]+=$event end
+            elif $event.event=="wait" then
+                if .[$index].started_at==null then error("wait without start") else .[$index]+=$event end
+            elif $event.event=="finish" then
+                if .[$index].started_at==null or (same_binding(.[$index];$event)|not) then error("conflicting finish or finish without start")
+                else .[$index]+=$event|.[$index].execution_status="done"|if .[$index].status!="canceled" then .[$index].status="done" else . end end
+            elif $event.event=="fail" then
+                if .[$index].started_at==null or (same_binding(.[$index];$event)|not) then error("conflicting failure or failure without start")
+                else .[$index]+=$event|.[$index].execution_status="failed"|if .[$index].status!="canceled" then .[$index].status="failed" else . end end
+            else error("unknown queue event") end)
+    '
+}
+
+queue_recover_tail() {
+    local workflow="$1" loaded="$2" next file pending matches=0 matched="" raw_base64 prefix_base64 tail_bytes
+    [[ $(jq '.partial_tail==null' <<< "$loaded") != true ]] || return 0
+    # Compare original bytes, including a split UTF-8 character or newline.
+    # Decoded diagnostic text is never used to repair the authoritative log.
+    tail_bytes=$(LC_ALL=C tail -n 1 "$CONFIG_DIR/queue/$workflow.events.jsonl" | wc -c | tr -d ' ') || return "$EXIT_CONFIG_ERROR"
+    raw_base64=$(LC_ALL=C tail -n 1 "$CONFIG_DIR/queue/$workflow.events.jsonl" | base64 | tr -d '\r\n') || return "$EXIT_CONFIG_ERROR"
+    next=$(jq '.events|length+1' <<< "$loaded") || return "$EXIT_CONFIG_ERROR"
+    for file in "$CONFIG_DIR/queue/.pending/$workflow"/*; do
+        [[ -f "$file" ]] || continue
+        pending=$(cat "$file") || return "$EXIT_CONFIG_ERROR"
+        queue_validate_events <<< "$(jq -nc --argjson event "$pending" '{events:[$event]}')" 2>/dev/null || continue
+        jq -e --arg workflow "$workflow" --argjson next "$next" '.workflow==$workflow and .sequence==$next' <<< "$pending" >/dev/null || continue
+        prefix_base64=$(LC_ALL=C head -c "$tail_bytes" "$file" | base64 | tr -d '\r\n') || return "$EXIT_CONFIG_ERROR"
+        if [[ "$prefix_base64" == "$raw_base64" ]]; then matches=$((matches+1)); matched="$file"; fi
+    done
+    [[ "$matches" -eq 1 ]] || { print_error "Queue trailing record is retained but cannot be uniquely recovered"; return "$EXIT_CONFIG_ERROR"; }
+    LC_ALL=C tail -c "+$((tail_bytes+1))" "$matched" >> "$CONFIG_DIR/queue/$workflow.events.jsonl" || return "$EXIT_CONFIG_ERROR"
+    queue_load "$workflow" >/dev/null
+}
+
+# Caller supplies only selected event fields. Identity/sequence are assigned
+# while holding the short mutation lock, never through a producer/busy wait.
+queue_append_event() (
+    local workflow="$1" event="$2" entry_id="$3" payload="${4:-}" loaded state sequence pending record current
+    [[ -n "$payload" ]] || payload='{}'
+    is_valid_workflow_name "$workflow" || return "$EXIT_USAGE_ERROR"
+    umask 077
+    mkdir -p "$CONFIG_DIR/queue/.pending/$workflow" "$CONFIG_DIR/.locks" || return "$EXIT_CONFIG_ERROR"
+    exec 8>>"$CONFIG_DIR/.locks/queue.$workflow.lock" || return "$EXIT_CONFIG_ERROR"
+    apr_kernel_lock 8 || return $?
+    loaded=$(queue_load "$workflow") || return $?
+    queue_recover_tail "$workflow" "$loaded" || return $?
+    loaded=$(queue_load "$workflow") || return $?
+    state=$(queue_fold <<< "$loaded") || return "$EXIT_CONFIG_ERROR"
+    current=$(jq -r --arg id "$entry_id" '.[]|select(.entry_id==$id)|.status' <<< "$state") || return "$EXIT_CONFIG_ERROR"
+    case "$event" in
+        enqueue) [[ -z "$current" ]] || return "$EXIT_BUSY_ERROR" ;;
+        start) [[ "$current" == queued ]] || return "$EXIT_BUSY_ERROR" ;;
+        bind|finish|fail|wait)
+            [[ "$current" == running ]] || jq -e --arg id "$entry_id" 'any(.[];.entry_id==$id and .status=="canceled" and .started_at!=null and .execution_status==null)' <<< "$state" >/dev/null || return "$EXIT_BUSY_ERROR" ;;
+        cancel) [[ "$current" == queued || "$current" == running ]] || return "$EXIT_BUSY_ERROR" ;;
+        *) return "$EXIT_USAGE_ERROR" ;;
+    esac
+    sequence=$(jq '.events|length+1' <<< "$loaded") || return "$EXIT_CONFIG_ERROR"
+    pending=$(mktemp "$CONFIG_DIR/queue/.pending/$workflow/event.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    payload=$(jq -c --arg event "$event" '
+        if $event=="enqueue" then {round,include_impl}
+        elif $event=="start" then {runner_id,started_at,runner_pid}
+        elif $event=="bind" then {run_id,ledger_path,run_record_path}
+        elif $event=="wait" then {waiting_code,waiting_since,execution}
+        elif $event=="finish" then {ok,code,exit_code,output_path,slug,finished_at,run_id,run_record_path,ledger_path,execution,stderr_sha256}
+        elif $event=="fail" then {ok,code,exit_code,finished_at,run_id,run_record_path,ledger_path,execution,stderr_sha256}
+        else {canceled_at,reason} end | with_entries(select(.value!=null))
+    ' <<< "$payload") || return "$EXIT_CONFIG_ERROR"
+    record=$(jq -nc --argjson payload "$payload" --arg workflow "$workflow" --arg event "$event" --arg id "$entry_id" \
+        --arg event_id "${pending##*/}" --arg ts "$(iso_timestamp)" --argjson sequence "$sequence" \
+        '$payload+{schema_version:"1.0.0",workflow:$workflow,event:$event,entry_id:$id,event_id:$event_id,ts:$ts,sequence:$sequence}') || return "$EXIT_CONFIG_ERROR"
+    queue_validate_events <<< "$(jq -nc --argjson event "$record" '{events:[$event]}')" || return "$EXIT_CONFIG_ERROR"
+    jq -c --argjson event "$record" '.events+=[$event]' <<< "$loaded" | queue_fold >/dev/null || return "$EXIT_CONFIG_ERROR"
+    printf '%s\n' "$record" > "$pending" || return "$EXIT_CONFIG_ERROR"
+    cat "$pending" >> "$CONFIG_DIR/queue/$workflow.events.jsonl" || return "$EXIT_CONFIG_ERROR"
+    printf '%s\n' "$record"
+)
+
+queue_status_data() {
+    local workflow="$1" loaded entries
+    loaded=$(queue_load "$workflow") || return $?
+    entries=$(queue_fold <<< "$loaded") || return "$EXIT_CONFIG_ERROR"
+    jq -nc --arg workflow "$workflow" --argjson loaded "$loaded" --argjson entries "$entries" \
+        '{workflow:$workflow,entries:$entries,counts:(reduce $entries[] as $entry ({queued:0,running:0,done:0,failed:0,canceled:0};.[$entry.status]+=1)),
+          warnings:(if $loaded.partial_tail==null then [] else [{code:"config_error",message:"Trailing queue record is retained and ignored until safely recovered"}] end)}'
+}
+
+# Retrying a short queue-lock acquisition never retries a producer. If a
+# terminal append cannot be made, the next runner reconciles the same run.
+queue_mutate() {
+    local attempt=0 result=12
+    while [[ "$result" -eq "$EXIT_BUSY_ERROR" && "$attempt" -lt 20 ]]; do
+        result=0
+        queue_append_event "$@" || result=$?
+        attempt=$((attempt+1))
+        [[ "$result" -ne "$EXIT_BUSY_ERROR" ]] || sleep 0.05
+    done
+    return "$result"
+}
+
+queue_find_run() {
+    local workflow="$1" entry_id="$2" round="$3" file found='' count=0
+    for file in "$CONFIG_DIR/runs/$workflow"/*/terminal.meta.json; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        if jq -e --arg id "$entry_id" --arg wf "$workflow" --argjson round "$round" \
+            '.queue_entry_id==$id and .workflow==$wf and .round==$round' "$file" >/dev/null; then
+            found="$file"; count=$((count+1))
+        fi
+    done
+    [[ "$count" -le 1 ]] || return "$EXIT_CONFIG_ERROR"
+    if [[ "$count" -eq 0 ]]; then
+        file="$CONFIG_DIR/rounds/$workflow/round_${round}.meta.json"
+        if [[ -f "$file" && ! -L "$file" ]] && jq -e --arg id "$entry_id" --arg wf "$workflow" --argjson round "$round" \
+            '.queue_entry_id==$id and .workflow==$wf and .round==$round' "$file" >/dev/null; then found="$file"; fi
+    fi
+    printf '%s' "$found"
+}
+
+queue_observe_run() {
+    local workflow="$1" entry="$2" file record state owner output metadata expected id round run_id bound private
+    id=$(jq -r .entry_id <<< "$entry"); round=$(jq -r .round <<< "$entry")
+    bound=$(jq -r '.run_id // empty' <<< "$entry")
+    while :; do
+        file=$(queue_find_run "$workflow" "$id" "$round") || return $?
+        [[ -n "$file" ]] || { print_error "Queue entry $id has an unresolved execution; inspect retained state before retrying"; return "$EXIT_BUSY_ERROR"; }
+        record=$(cat "$file") || return "$EXIT_CONFIG_ERROR"
+        ledger_validate <<< "$record" || return "$EXIT_CONFIG_ERROR"
+        run_id=$(jq -r .run_id <<< "$record")
+        [[ -z "$bound" || "$bound" == "$run_id" ]] || return "$EXIT_CONFIG_ERROR"
+        state=$(jq -r .state <<< "$record")
+        owner=$(jq -r '.owner_pid // empty' <<< "$record")
+        if [[ "$state" != started ]]; then
+            # Publication of the canonical terminal record precedes the
+            # private terminal link. Wait through that real handoff window.
+            private="$CONFIG_DIR/runs/$workflow/$run_id/terminal.meta.json"
+            if [[ "$file" != "$private" ]]; then
+                if [[ -f "$private" && ! -L "$private" ]]; then continue; fi
+                if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then sleep 0.2; continue; fi
+                print_error "Queue entry $id lacks its private terminal record; preserving the canonical outcome"
+                return "$EXIT_BUSY_ERROR"
+            fi
+            if [[ "$state" == finished ]]; then
+                output=$(jq -r .outcome.output_path <<< "$record")
+                [[ -f "$output" && ! -L "$output" ]] && validate_output_file "$output" || return "$EXIT_CONFIG_ERROR"
+                expected=$(jq -r '.output_observation.sha256 // empty' <<< "$record")
+                [[ -n "$expected" ]] || return "$EXIT_CONFIG_ERROR"
+                metadata=$(document_file_metadata "$output" readme required) || return $?
+                [[ $(jq -r .sha256 <<< "$metadata") == "$expected" ]] || return "$EXIT_CONFIG_ERROR"
+            fi
+            jq -nc --argjson record "$record" --arg path "$file" '{record:$record,run_record_path:$path}'
+            return 0
+        fi
+        if [[ ! "$owner" =~ ^[0-9]+$ ]] || ! kill -0 "$owner" 2>/dev/null; then
+            print_error "Queue entry $id has a nonterminal run; preserving it without launching a duplicate"
+            return "$EXIT_BUSY_ERROR"
+        fi
+        sleep 0.2
+    done
+}
+
+queue_record_outcome() {
+    local workflow="$1" entry="$2" observed="$3" stderr_file="${4:-}" record id payload event stderr_hash=''
+    record=$(jq -c .record <<< "$observed"); id=$(jq -r .entry_id <<< "$entry")
+    payload=$(jq -nc --argjson record "$record" --arg path "$(jq -r .run_record_path <<< "$observed")" \
+        --arg ledger "$CONFIG_DIR/rounds/$workflow/round_$(jq -r .round <<< "$entry").meta.json" \
+        '{run_id:$record.run_id,run_record_path:$path,ledger_path:$ledger}') || return "$EXIT_CONFIG_ERROR"
+    queue_mutate "$workflow" bind "$id" "$payload" >/dev/null || return $?
+    if [[ -n "$stderr_file" && -f "$stderr_file" ]]; then
+        stderr_hash=$(document_sha256_stdin < "$stderr_file") || return "$EXIT_CONFIG_ERROR"
+    fi
+    payload=$(jq -nc --argjson binding "$payload" --argjson record "$record" --arg hash "$stderr_hash" \
+        '$binding + {ok:$record.outcome.ok,code:$record.outcome.code,exit_code:$record.outcome.exit_code,
+          finished_at:$record.finished_at,execution:$record.execution,output_path:$record.outcome.output_path,slug:$record.slug} +
+          (if $hash=="" then {} else {stderr_sha256:$hash} end)') || return "$EXIT_CONFIG_ERROR"
+    event=fail
+    [[ $(jq -r .state <<< "$record") != finished ]] || event=finish
+    queue_mutate "$workflow" "$event" "$id" "$payload" >/dev/null
+}
+
+queue_run_data() (
+    local workflow="$1" maximum="$2" status entries entry id round include runner result=0 processed=0 failures=0 code=ok
+    local launch launch_exit stderr_file observed recovery
+    umask 077
+    mkdir -p "$CONFIG_DIR/.locks" "$CONFIG_DIR/queue/.runners/$workflow" || return "$EXIT_CONFIG_ERROR"
+    # FD9 lives through the worker handoff. A crashed controller cannot permit
+    # a second runner while its useful detached worker is still executing.
+    exec 9>>"$CONFIG_DIR/.locks/queue-runner.$workflow.lock" || return "$EXIT_CONFIG_ERROR"
+    apr_kernel_lock 9 || return $?
+    runner=$(mktemp -d "$CONFIG_DIR/queue/.runners/$workflow/runner.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    while [[ "$maximum" -eq 0 || "$processed" -lt "$maximum" ]]; do
+        status=$(queue_status_data "$workflow") || return $?
+        # Finish an interrupted controller's already-started entry first,
+        # including canceled executions whose useful worker was preserved.
+        entry=$(jq -c '[.entries[]|select(.status=="running" or (.status=="canceled" and .started_at!=null and .execution_status==null))][0] // empty' <<< "$status")
+        recovery=true
+        if [[ -z "$entry" ]]; then
+            entry=$(jq -c '[.entries[]|select(.status=="queued")][0] // empty' <<< "$status")
+            recovery=false
+        fi
+        [[ -n "$entry" ]] || break
+        id=$(jq -r .entry_id <<< "$entry"); round=$(jq -r .round <<< "$entry"); include=$(jq -r .include_impl <<< "$entry")
+        stderr_file="$runner/$id.stderr"
+        if [[ "$recovery" == false ]]; then
+            queue_mutate "$workflow" start "$id" "$(jq -nc --arg runner "${runner##*/}" --arg stamp "$(iso_timestamp)" --argjson pid "${BASHPID:-$$}" \
+                '{runner_id:$runner,started_at:$stamp,runner_pid:$pid}')" >/dev/null || return $?
+            # The shared robot run gates local validation before Oracle and
+            # preserves the same prompt, busy policy, writer and output logic.
+            launch_exit=0
+            launch=$(
+                ROBOT_MODE=true; ROBOT_COMPACT=true; ROBOT_FORMAT=json; ROBOT_STATS=false
+                WORKFLOW="$workflow"; INCLUDE_IMPL="$include"
+                export APR_QUEUE_ENTRY_ID="$id"
+                export APR_BUSY_WAIT_SECONDS="${APR_BUSY_WAIT_SECONDS:-infinite}"
+                ORACLE_BUSY_WAIT_SECONDS="$APR_BUSY_WAIT_SECONDS"
+                robot_run "$round"
+            ) 2> "$stderr_file" || launch_exit=$?
+            printf '%s\n' "$launch" > "$runner/$id.launch.json" || return "$EXIT_CONFIG_ERROR"
+            # Launch acknowledgement is not completion. Failed pre-launch
+            # attempts also own a queue-bound private terminal record.
+            if [[ "$launch_exit" -eq 0 ]] && jq -e '.ok and .data.run_id!=null' <<< "$launch" >/dev/null; then
+                queue_mutate "$workflow" bind "$id" "$(jq -c '.data|{run_id,ledger_path,run_record_path}' <<< "$launch")" >/dev/null || return $?
+                entry=$(jq -c --argjson binding "$(jq -c '.data|{run_id,ledger_path,run_record_path}' <<< "$launch")" '.+$binding' <<< "$entry")
+            fi
+        fi
+        observed=$(queue_observe_run "$workflow" "$entry") || return $?
+        status=$(queue_status_data "$workflow") || return $?
+        if jq -e '.record.outcome.code=="busy" and .record.oracle_failure_kind=="busy"' <<< "$observed" >/dev/null &&
+            ! jq -e --arg id "$id" 'any(.entries[];.entry_id==$id and .status=="canceled")' <<< "$status" >/dev/null; then
+            # Explicit finite busy exhaustion keeps the request pending and
+            # stops later jobs. Never replay an uncertain/output-conflict run.
+            queue_mutate "$workflow" bind "$id" "$(jq -c --arg ledger "$CONFIG_DIR/rounds/$workflow/round_${round}.meta.json" \
+                '{run_id:.record.run_id,run_record_path,ledger_path:$ledger}' <<< "$observed")" >/dev/null || return $?
+            if ! jq -e --arg id "$id" 'any(.entries[];.entry_id==$id and .waiting_code=="busy")' <<< "$status" >/dev/null; then
+                queue_mutate "$workflow" wait "$id" "$(jq -nc --arg stamp "$(iso_timestamp)" --argjson execution "$(jq -c .record.execution <<< "$observed")" \
+                    '{waiting_code:"busy",waiting_since:$stamp,execution:$execution}')" >/dev/null || return $?
+            fi
+            status=$(queue_status_data "$workflow") || return $?
+            jq -nc --argjson status "$status" --argjson processed "$processed" '$status+{processed:$processed,failures:0,code:"busy"}'
+            return "$EXIT_BUSY_ERROR"
+        fi
+        queue_record_outcome "$workflow" "$entry" "$observed" "$stderr_file" || return $?
+        if [[ $(jq -r .record.outcome.ok <<< "$observed") != true ]]; then
+            failures=$((failures+1))
+            if [[ "$result" -eq 0 ]]; then
+                result=$(jq -r .record.outcome.exit_code <<< "$observed")
+                code=$(jq -r .record.outcome.code <<< "$observed")
+            fi
+        fi
+        processed=$((processed+1))
+    done
+    status=$(queue_status_data "$workflow") || return $?
+    jq -nc --argjson status "$status" --argjson processed "$processed" --argjson failures "$failures" --arg code "$code" \
+        '$status+{processed:$processed,failures:$failures,code:$code}'
+    return "$result"
+)
+
+cmd_queue() {
+    local action="${1:-status}" workflow="${WORKFLOW:-default}" result=0 data='{}' code=ok maximum=0 round id
+    [[ "$#" -eq 0 ]] || shift
+    if ! command -v jq >/dev/null 2>&1; then print_error "Queue commands require jq"; apr_emit_error_code_tag dependency_missing; return "$EXIT_DEPENDENCY_ERROR"; fi
+    if [[ "${DRY_RUN:-false}" == true || "${RENDER:-false}" == true || "${SHOW_MANIFEST:-false}" == true || "${COPY:-false}" == true ]]; then
+        print_error "Queue commands do not accept preview/render/copy flags; use lint or run --show-manifest before queueing"
+        result=$EXIT_USAGE_ERROR
+    elif ! is_valid_workflow_name "$workflow"; then result=$EXIT_USAGE_ERROR; else
+        case "$action" in
+            add)
+                round="${1:-}"
+                while [[ "${#round}" -gt 1 && "$round" == 0* ]]; do round="${round#0}"; done
+                if [[ "$#" -ne 1 ]] || ! is_non_negative_int "$round" || [[ "${#round}" -gt 9 ]]; then result=$EXIT_USAGE_ERROR
+                elif [[ ! -d "$CONFIG_DIR" ]]; then result=$EXIT_CONFIG_ERROR; code=not_configured
+                else
+                    id="entry-$(date -u +%Y%m%dT%H%M%SZ)-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
+                    data=$(queue_mutate "$workflow" enqueue "$id" "$(jq -nc --argjson round "$round" --argjson include "${INCLUDE_IMPL:-false}" '{round:$round,include_impl:$include}')") || result=$?
+                fi ;;
+            status|doctor)
+                if [[ "$#" -ne 0 ]]; then result=$EXIT_USAGE_ERROR; else data=$(queue_status_data "$workflow") || result=$?; fi ;;
+            cancel)
+                id="${1:-}"
+                if [[ "$#" -ne 1 || ! "$id" =~ ^[A-Za-z0-9_.-]+$ ]]; then result=$EXIT_USAGE_ERROR
+                else data=$(queue_mutate "$workflow" cancel "$id" "$(jq -nc --arg stamp "$(iso_timestamp)" '{canceled_at:$stamp,reason:"Canceled by operator; any active worker is preserved"}')") || result=$?; fi ;;
+            run)
+                while [[ "$#" -gt 0 ]]; do
+                    case "$1" in
+                        --once) maximum=1; shift ;;
+                        --until-empty) maximum=0; shift ;;
+                        --max)
+                            maximum="${2:-}"
+                            if [[ ! "$maximum" =~ ^[1-9][0-9]*$ || "${#maximum}" -gt 9 ]]; then result=$EXIT_USAGE_ERROR; break; fi
+                            shift 2 ;;
+                        *) result=$EXIT_USAGE_ERROR; break ;;
+                    esac
+                done
+                if [[ "$result" -eq 0 ]]; then data=$(queue_run_data "$workflow" "$maximum") || result=$?; fi ;;
+            *) result=$EXIT_USAGE_ERROR ;;
+        esac
+    fi
+    if [[ "$result" -ne 0 && "$code" == ok ]]; then
+        case "$result" in
+            2) code=usage_error ;; 3) code=dependency_missing ;; 4) code=config_error ;; 12) code=busy ;; *) code=internal_error ;;
+        esac
+        if [[ -n "$data" ]] && jq -e '.code!=null' <<< "$data" >/dev/null; then code=$(jq -r .code <<< "$data"); fi
+    fi
+    [[ -n "$data" ]] || data='{}'
+    if [[ "$ROBOT_MODE" == true ]]; then
+        robot_json "$([[ "$result" -eq 0 ]] && printf true || printf false)" "$code" "$data" "Queue history and uncertain executions are retained; inspect status before retrying"
+        [[ "$result" -eq 0 ]] || apr_emit_error_code_tag "$code"
+    elif [[ "${STATS_JSON:-false}" == true ]]; then
+        printf '%s\n' "$data"
+        [[ "$result" -eq 0 ]] || apr_emit_error_code_tag "$code"
+    elif [[ "$result" -ne 0 ]]; then
+        print_error "Queue $action: $code (status $result)"; apr_emit_error_code_tag "$code"
+    elif [[ "$action" == add ]]; then print_success "Queued $(jq -r .entry_id <<< "$data") for $workflow round $(jq -r .round <<< "$data")"
+    elif [[ "$action" == cancel ]]; then print_success "Canceled $id; history and any active worker retained"
+    else
+        jq -r '"Queue \(.workflow): queued=\(.counts.queued) running=\(.counts.running) done=\(.counts.done) failed=\(.counts.failed) canceled=\(.counts.canceled)",
+            (.warnings[]?.message),(.entries[]|"\(.entry_id)  round \(.round)  \(.status)" )' <<< "$data" >&2
+    fi
+    return "$result"
+}
+
 # Versioned run provenance contract. Writers and readers use this same check;
 # unknown optional fields are permitted within major version 1. Unknown major
 # versions and contradictory terminal outcomes are never silently accepted.
@@ -2231,14 +2766,15 @@ ledger_write_start() {
     jq -nc --arg id "$APR_LEDGER_RUN_ID" --arg workflow "$workflow" --arg round "$round" \
         --arg slug "$slug" --arg config "$config_path" --arg output "$output_path" \
         --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson epoch "$(date +%s)" \
-        --argjson owner "${BASHPID:-$$}" \
+        --argjson owner "${BASHPID:-$$}" --arg queue_entry "${APR_QUEUE_ENTRY_ID:-}" \
         '{schema_version:"1.0.0",run_id:$id,workflow:$workflow,round:($round|tonumber),slug:$slug,
           state:"started",started_at:$started,started_epoch_s:$epoch,owner_pid:$owner,finished_at:null,duration_ms:null,
           config:{path:(if $config=="" then null else $config end),sha256:null},
           inputs:{status:"pending",files:[],manifest:null,prompt_hash:null},
           invocation:{engine:"browser",model:null,thinking_time:null,remote_host:null,oracle_flags_used:[],oracle_args:[]},
           execution:{attempts_count:0,retries_count:0,busy_wait_count:0,busy_wait_total_ms:0,retry_reasons:[]},
-          outcome:{ok:null,code:null,exit_code:null,oracle_exit_code:null,output_path:(if $output=="" then null else $output end)}}' \
+          outcome:{ok:null,code:null,exit_code:null,oracle_exit_code:null,output_path:(if $output=="" then null else $output end)}} +
+          (if $queue_entry=="" then {} else {queue_entry_id:$queue_entry} end)' \
         > "$candidate" || return "$EXIT_CONFIG_ERROR"
     APR_LEDGER_PENDING="$candidate"
     ledger_publish "$candidate" true || result=$?
@@ -2325,10 +2861,11 @@ ledger_write_finish() {
         --argjson native "$native" --arg finish "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson now "$now" \
         --argjson attempts "$APR_ATTEMPTS_COUNT" --argjson retries "$APR_RETRIES_COUNT" \
         --argjson busy "$APR_BUSY_WAIT_COUNT" --argjson busy_ms "$APR_BUSY_WAIT_TOTAL_MS" \
-        --argjson reasons "$APR_RETRY_REASONS" \
+        --argjson reasons "$APR_RETRY_REASONS" --arg failure_kind "${ORACLE_FAILURE_KIND:-}" \
         '.state=$state | .finished_at=$finish | .duration_ms=([0,($now-.started_epoch_s)*1000]|max) |
          (if .inputs.status=="pending" then .inputs.status="failed" else . end) |
          .execution={attempts_count:$attempts,retries_count:$retries,busy_wait_count:$busy,busy_wait_total_ms:$busy_ms,retry_reasons:$reasons} |
+         .oracle_failure_kind=(if $failure_kind=="" then null else $failure_kind end) |
          .outcome={ok:($state=="finished"),code:$code,exit_code:$exit,oracle_exit_code:$native,
             output_path:(if $output=="" then null else $output end)}' "$APR_LEDGER_RECORD" \
         > "$candidate" || return "$EXIT_CONFIG_ERROR"
@@ -2338,8 +2875,16 @@ ledger_write_finish() {
 }
 
 ledger_write_finish_success() {
-    local output="$1"
+    local output="$1" metadata
     validate_output_file "$output" || return "$EXIT_CONFIG_ERROR"
+    metadata=$(document_file_metadata "$output" readme required) || return $?
+    # Bind successful output bytes before publishing the terminal record. This
+    # lets queue restart recovery distinguish the answer from a changed file.
+    local candidate
+    candidate=$(umask 077; mktemp "${APR_LEDGER_FILE%/*}/.ledger-output.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    jq -c --argjson metadata "$metadata" '.output_observation={sha256:$metadata.sha256,bytes:$metadata.bytes}' "$APR_LEDGER_RECORD" > "$candidate" || return "$EXIT_CONFIG_ERROR"
+    ledger_publish "$candidate" || return $?
+    APR_LEDGER_RECORD="$candidate"
     ledger_write_finish finished ok 0 "$output" "${ORACLE_EXIT_CODE:-0}"
 }
 
@@ -2455,6 +3000,9 @@ apr_run_cleanup() {
             ledger_write_finish_error "$code" "$result" "$APR_RUN_OUTPUT" "$native" || print_error "Could not finalize this run's ledger; retained its last record"
         else
             apr_run_early_error "$APR_RUN_WORKFLOW" "$APR_RUN_ROUND" "$code" "$result" || print_error "Could not persist this refused attempt; existing work was retained"
+        fi
+        if [[ -n "$APR_LEDGER_RECORD" && ! -e "$APR_LEDGER_DIR/terminal.meta.json" && ! -L "$APR_LEDGER_DIR/terminal.meta.json" ]]; then
+            ln "$APR_LEDGER_RECORD" "$APR_LEDGER_DIR/terminal.meta.json" || print_error "Could not retain private terminal record"
         fi
     fi
     release_lock 2>/dev/null || true
@@ -3939,6 +4487,14 @@ run_round() (
                 exit $EXIT_CONFIG_ERROR
             fi
             # preflight_result=2 means warnings only, continue execution.
+            local local_validation
+            local_validation=$(validate_workflow_local "$workflow" "$round_num" "$include_impl") || return $?
+            if [[ $(jq -r .valid <<< "$local_validation") != true ]]; then
+                render_local_validation "$local_validation"
+                APR_RUN_ERROR_CODE=$(jq -r .code <<< "$local_validation")
+                apr_emit_error_code_tag "$APR_RUN_ERROR_CODE"
+                return "$(apr_exit_code_for_code "$APR_RUN_ERROR_CODE")"
+            fi
         else
             verbose "Skipping pre-flight checks (skip_preflight=$skip_preflight dry_run=$dry_run render=$render)"
             local required_path
@@ -6674,6 +7230,14 @@ robot_run() (
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
+    local local_validation validation_code
+    local_validation=$(validate_workflow_local "$workflow" "$round_num" "$include_impl") || return $?
+    if [[ $(jq -r .valid <<< "$local_validation") != true ]]; then
+        validation_code=$(jq -r .code <<< "$local_validation")
+        robot_fail "$validation_code" "$local_validation" "Fix local workflow findings before running"
+        return $?
+    fi
+
     # Check Oracle
     if ! check_oracle; then
         robot_fail "dependency_missing" '{"dependency":"oracle"}' "Oracle not available"
@@ -7281,6 +7845,8 @@ robot_help() {
             workflows: "List all workflows with descriptions",
             init: "Initialize .apr directory",
             validate: "Pre-run validation (apr robot validate <round>)",
+            lint: "Offline local workflow validation (apr robot lint [round])",
+            queue: "Persistent FIFO queue: add <round>, status, cancel <id>, run [--once|--until-empty|--max N], doctor",
             run: "Execute revision round (apr robot run <round>)",
             show: "View round content (apr robot show <round>)",
             diff: "Compare rounds (apr robot diff <N> [M])",
@@ -7356,6 +7922,15 @@ cmd_robot() {
                 ROBOT_FORMAT_OVERRIDE="${1#*=}"
                 shift
                 ;;
+            --once|--until-empty|--max)
+                if [[ "$robot_cmd" != queue ]]; then robot_fail usage_error '{}' "Queue option requires the queue command"; return $?; fi
+                robot_args+=("$1")
+                if [[ "$1" == --max ]]; then
+                    [[ -n "${2:-}" ]] || { robot_fail usage_error '{}' "--max requires a positive integer"; return $?; }
+                    robot_args+=("$2"); shift
+                fi
+                shift
+                ;;
             -w|--workflow)
                 if [[ -z "${2:-}" ]]; then
                     robot_fail "usage_error" '{"option":"-w"}' "Option -w requires a workflow name"
@@ -7412,6 +7987,12 @@ cmd_robot() {
         validate)
             robot_validate "${robot_args[0]:-}"
             ;;
+        lint)
+            cmd_lint "${robot_args[0]:-1}"
+            ;;
+        queue)
+            cmd_queue "${robot_args[@]}"
+            ;;
         run)
             robot_run "${robot_args[0]:-}"
             ;;
@@ -7461,6 +8042,8 @@ show_help() {
 
         gum style --foreground 214 --bold "COMMANDS" >&2
         gum style --foreground 39 "  Core Workflow" >&2
+        echo "    lint [round]         Validate local workflow without Oracle" >&2
+        echo "    queue <action>       Add/status/cancel/run/doctor persistent work" >&2
         echo "    $(gum style --foreground 82 'run <round>')        Run a revision round" >&2
         echo "    $(gum style --foreground 82 'setup')              Interactive workflow setup wizard" >&2
         echo "    $(gum style --foreground 82 'status')             Check Oracle session status" >&2
@@ -7572,6 +8155,8 @@ show_help() {
         echo "" >&2
         echo -e "${BOLD}${YELLOW}COMMANDS${NC}" >&2
         echo -e "  ${CYAN}Core Workflow${NC}" >&2
+        echo "    lint [round]         Validate local workflow without Oracle" >&2
+        echo "    queue <action>       Add/status/cancel/run/doctor persistent work" >&2
         echo -e "    ${GREEN}run <round>${NC}        Run a revision round" >&2
         echo -e "    ${GREEN}setup${NC}              Interactive workflow setup wizard" >&2
         echo -e "    ${GREEN}status${NC}             Check Oracle session status" >&2
@@ -7685,7 +8270,10 @@ main() {
     check_gum || true
 
     # Check for updates (opt-in, non-blocking)
-    check_for_updates
+    case "${1:-}" in
+        lint|queue|robot) ;;
+        *) check_for_updates ;;
+    esac
 
     # Check Oracle availability (not needed for some commands)
     local command="${1:-help}"
@@ -7767,6 +8355,15 @@ main() {
                 ;;
             --show-manifest)
                 SHOW_MANIFEST=true
+                shift
+                ;;
+            --once|--until-empty|--max)
+                if [[ "$command" != queue ]]; then print_error "Queue option requires the queue command"; return "$EXIT_USAGE_ERROR"; fi
+                positional_args+=("$1")
+                if [[ "$1" == --max ]]; then
+                    [[ -n "${2:-}" ]] || { print_error "--max requires a positive integer"; return "$EXIT_USAGE_ERROR"; }
+                    positional_args+=("$2"); shift
+                fi
                 shift
                 ;;
             -c|--copy)
@@ -7942,6 +8539,12 @@ main() {
 
     # Execute command
     case "$command" in
+        lint)
+            cmd_lint "${positional_args[0]:-1}"
+            ;;
+        queue)
+            cmd_queue "${positional_args[@]}"
+            ;;
         run)
             if [[ ${#positional_args[@]} -lt 1 ]]; then
                 print_error "Round number required"
