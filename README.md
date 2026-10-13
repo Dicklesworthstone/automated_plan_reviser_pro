@@ -886,8 +886,7 @@ Network issues, rate limits, and transient failures shouldn't require manual int
 ```
 Attempt 1 → fail → wait 10s
 Attempt 2 → fail → wait 30s  (10s × 3)
-Attempt 3 → fail → wait 90s  (30s × 3)
-Attempt 4 → success (or final failure)
+Attempt 3 → success (or final failure)
 ```
 
 Configuration via environment variables:
@@ -904,12 +903,51 @@ The exponential backoff (multiplier of 3) prevents hammering the service while g
 
 APR recognizes Oracle's failing stderr diagnostics `ERROR: busy` and
 `User error (browser-automation): busy` as single-flight contention. Foreground
-runs return exit 12 with `APR_ERROR_CODE=busy`; a robot worker that exhausts its
-attempts before the launch check returns the JSON `busy` code. A worker still
+runs that exhaust their busy budget return exit 12 with `APR_ERROR_CODE=busy`;
+a robot worker that exhausts its configured policy before the launch check
+returns the JSON `busy` code with `data.busy: true` and `data.policy`. A worker still
 retrying remains `running`. The final attempt determines the result, so an
 earlier busy response cannot relabel a later authentication or network error.
 Successful output, stdout prose and unrelated errors such as “device busy” are
-not busy signals. Retry counts and delays retain the settings above.
+not busy signals. Other failures retain the ordinary retry settings above.
+
+Human runs wait for busy Oracle operations for up to **300 seconds**, independently
+of `APR_MAX_RETRIES`. Busy responses do not consume ordinary retries while this
+wait policy is enabled. Delays double from 5 seconds up to a 30-second cap.
+Each update includes elapsed time, the next delay and single-flight guidance.
+`--no-retry` remains one-shot, including when a busy wait is configured.
+
+```bash
+# Finite busy budget; min/max delays and advisory status timeout (seconds)
+APR_BUSY_WAIT_SECONDS=600 APR_BUSY_MIN_SLEEP=5 APR_BUSY_MAX_SLEEP=30 apr run 5 --wait
+
+# Explicit unbounded wait; useful when another long review must finish first
+APR_BUSY_WAIT_SECONDS=infinite apr run 5 --wait
+
+# Disable the separate busy wait and use the ordinary retry policy
+APR_BUSY_WAIT_SECONDS=0 apr run 5 --wait
+
+# Robot workers opt into waiting explicitly; default remains ordinary retries
+APR_BUSY_WAIT_SECONDS=600 apr robot run 5 --compact
+```
+
+Finite values are decimal whole seconds from 0 through 86400; invalid or oversized
+values use the documented defaults. Min/max delays must be positive; zero min
+uses 5, and a max below the min is raised to the min. `APR_BUSY_STATUS_TIMEOUT`
+defaults to 2 seconds (zero uses the default). Status probes and sleeps consume
+the same busy budget, and APR does not start a new review at/after its deadline.
+A review already started is allowed to finish normally.
+
+When `timeout` or `gtimeout` is available, APR runs a bounded **no-ID** `oracle status`
+diagnostic. It lists local sessions and cannot establish remote availability;
+only a successful review attempt ends contention. Probe errors/timeouts cannot
+replace the producer's error. Without a bounded timeout utility, APR skips this
+optional diagnostic and continues its bounded retry policy. APR never attaches
+to another session while polling. Robot launch JSON includes `data.busy_policy`
+(`retry` or `wait`); an active waiting worker remains `running`, with progress in
+its retained log and final classification in its result file. Persistent queue
+integration remains pending; these options do not create or enqueue work.
+
 If the worker has already completed successfully at the launch check, APR
 validates and retains its output instead of reporting a startup failure; robot
 mode returns `status: "completed"`. An incomplete or missing output is never

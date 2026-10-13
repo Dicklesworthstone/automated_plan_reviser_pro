@@ -34,6 +34,17 @@ set -euo pipefail
 case "${1:-}" in
     --version) printf '%s\n' 'oracle 1.0.0'; exit 0 ;;
     --help) printf '%s\n' '--notify --browser-attachments --write-output'; exit 0 ;;
+    status)
+        printf '%s\n' "$$" >> "$APR_FIXTURE_COUNT.status"
+        if [[ "$APR_FIXTURE_MODE" == busy_hanging_status ]]; then
+            trap '' TERM
+            sleep 60 &
+            printf '%s\n' "$!" >> "$APR_FIXTURE_COUNT.status"
+            wait
+        fi
+        printf '%s\n' 'ERROR: busy: local session listing is only advisory' >&2
+        exit "${APR_FIXTURE_STATUS_EXIT:-0}"
+        ;;
 esac
 for arg in "$@"; do
     if [[ "$arg" == --render ]]; then
@@ -48,6 +59,12 @@ printf '%s\n' "$count" > "$APR_FIXTURE_COUNT"
 case "$APR_FIXTURE_MODE" in
     busy) printf '%s\n' 'ERROR: busy: another review is active' >&2; exit 1 ;;
     browser_busy) printf '%s\n' 'User error (browser-automation): busy' >&2; exit 7 ;;
+    busy_for|busy_hanging_status)
+        if [[ "$count" -le "${APR_FIXTURE_BUSY_RESPONSES:-4}" ]]; then
+            printf '%s\n' 'ERROR: busy: another review is active' >&2
+            exit 7
+        fi
+        ;;
     busy_success|busy_auth)
         if [[ "$count" -eq 1 ]]; then
             printf '%s\n' 'ERROR: busy' >&2
@@ -86,7 +103,19 @@ EOF
     ORACLE_CMD=("$TEST_DIR/oracle-bin/oracle")
     MAX_RETRY_ATTEMPTS=1
     INITIAL_BACKOFF=0
+    # Existing detector cases exercise ordinary retry semantics. Busy-wait
+    # tests below explicitly enable a budget without changing their assertions.
+    ORACLE_BUSY_WAIT_SECONDS=0
     [[ -x "${ORACLE_CMD[0]}" && "$MAX_RETRY_ATTEMPTS" -eq 1 && "$INITIAL_BACKOFF" -eq 0 ]]
+}
+
+configure_busy_wait_fixture() {
+    create_oracle_failure_fixture "${1:-busy_for}"
+    export APR_BUSY_WAIT_SECONDS="${2:-10}" APR_BUSY_MIN_SLEEP=1 APR_BUSY_MAX_SLEEP=1 APR_BUSY_STATUS_TIMEOUT=1
+    export APR_FIXTURE_BUSY_RESPONSES="${3:-2}"
+    ORACLE_BUSY_WAIT_SECONDS="$APR_BUSY_WAIT_SECONDS"
+    ORACLE_BUSY_MIN_SLEEP=1 ORACLE_BUSY_MAX_SLEEP=1 ORACLE_BUSY_STATUS_TIMEOUT=1
+    [[ "$ORACLE_BUSY_WAIT_SECONDS" == "$APR_BUSY_WAIT_SECONDS" && "$ORACLE_BUSY_MIN_SLEEP" -eq 1 && "$ORACLE_BUSY_MAX_SLEEP" -eq 1 && "$ORACLE_BUSY_STATUS_TIMEOUT" -eq 1 ]]
 }
 
 create_docs() {
@@ -676,4 +705,167 @@ assert_json_array_contains() {
     [[ "$CAPTURED_STATUS" -eq 1 ]]
     assert_json_value "$CAPTURED_STDOUT" '.code' internal_error
     [[ "$CAPTURED_STDERR" != *'APR_ERROR_CODE=busy'* && "$(cat "$APR_FIXTURE_COUNT")" -eq 2 ]]
+}
+
+@test "busy wait: public foreground recovers beyond generic retry limit with useful output" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    configure_busy_wait_fixture busy_for 10 4
+    export APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 0 && "$(cat "$APR_FIXTURE_COUNT")" -eq 5 ]]
+    [[ -s .apr/rounds/default/round_1.md ]]
+    [[ "$(head -n 1 .apr/rounds/default/round_1.md)" == 'A complete deterministic local fixture response.' ]]
+    [[ "$CAPTURED_STDERR" == *'single-flight'* && "$CAPTURED_STDERR" == *'retrying in 1s'* ]]
+    [[ "$(wc -l < "$APR_FIXTURE_COUNT.status")" -eq 4 ]]
+}
+
+@test "busy wait: finite budget returns busy12 with final producer status and no extra launch" {
+    configure_busy_wait_fixture busy 1
+    local started=$SECONDS
+    capture_streams run_oracle_recorded "$TEST_DIR/result" true
+    [[ "$CAPTURED_STATUS" -eq 12 && "$ORACLE_FAILURE_KIND" == busy && "$ORACLE_EXIT_CODE" -eq 1 ]]
+    [[ "$(cat "$TEST_DIR/result")" == $'1\nbusy' && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+    [[ "$CAPTURED_STDERR" == *'wait budget exhausted'* && $((SECONDS - started)) -le 3 ]]
+}
+
+@test "busy wait: hanging TERM-ignoring status descendants consume the budget and cannot relabel busy" {
+    configure_busy_wait_fixture busy_hanging_status 1 9
+    local started=$SECONDS pid state
+    capture_streams run_oracle_recorded "$TEST_DIR/result" true
+    [[ "$CAPTURED_STATUS" -eq 12 && "$(cat "$TEST_DIR/result")" == $'7\nbusy' ]]
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 1 && $((SECONDS - started)) -le 3 ]]
+    [[ "$(wc -l < "$APR_FIXTURE_COUNT.status")" -eq 2 ]]
+    while IFS= read -r pid; do
+        state=$(ps -p "$pid" -o stat= || true)
+        [[ -z "$state" || "$state" == Z* ]]
+    done < "$APR_FIXTURE_COUNT.status"
+}
+
+@test "busy wait: later authentication retains native error despite failed advisory status" {
+    configure_busy_wait_fixture busy_auth 10
+    export APR_FIXTURE_STATUS_EXIT=19
+    MAX_RETRY_ATTEMPTS=1
+    capture_streams run_oracle_recorded "$TEST_DIR/result" true
+    [[ "$CAPTURED_STATUS" -eq 19 && "$ORACLE_FAILURE_KIND" == oracle_error ]]
+    [[ "$(cat "$TEST_DIR/result")" == $'19\noracle_error' && "$(cat "$APR_FIXTURE_COUNT")" -eq 2 ]]
+    [[ "$CAPTURED_STDERR" == *'ERROR: authentication failed'* ]]
+}
+
+@test "busy wait: explicit infinite mode recovers with exact streams and no duplicate success" {
+    configure_busy_wait_fixture busy_for infinite 2
+    printf 'Useful stdout\r\n' > "$TEST_DIR/expected-out"
+    run_oracle_with_retry > "$TEST_DIR/actual-out" 2> "$TEST_DIR/actual-err"
+    cmp "$TEST_DIR/expected-out" "$TEST_DIR/actual-out"
+    [[ "$ORACLE_FAILURE_KIND" == ok && "$ORACLE_EXIT_CODE" -eq 0 ]]
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 3 && "$(cat "$TEST_DIR/actual-err")" == *$'Useful stderr\r'* ]]
+}
+
+@test "busy wait: no-retry stays one-shot even with an explicit infinite budget" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    configure_busy_wait_fixture busy infinite
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 12 && "$CAPTURED_STDERR" == *'APR_ERROR_CODE=busy'* ]]
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 1 && ! -e "$APR_FIXTURE_COUNT.status" ]]
+}
+
+@test "busy wait: public robot opts in and its detached worker retains completed output" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    configure_busy_wait_fixture busy_for 10 2
+    export APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.busy_policy' wait
+    assert_json_value "$CAPTURED_STDOUT" '.data.status' running
+    local attempt result_file
+    for ((attempt=0; attempt<80; attempt++)); do
+        [[ -s .apr/rounds/default/round_1.md ]] && break
+        sleep 0.1
+    done
+    [[ -s .apr/rounds/default/round_1.md && "$(cat "$APR_FIXTURE_COUNT")" -eq 3 ]]
+    result_file=$(find .apr/logs -name '*.result.*' -type f)
+    for ((attempt=0; attempt<20; attempt++)); do
+        [[ "$(cat "$result_file")" == $'0\nok' ]] && break
+        sleep 0.1
+    done
+    [[ "$(cat "$result_file")" == $'0\nok' ]]
+    [[ "$(head -n 1 .apr/rounds/default/round_1.md)" == 'A complete deterministic local fixture response.' ]]
+}
+
+@test "busy wait: robot default preserves its retry policy and returns structured busy" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_oracle_failure_fixture browser_busy
+    export APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 12 && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.policy' retry
+    assert_json_value "$CAPTURED_STDOUT" '.data.busy' true
+    [[ ! -e "$APR_FIXTURE_COUNT.status" ]]
+}
+
+@test "busy wait: configuration normalizes decimal and rejects overflow or zero delays" {
+    [[ "$(oracle_busy_config_seconds 00008 5)" == 8 ]]
+    [[ "$(oracle_busy_config_seconds 999999999999999999999 5)" == 5 ]]
+    [[ "$(oracle_busy_config_seconds invalid 5)" == 5 ]]
+    [[ "$(oracle_busy_config_seconds 86401 5)" == 5 ]]
+    [[ "$(oracle_busy_config_seconds 0 5)" == 0 ]]
+    export APR_BUSY_WAIT_SECONDS=00008 APR_BUSY_MIN_SLEEP=0 APR_BUSY_MAX_SLEEP=0 APR_BUSY_STATUS_TIMEOUT=0
+    capture_streams bash -c 'source "$1"; printf "%s %s %s %s" "$ORACLE_BUSY_WAIT_SECONDS" "$ORACLE_BUSY_MIN_SLEEP" "$ORACLE_BUSY_MAX_SLEEP" "$ORACLE_BUSY_STATUS_TIMEOUT"' _ "$TEST_DIR/apr_functions.bash"
+    [[ "$CAPTURED_STATUS" -eq 0 && "$CAPTURED_STDOUT" == '8 5 5 2' ]]
+}
+
+@test "busy wait: capped exponential delays recover without consuming ordinary attempts" {
+    configure_busy_wait_fixture busy_for 10 3
+    ORACLE_BUSY_MAX_SLEEP=2
+    [[ "$ORACLE_BUSY_MAX_SLEEP" -eq 2 ]]
+    capture_streams run_oracle_with_retry
+    [[ "$CAPTURED_STATUS" -eq 0 && "$(cat "$APR_FIXTURE_COUNT")" -eq 4 ]]
+    [[ "$CAPTURED_STDERR" == *'retrying in 1s'* && "$CAPTURED_STDERR" == *'retrying in 2s'* ]]
+    [[ "$CAPTURED_STDERR" != *'retrying in 4s'* && "$CAPTURED_STDOUT" == $'Useful stdout\r' ]]
+}
+
+@test "busy wait: missing bounded status utility still recovers without a probe" {
+    configure_busy_wait_fixture busy_for 10 1
+    command() {
+        if [[ "${1:-}" == -v && ( "${2:-}" == timeout || "${2:-}" == gtimeout ) ]]; then
+            return 1
+        fi
+        builtin command "$@"
+    }
+    capture_streams run_oracle_with_retry
+    [[ "$CAPTURED_STATUS" -eq 0 && "$(cat "$APR_FIXTURE_COUNT")" -eq 2 ]]
+    [[ ! -e "$APR_FIXTURE_COUNT.status" && "$CAPTURED_STDOUT" == $'Useful stdout\r' ]]
+}
+
+@test "busy wait: diagnostic capture failure never replays the producer with waiting enabled" {
+    configure_busy_wait_fixture success infinite
+    tee() { cat >&2; return 1; }
+    capture_streams run_oracle_with_retry
+    [[ "$CAPTURED_STATUS" -eq 1 && "$ORACLE_FAILURE_KIND" == capture_error && "$ORACLE_EXIT_CODE" -eq 0 ]]
+    [[ "$(cat "$APR_FIXTURE_COUNT")" -eq 1 && ! -e "$APR_FIXTURE_COUNT.status" ]]
+    [[ "$CAPTURED_STDOUT" == $'Useful stdout\r' ]]
+}
+
+@test "busy wait: generic backoff after busy respects the deadline and preserves authentication" {
+    configure_busy_wait_fixture busy_auth 2
+    MAX_RETRY_ATTEMPTS=3 INITIAL_BACKOFF=4
+    local started=$SECONDS
+    capture_streams run_oracle_recorded "$TEST_DIR/result" true
+    [[ "$CAPTURED_STATUS" -eq 19 && "$ORACLE_FAILURE_KIND" == oracle_error ]]
+    [[ "$(cat "$TEST_DIR/result")" == $'19\noracle_error' && "$(cat "$APR_FIXTURE_COUNT")" -eq 2 ]]
+    [[ "$CAPTURED_STDERR" == *'retaining the final Oracle result'* && $((SECONDS - started)) -le 4 ]]
+}
+
+@test "busy wait: public foreground budget exhaustion retains the semantic busy exit" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    configure_busy_wait_fixture browser_busy 1
+    export APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 12 && "$CAPTURED_STDERR" == *'APR_ERROR_CODE=busy'* ]]
+    [[ "$CAPTURED_STDERR" == *'wait budget exhausted'* && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+    [[ ! -f .apr/rounds/default/round_1.md ]]
 }

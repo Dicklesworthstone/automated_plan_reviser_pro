@@ -1079,6 +1079,53 @@ if ! is_non_negative_int "$INITIAL_BACKOFF"; then
     INITIAL_BACKOFF=10
 fi
 
+# Busy waits have their own budget; they must not exhaust transient retries.
+# Normalize decimal input before arithmetic (08 is not an octal number).
+oracle_busy_config_seconds() {
+    local value="$1" fallback="$2"
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$fallback"
+        return
+    fi
+    while [[ "${#value}" -gt 1 && "$value" == 0* ]]; do value="${value#0}"; done
+    if [[ "${#value}" -gt 5 ]] || ((10#$value > 86400)); then
+        printf '%s\n' "$fallback"
+    else
+        printf '%s\n' "$((10#$value))"
+    fi
+}
+
+ORACLE_BUSY_WAIT_SECONDS="${APR_BUSY_WAIT_SECONDS:-300}"
+if [[ "$ORACLE_BUSY_WAIT_SECONDS" != infinite ]]; then
+    ORACLE_BUSY_WAIT_SECONDS=$(oracle_busy_config_seconds "$ORACLE_BUSY_WAIT_SECONDS" 300)
+fi
+ORACLE_BUSY_MIN_SLEEP=$(oracle_busy_config_seconds "${APR_BUSY_MIN_SLEEP:-5}" 5)
+ORACLE_BUSY_MAX_SLEEP=$(oracle_busy_config_seconds "${APR_BUSY_MAX_SLEEP:-30}" 30)
+ORACLE_BUSY_STATUS_TIMEOUT=$(oracle_busy_config_seconds "${APR_BUSY_STATUS_TIMEOUT:-2}" 2)
+((ORACLE_BUSY_MIN_SLEEP > 0)) || ORACLE_BUSY_MIN_SLEEP=5
+((ORACLE_BUSY_MAX_SLEEP >= ORACLE_BUSY_MIN_SLEEP)) || ORACLE_BUSY_MAX_SLEEP=$ORACLE_BUSY_MIN_SLEEP
+((ORACLE_BUSY_STATUS_TIMEOUT > 0)) || ORACLE_BUSY_STATUS_TIMEOUT=2
+
+# No-ID status lists local sessions, not remote availability. Only a new
+# producer attempt can establish recovery. A timeout kills the probe's process
+# group, including children that ignore TERM; never terminate the review itself.
+# If a bounded timeout utility is unavailable, skip this optional diagnostic.
+oracle_busy_status_probe() {
+    local seconds="$1" timeout_cmd=""
+    if command -v timeout >/dev/null 2>&1; then
+        timeout_cmd=timeout
+    elif command -v gtimeout >/dev/null 2>&1; then
+        timeout_cmd=gtimeout
+    else
+        verbose "Skipping advisory Oracle status: no bounded timeout utility"
+        return 0
+    fi
+    print_info "Oracle status (local sessions only; availability remains unconfirmed):"
+    "$timeout_cmd" --signal=KILL "${seconds}s" "${ORACLE_CMD[@]}" status >&2 ||
+        verbose "Advisory Oracle status unavailable or timed out"
+    return 0
+}
+
 # Only Oracle's explicit failing stderr diagnostics establish a busy result.
 # A successful answer, stdout prose, and unrelated OS errors are not busy.
 oracle_failure_kind() {
@@ -1137,10 +1184,20 @@ run_oracle_with_retry() {
     local attempt=1
     local backoff="$INITIAL_BACKOFF"
     local exit_code=0
+    local busy_started=-1 busy_elapsed=0 busy_count=0
+    local busy_delay="$ORACLE_BUSY_MIN_SLEEP" remaining=0 probe_seconds=0
 
     verbose "run_oracle_with_retry: max_attempts=$MAX_RETRY_ATTEMPTS initial_backoff=$INITIAL_BACKOFF"
 
     while [[ $attempt -le $MAX_RETRY_ATTEMPTS ]]; do
+        # An ordinary failure after busy may also have used retry backoff.
+        # Enforce the active deadline before every launch, retaining that
+        # producer's actual error rather than relabeling it as contention.
+        if ((busy_started >= 0)) && [[ "$ORACLE_BUSY_WAIT_SECONDS" != infinite ]] &&
+            ((SECONDS - busy_started >= ORACLE_BUSY_WAIT_SECONDS)); then
+            print_error "Busy wait budget exhausted; retaining the final Oracle result ($ORACLE_FAILURE_KIND, exit $exit_code)"
+            return "$exit_code"
+        fi
         verbose "Oracle attempt $attempt/$MAX_RETRY_ATTEMPTS"
 
         # Classification belongs to this attempt, never to an accumulated log.
@@ -1160,13 +1217,69 @@ run_oracle_with_retry() {
             return 0
         fi
 
+        if [[ "$ORACLE_FAILURE_KIND" == busy && "$ORACLE_BUSY_WAIT_SECONDS" != 0 ]]; then
+            ((busy_started >= 0)) || busy_started=$SECONDS
+            busy_elapsed=$((SECONDS - busy_started))
+            busy_count=$((busy_count + 1))
+            if [[ "$ORACLE_BUSY_WAIT_SECONDS" != infinite ]]; then
+                remaining=$((ORACLE_BUSY_WAIT_SECONDS - busy_elapsed))
+                if ((remaining <= 0)); then
+                    print_error "Oracle still busy after ${busy_elapsed}s ($busy_count busy responses); wait budget exhausted. Oracle serve is single-flight."
+                    return "$EXIT_BUSY_ERROR"
+                fi
+            fi
+
+            # Status diagnostics consume the same wait budget and never replace
+            # the last producer's native exit or busy classification.
+            probe_seconds=$ORACLE_BUSY_STATUS_TIMEOUT
+            if [[ "$ORACLE_BUSY_WAIT_SECONDS" != infinite ]] && ((probe_seconds > remaining)); then
+                probe_seconds=$remaining
+            fi
+            oracle_busy_status_probe "$probe_seconds"
+            busy_elapsed=$((SECONDS - busy_started))
+            local delay="$busy_delay"
+            if [[ "$ORACLE_BUSY_WAIT_SECONDS" != infinite ]]; then
+                remaining=$((ORACLE_BUSY_WAIT_SECONDS - busy_elapsed))
+                if ((remaining <= 0)); then
+                    print_error "Oracle still busy after ${busy_elapsed}s; wait budget exhausted during advisory status. Oracle serve is single-flight."
+                    return "$EXIT_BUSY_ERROR"
+                fi
+                ((delay <= remaining)) || delay=$remaining
+            fi
+            print_info "Oracle is busy (single-flight); waited ${busy_elapsed}s, retrying in ${delay}s (budget: ${ORACLE_BUSY_WAIT_SECONDS}s). Wait for the active review or inspect 'oracle status'."
+            sleep "$delay"
+            # Do not start another producer at/after the deadline. Once a
+            # producer starts, let its useful review finish normally.
+            busy_elapsed=$((SECONDS - busy_started))
+            if [[ "$ORACLE_BUSY_WAIT_SECONDS" != infinite ]] && ((busy_elapsed >= ORACLE_BUSY_WAIT_SECONDS)); then
+                print_error "Oracle still busy after ${busy_elapsed}s; wait budget exhausted. Oracle serve is single-flight."
+                return "$EXIT_BUSY_ERROR"
+            fi
+            # Saturate before multiplying, even with very large configuration.
+            if ((busy_delay > ORACLE_BUSY_MAX_SLEEP / 2)); then
+                busy_delay=$ORACLE_BUSY_MAX_SLEEP
+            else
+                busy_delay=$((busy_delay * 2))
+            fi
+            continue
+        fi
+
         # Check if this is a retryable error
         # Exit codes: typically network/transient issues are specific codes
         # For now, we'll retry on any non-zero exit if we have attempts left
         if [[ $attempt -lt $MAX_RETRY_ATTEMPTS ]]; then
             print_warning "Attempt $attempt/$MAX_RETRY_ATTEMPTS failed (exit code: $exit_code)"
-            print_info "Retrying in ${backoff}s..."
-            sleep "$backoff"
+            local retry_delay="$backoff"
+            if ((busy_started >= 0)) && [[ "$ORACLE_BUSY_WAIT_SECONDS" != infinite ]]; then
+                remaining=$((ORACLE_BUSY_WAIT_SECONDS - (SECONDS - busy_started)))
+                if ((remaining <= 0)); then
+                    print_error "Busy wait budget exhausted; retaining the final Oracle result ($ORACLE_FAILURE_KIND, exit $exit_code)"
+                    return "$exit_code"
+                fi
+                ((retry_delay <= remaining)) || retry_delay=$remaining
+            fi
+            print_info "Retrying in ${retry_delay}s..."
+            sleep "$retry_delay"
             # Exponential backoff: 10s, 30s, 90s
             backoff=$((backoff * 3))
         fi
@@ -5850,6 +5963,12 @@ robot_run() {
     local round_num="${1:-}"
     local workflow="${WORKFLOW:-default}"
     local include_impl="${INCLUDE_IMPL:-false}"
+    # Preserve robot's ordinary retry policy unless waiting is explicitly
+    # requested. A positive budget/infinite opts its worker into the same loop.
+    local ORACLE_BUSY_WAIT_SECONDS="$ORACLE_BUSY_WAIT_SECONDS"
+    [[ -n "${APR_BUSY_WAIT_SECONDS+x}" ]] || ORACLE_BUSY_WAIT_SECONDS=0
+    local busy_policy=retry
+    [[ "$ORACLE_BUSY_WAIT_SECONDS" == 0 ]] || busy_policy="wait"
 
     verbose "robot_run: round=$round_num workflow=$workflow include_impl=$include_impl"
 
@@ -6034,8 +6153,8 @@ robot_run() {
         if [[ "$result_exit" -eq 0 && "$result_kind" == "ok" ]] && validate_output_file "$output_file"; then
             launch_status="completed"
         elif [[ "$result_exit" -ne 0 && "$result_kind" == "busy" ]]; then
-            robot_fail "busy" "$(jq -nc --arg log "$oracle_log" --arg exit "$result_oracle_exit" \
-                '{reason:"oracle_busy", log_file:$log, oracle_exit:($exit | tonumber)}')" \
+            robot_fail "busy" "$(jq -nc --arg log "$oracle_log" --arg exit "$result_oracle_exit" --arg policy "$busy_policy" \
+                '{reason:"oracle_busy", busy:true, policy:$policy, log_file:$log, oracle_exit:($exit | tonumber)}')" \
                 "Oracle is busy; retry when the active review completes"
             return $?
         else
@@ -6056,6 +6175,7 @@ robot_run() {
         --arg workflow "$workflow" \
         --arg round "$round_num" \
         --arg status "$launch_status" \
+        --arg busy_policy "$busy_policy" \
         --argjson include_impl "$include_impl" \
         '{
             slug: $slug,
@@ -6065,7 +6185,8 @@ robot_run() {
             workflow: $workflow,
             round: ($round | tonumber),
             include_impl: $include_impl,
-            status: $status
+            status: $status,
+            busy_policy: $busy_policy
         }')
 
     robot_json true "ok" "$data" "Use 'apr status' or 'apr attach $slug' to monitor"
@@ -6666,6 +6787,9 @@ show_help() {
         gum style --faint "  APR_VERBOSE          Enable verbose mode (set to true)" >&2
         gum style --faint "  APR_MAX_RETRIES      Max retry attempts (default: 3)" >&2
         gum style --faint "  APR_INITIAL_BACKOFF  Initial retry backoff in seconds (default: 10)" >&2
+        gum style --faint "  APR_BUSY_WAIT_SECONDS Busy wait budget: 0 disables, infinite opts in (human: 300; robot: 0)" >&2
+        gum style --faint "  APR_BUSY_MIN_SLEEP / APR_BUSY_MAX_SLEEP  Busy delays in seconds (defaults: 5 / 30)" >&2
+        gum style --faint "  APR_BUSY_STATUS_TIMEOUT  Advisory status timeout in seconds (default: 2)" >&2
         gum style --faint "  APR_NO_GUM           Disable gum even if available" >&2
         gum style --faint "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
@@ -6771,6 +6895,9 @@ show_help() {
         echo "  APR_VERBOSE          Enable verbose mode (set to true)" >&2
         echo "  APR_MAX_RETRIES      Max retry attempts (default: 3)" >&2
         echo "  APR_INITIAL_BACKOFF  Initial retry backoff in seconds (default: 10)" >&2
+        echo "  APR_BUSY_WAIT_SECONDS Busy wait budget: 0 disables, infinite opts in (human: 300; robot: 0)" >&2
+        echo "  APR_BUSY_MIN_SLEEP / APR_BUSY_MAX_SLEEP  Busy delays in seconds (defaults: 5 / 30)" >&2
+        echo "  APR_BUSY_STATUS_TIMEOUT  Advisory status timeout in seconds (default: 2)" >&2
         echo "  APR_NO_GUM           Disable gum even if available" >&2
         echo "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
