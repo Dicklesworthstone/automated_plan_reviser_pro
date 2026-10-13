@@ -994,6 +994,60 @@ not establish immutable transmitted bytes or model acknowledgement. Persistent
 ledger recording of the manifest/final prompt hash and queue integration remain
 pending.
 
+### Run Ledger Contract
+
+The ledger contract is version `1.0.0`. Its canonical path is
+`.apr/rounds/<workflow>/round_<N>.meta.json`, independently of a custom output
+directory. A run has an immutable `run_id`; its workflow, round and slug identify
+the selected review. A later run must preserve the earlier ledger as a separate
+run record before publishing the new canonical record. Optional fields may be
+added within version 1; removing or renaming fields requires a major version
+change. Readers reject unsupported versions and contradictory outcomes.
+
+The required fields are:
+
+| Field | Meaning |
+|---|---|
+| `schema_version`, `run_id`, `workflow`, `round`, `slug` | Version and run identity; round is a nonnegative integer |
+| `state` | `started`, `finished`, `failed`, or `canceled` |
+| `started_at`, `finished_at`, `duration_ms` | UTC RFC3339 timestamps; finish and duration are null until terminal |
+| `config.path`, `config.sha256` | Configured workflow path and observed config bytes digest; null until available |
+| `inputs.status` | `pending`, `complete`, or `failed`; unavailable metadata never receives an invented hash |
+| `inputs.files[]` | Role, configured path, basename, observed bytes/SHA256, included boolean, `inclusion_reason`, and `skip_reason` |
+| `inputs.manifest`, `inputs.prompt_hash` | Original observed manifest and SHA256 of the exact final `-p` argument bytes, with no added newline |
+| `invocation` | Browser engine, model, thinking time, sanitized remote host, flag names and redacted Oracle args |
+| `execution` | `attempts_count`, ordinary `retries_count`, `busy_wait_count`, `busy_wait_total_ms`, `retry_reasons[]` |
+| `outcome` | `ok`, canonical `code`, actual caller `exit_code`, native `oracle_exit_code`, and output path |
+
+Included files have nonnegative byte sizes and lowercase SHA256; skipped optional
+files have null sizes/hashes and an explicit reason. A complete observation has
+one README, one specification and one implementation row (possibly skipped),
+the manifest and the final prompt hash. Metadata failures may retain partial
+observations with `inputs.status: "failed"`; they never claim a complete bundle.
+Input hashes remain local observations rather than immutable sent bytes.
+
+Started records have null finish/duration and null outcome `ok/code/exit_code`.
+Successful records require `state: "finished"`, complete observed inputs,
+`ok: true`, `code: "ok"` and exit 0. Failed/canceled records require a finish
+timestamp, duration, `ok: false`, a non-`ok` code from APR's existing taxonomy and
+a nonzero exit. Cancellation uses `internal_error` with the actual signal exit
+(for example 130), with a separate interruption reason when available. Native
+Oracle status is retained separately from the caller exit; legacy human and
+robot exits may differ until the broader error-contract work is complete.
+
+Remote hosts contain only host/port authority, never user information, URLs,
+query parameters or tokens. No environment dump, raw configuration contents,
+cookies or prompt text is stored. Oracle arguments redact authentication values
+and the prompt body; the prompt hash binds the latter. Attempt counts include
+every actual producer launch; retry counts exclude busy-policy retries. Busy
+wait duration measures status-probe/sleep time, not useful model execution, at
+the available clock resolution. Optional `warnings`, `overrides`, `trim` and
+`redaction` fields may extend the record without changing these meanings.
+
+The executable `ledger_validate` check and state fixtures exercise this contract.
+The writer and automatic execution hooks are implemented under their separate
+original Beads; defining this contract alone does not establish persisted runs.
+
 ### GPT Pro Extended Thinking Stability
 
 GPT Pro Extended Thinking can pause for 10-30+ seconds during its reasoning phase. Without adjustment, Oracle's browser automation might interpret these pauses as "response complete" and capture truncated output.
