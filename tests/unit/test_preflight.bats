@@ -118,6 +118,21 @@ configure_busy_wait_fixture() {
     [[ "$ORACLE_BUSY_WAIT_SECONDS" == "$APR_BUSY_WAIT_SECONDS" && "$ORACLE_BUSY_MIN_SLEEP" -eq 1 && "$ORACLE_BUSY_MAX_SLEEP" -eq 1 && "$ORACLE_BUSY_STATUS_TIMEOUT" -eq 1 ]]
 }
 
+create_manifest_probe_spy() {
+    mkdir -p "$TEST_DIR/manifest-spy"
+    local tool
+    for tool in oracle npx; do
+        cat > "$TEST_DIR/manifest-spy/$tool" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$0 $*" >> "$APR_MANIFEST_PROBES"
+exit 97
+EOF
+        chmod +x "$TEST_DIR/manifest-spy/$tool"
+    done
+    export APR_MANIFEST_PROBES="$TEST_DIR/manifest-probes"
+    export PATH="$TEST_DIR/manifest-spy:$PATH"
+}
+
 create_docs() {
     local dir="${1:-$TEST_PROJECT}"
     mkdir -p "$dir"
@@ -868,4 +883,233 @@ assert_json_array_contains() {
     [[ "$CAPTURED_STATUS" -eq 12 && "$CAPTURED_STDERR" == *'APR_ERROR_CODE=busy'* ]]
     [[ "$CAPTURED_STDERR" == *'wait budget exhausted'* && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
     [[ ! -f .apr/rounds/default/round_1.md ]]
+}
+
+@test "manifest: hash and size retain binary NUL nonUTF8 CRLF and trailing newlines" {
+    printf '\000\377A\r\n\n' > "$TEST_PROJECT/binary"
+    capture_streams document_file_metadata "$TEST_PROJECT/binary" readme required
+    [[ "$CAPTURED_STATUS" -eq 0 && -z "$CAPTURED_STDERR" ]]
+    assert_json_value "$CAPTURED_STDOUT" '.bytes' 6
+    assert_json_value "$CAPTURED_STDOUT" '.sha256' c2d6098cbf68842ad602337645fae2e17f40f4282f66c573cf5945274971cab9
+    [[ "$(wc -c < "$TEST_PROJECT/binary")" -eq 6 ]]
+}
+
+@test "manifest: empty file has exact zero bytes and standard SHA256" {
+    touch "$TEST_PROJECT/empty"
+    capture_streams document_file_metadata "$TEST_PROJECT/empty" spec required
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.bytes' 0
+    assert_json_value "$CAPTURED_STDOUT" '.sha256' e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+}
+
+@test "manifest: duplicate basenames quoted newline and leadingdash paths remain distinct" {
+    local name=$'-quote"\\line\n.md' manifest
+    mkdir -p left right
+    printf a > "left/$name"
+    printf b > "right/$name"
+    manifest=$(build_document_manifest "left/$name" "right/$name" '' false)
+    [[ "$(jq '[.files[] | select(.included)] | length' <<< "$manifest")" -eq 2 ]]
+    [[ "$(jq -r '.files[] | select(.role=="readme") | .path | @base64' <<< "$manifest")" == "$(printf '%s' "left/$name" | base64 | tr -d '\r\n')" ]]
+    [[ "$(jq -r '.files[] | select(.role=="spec") | .path | @base64' <<< "$manifest")" == "$(printf '%s' "right/$name" | base64 | tr -d '\r\n')" ]]
+    [[ "$(jq '[.files[] | select(.included) | .sha256] | unique | length' <<< "$manifest")" -eq 2 ]]
+    capture_streams format_document_manifest "$manifest"
+    [[ "$CAPTURED_STATUS" -eq 0 && "$CAPTURED_STDOUT" == *'\\line\n.md'* ]]
+}
+
+@test "manifest: repeated JSON and reordered locale-independent text are byte-identical" {
+    create_docs
+    local first second reversed text
+    first=$(build_document_manifest README.md SPEC.md IMPL.md true optional)
+    second=$(LC_ALL=C build_document_manifest README.md SPEC.md IMPL.md true optional)
+    [[ "$first" == "$second" ]]
+    reversed=$(jq '.files |= reverse' <<< "$first")
+    text=$(format_document_manifest "$first")
+    [[ "$text" == "$(LC_ALL=C format_document_manifest "$reversed")" ]]
+    [[ "$(jq -r '.files | map(.role) | join(",")' <<< "$first")" == implementation,readme,spec ]]
+}
+
+@test "manifest: same-size content change changes hash without losing either observation" {
+    printf aaaa > sample
+    local first second
+    first=$(document_file_metadata sample readme required)
+    printf bbbb > sample
+    second=$(document_file_metadata sample readme required)
+    [[ "$(jq -r .sha256 <<< "$first")" != "$(jq -r .sha256 <<< "$second")" ]]
+    [[ "$(jq .bytes <<< "$first")" -eq 4 && "$(jq .bytes <<< "$second")" -eq 4 ]]
+}
+
+@test "manifest: missing optional implementation records reason without fabricated hash" {
+    create_docs
+    local manifest
+    manifest=$(build_document_manifest README.md SPEC.md missing.md true impl_every_n)
+    assert_json_value "$manifest" '.files[0].included' false
+    assert_json_value "$manifest" '.files[0].reason' impl_every_n
+    assert_json_value "$manifest" '.files[0].skip_reason' missing_optional
+    [[ "$(jq '.files[0].bytes==null and .files[0].sha256==null' <<< "$manifest")" == true ]]
+    manifest=$(build_document_manifest README.md SPEC.md '' true optional)
+    assert_json_value "$manifest" '.files[0].skip_reason' not_configured
+}
+
+@test "manifest: unrequested present implementation is explicitly skipped" {
+    create_docs
+    local manifest
+    manifest=$(build_document_manifest README.md SPEC.md IMPL.md false optional)
+    assert_json_value "$manifest" '.files[0].skip_reason' not_requested
+    assert_json_value "$manifest" '.files[0].included' false
+    [[ "$(jq '.files[0].bytes==null and .files[0].sha256==null' <<< "$manifest")" == true ]]
+}
+
+@test "manifest: missing required or directory document fails without partial stdout" {
+    create_docs
+    capture_streams build_document_manifest README.md missing.md '' false
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'Cannot read document metadata'* ]]
+    capture_streams build_document_manifest README.md "$TEST_PROJECT" '' false
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" ]]
+}
+
+@test "manifest: requested unreadable implementation fails without partial stdout" {
+    create_docs
+    chmod 000 IMPL.md
+    [[ ! -r IMPL.md ]]
+    capture_streams build_document_manifest README.md SPEC.md IMPL.md true optional
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'Cannot read document metadata'* ]]
+}
+
+@test "manifest: failed digest utility cannot publish partial success" {
+    create_docs
+    sha256sum() { cat >/dev/null; return 9; }
+    capture_streams build_document_manifest README.md SPEC.md '' false
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'Failed to hash/count'* ]]
+}
+
+@test "manifest: failed byte stream cannot publish partial success" {
+    create_docs
+    tee() { cat >/dev/null; return 9; }
+    capture_streams build_document_manifest README.md SPEC.md '' false
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'Failed to hash/count'* ]]
+}
+
+@test "manifest: invalid UTF8 skipped path is rejected rather than silently replaced" {
+    create_docs
+    capture_streams build_document_manifest README.md SPEC.md $'bad\377.md' false
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'valid UTF-8'* ]]
+}
+
+@test "manifest: public JSON preview skips every Oracle probe and creates no run artifacts" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
+    create_manifest_probe_spy
+    capture_streams bash "$APR_SCRIPT" run 1 --show-manifest --json --render --wait
+    [[ "$CAPTURED_STATUS" -eq 0 && ! -e "$APR_MANIFEST_PROBES" ]]
+    [[ "$(jq '[.files[] | select(.included)] | length' <<< "$CAPTURED_STDOUT")" -eq 2 ]]
+    [[ ! -d .apr/rounds && ! -d .apr/locks && ! -d .apr/.locks && ! -d .apr/logs ]]
+    [[ "$CAPTURED_STDOUT" != *'Current local document'* ]]
+}
+
+@test "manifest: public text preview is stderr-only and names its observation boundary" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    create_manifest_probe_spy
+    capture_streams bash "$APR_SCRIPT" run 1 --show-manifest
+    [[ "$CAPTURED_STATUS" -eq 0 && -z "$CAPTURED_STDOUT" && ! -e "$APR_MANIFEST_PROBES" ]]
+    [[ "$CAPTURED_STDERR" == *'not a sent attachment receipt'* && "$CAPTURED_STDERR" == *'sha256='* ]]
+}
+
+@test "manifest: public preview records explicit and cadence inclusion reasons" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
+    create_manifest_probe_spy
+    capture_streams bash "$APR_SCRIPT" run 3 --show-manifest --json --include-impl
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.files[0].included' true
+    assert_json_value "$CAPTURED_STDOUT" '.files[0].reason' optional
+    printf '\n  impl_every_n: 4\n' >> .apr/workflows/default.yaml
+    capture_streams bash "$APR_SCRIPT" run 4 --show-manifest --json
+    [[ "$CAPTURED_STATUS" -eq 0 && ! -e "$APR_MANIFEST_PROBES" ]]
+    assert_json_value "$CAPTURED_STDOUT" '.files[0].reason' impl_every_n
+    assert_json_value "$CAPTURED_STDOUT" '.files[0].included' true
+}
+
+@test "manifest: public missing required file returns config_error without partial JSON" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/missing.md"
+    create_manifest_probe_spy
+    capture_streams bash "$APR_SCRIPT" run 1 --show-manifest --json
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && ! -e "$APR_MANIFEST_PROBES" ]]
+    [[ "$CAPTURED_STDERR" == *'APR_ERROR_CODE=config_error'* ]]
+}
+
+@test "manifest: real shasum fallback preserves binary digest and byte count" {
+    printf '\000\377A\r\n\n' > binary
+    command() {
+        if [[ "${1:-}" == -v && "${2:-}" == sha256sum ]]; then return 1; fi
+        builtin command "$@"
+    }
+    capture_streams document_file_metadata binary readme required
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.bytes' 6
+    assert_json_value "$CAPTURED_STDOUT" '.sha256' c2d6098cbf68842ad602337645fae2e17f40f4282f66c573cf5945274971cab9
+}
+
+@test "manifest: hash and size describe one stream even when source grows after hashing" {
+    printf aaaa > sample
+    export APR_MANIFEST_CHANGE_PATH="$TEST_PROJECT/sample"
+    sha256sum() {
+        local digest
+        digest=$(command sha256sum) || return $?
+        printf bbbb >> "$APR_MANIFEST_CHANGE_PATH"
+        printf '%s\n' "$digest"
+    }
+    capture_streams document_file_metadata sample readme required
+    [[ "$CAPTURED_STATUS" -eq 0 && "$(wc -c < sample)" -eq 8 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.bytes' 4
+    [[ "$(jq -r '.sha256' <<< "$CAPTURED_STDOUT")" == "$(printf aaaa | command sha256sum | cut -d ' ' -f 1)" ]]
+}
+
+@test "manifest: asynchronous size collector failure cannot publish a hash-only result" {
+    create_docs
+    wc() { cat >/dev/null; return 9; }
+    capture_streams build_document_manifest README.md SPEC.md '' false
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'Failed to hash/count'* ]]
+}
+
+@test "manifest: missing jq returns the matching dependency tag without partial output" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    SHOW_MANIFEST=true STATS_JSON=true
+    [[ "$SHOW_MANIFEST" == true && "$STATS_JSON" == true ]]
+    command() {
+        if [[ "${1:-}" == -v && "${2:-}" == jq ]]; then return 1; fi
+        builtin command "$@"
+    }
+    capture_streams run_round 1
+    [[ "$CAPTURED_STATUS" -eq 3 && -z "$CAPTURED_STDOUT" ]]
+    [[ "$CAPTURED_STDERR" == *'APR_ERROR_CODE=dependency_missing'* && "$CAPTURED_STDERR" != *'APR_ERROR_CODE=config_error'* ]]
+}
+
+@test "manifest: unsearchable parent is a real read error rather than missing optional" {
+    create_docs
+    mkdir sealed
+    printf 'Useful implementation\n' > sealed/IMPL.md
+    chmod 000 sealed
+    [[ ! -x sealed && ! -e sealed/IMPL.md ]]
+    capture_streams build_document_manifest README.md SPEC.md sealed/IMPL.md true optional
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" ]]
+    [[ "$CAPTURED_STDERR" == *'Cannot search optional document parent'* ]]
+}
+
+@test "manifest: a genuinely absent optional parent is explicitly skipped" {
+    create_docs
+    local manifest
+    manifest=$(build_document_manifest README.md SPEC.md missing-parent/IMPL.md true optional)
+    assert_json_value "$manifest" '.files[0].skip_reason' missing_optional
+    assert_json_value "$manifest" '.files[0].included' false
+}
+
+@test "manifest: parent enumeration failure never becomes an optional omission" {
+    create_docs
+    find() { printf '%s\n' 'fixture: directory read failed' >&2; return 9; }
+    capture_streams build_document_manifest README.md SPEC.md missing.md true optional
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" ]]
+    [[ "$CAPTURED_STDERR" == *'fixture: directory read failed'* && "$CAPTURED_STDERR" == *'Cannot inspect optional document parent'* ]]
 }

@@ -954,6 +954,33 @@ mode returns `status: "completed"`. An incomplete or missing output is never
 reported as completed. Diagnostic-capture failures stop without launching a
 duplicate review.
 
+### Preview Document Metadata Without Oracle
+
+Inspect the documents selected by a workflow without starting a review or even
+probing Oracle:
+
+```bash
+apr run 4 --show-manifest                 # Human text on stderr
+apr run 4 --show-manifest --json          # Deterministic JSON on stdout
+apr run 3 --show-manifest --include-impl  # Explicit implementation selection
+```
+
+The preview records each document's role, path, basename, exact observed byte
+count, SHA256 and inclusion reason (`required`, `optional`, or `impl_every_n`).
+It applies the existing workflow cadence and records skipped implementation
+documents explicitly, with no invented hash or size. Duplicate basenames remain
+distinct by role/path. Paths are safely quoted, JSON keys/rows have stable
+ordering, and binary file contents are hashed as bytes. Invalid UTF-8 paths are
+rejected rather than silently replaced.
+
+Hash and size come from the same byte stream. They describe the **current local
+observation**; a later writer or Oracle read may see different bytes. This
+preview does not send documents, acquire a run lock, create output/log artifacts,
+or prepend metadata to review prompts. Automatic prompt/ledger/queue binding is
+still pending. Required-file, unreadable-file and hashing failures return a
+configuration error with no partial JSON manifest. `--show-manifest` takes
+precedence over review/render flags.
+
 ### GPT Pro Extended Thinking Stability
 
 GPT Pro Extended Thinking can pause for 10-30+ seconds during its reasoning phase. Without adjustment, Oracle's browser automation might interpret these pauses as "response complete" and capture truncated output.

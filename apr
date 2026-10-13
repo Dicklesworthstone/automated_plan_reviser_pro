@@ -377,6 +377,174 @@ is_non_negative_int() {
     [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+# Hash stdin, not a filename-bearing digest report. Document bytes never enter
+# shell variables, so binary content, NULs and trailing newlines are preserved.
+document_sha256_stdin() {
+    local report digest
+    if command -v sha256sum >/dev/null 2>&1; then
+        report=$(sha256sum) || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        report=$(shasum -a 256) || return 1
+    else
+        print_error "Document metadata requires sha256sum or shasum"
+        return 1
+    fi
+    read -r digest _ <<< "$report"
+    [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    printf '%s\n' "${digest,,}"
+}
+
+document_manifest_path_valid() {
+    local path="$1"
+    # jq replaces invalid UTF-8. Reject that instead of producing colliding,
+    # misleading filenames; valid control characters are escaped reversibly.
+    local raw_path encoded_path
+    raw_path=$(printf '%s' "$path" | base64 | tr -d '\r\n') || return "$EXIT_CONFIG_ERROR"
+    encoded_path=$(jq -nr --arg path "$path" '$path | @base64') || return "$EXIT_CONFIG_ERROR"
+    if [[ "$raw_path" != "$encoded_path" ]]; then
+        print_error "Document paths must be valid UTF-8 for manifest rendering"
+        return "$EXIT_CONFIG_ERROR"
+    fi
+}
+
+document_file_metadata() {
+    local path="$1" role="$2" reason="$3"
+    if [[ ! -f "$path" || ! -r "$path" ]]; then
+        print_error "Cannot read document metadata: $path"
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    document_manifest_path_valid "$path" || return $?
+
+    local metrics digest="" bytes="" line
+    # Hash and size observe exactly the same single byte stream, even when a
+    # writer changes the source. This is an observation, not an immutable
+    # attachment snapshot or proof of what a later Oracle process will read.
+    if ! metrics=$(
+        exec 3>&1
+        exec 4> >(
+            byte_count=$(LC_ALL=C wc -c) || exit 1
+            printf 'bytes=%s\n' "${byte_count//[[:space:]]/}" >&3
+        )
+        result=0
+        hash=$(tee /dev/fd/4 < "$path" | document_sha256_stdin) || result=$?
+        exec 4>&-
+        # The collector holds FD3 open until it emits bytes= or fails. Capturing
+        # stdout waits for that EOF; do not wait on process-substitution PIDs,
+        # which is only supported in Bash4.4+, beyond APR's Bash4.0 contract.
+        [[ "$result" -eq 0 ]] || exit 1
+        printf 'sha256=%s\n' "$hash"
+    ); then
+        print_error "Failed to hash/count document bytes: $path"
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    while IFS= read -r line; do
+        case "$line" in
+            bytes=*) bytes="${line#bytes=}" ;;
+            sha256=*) digest="${line#sha256=}" ;;
+        esac
+    done <<< "$metrics"
+    if [[ ! "$bytes" =~ ^[0-9]+$ || ! "$digest" =~ ^[[:xdigit:]]{64}$ ]]; then
+        print_error "Failed to hash/count document bytes: $path (incomplete collector result)"
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    local display_path="${path#"$PWD/"}"
+    jq -nc --arg role "$role" --arg path "$display_path" --arg basename "${path##*/}" \
+        --argjson bytes "$bytes" --arg sha256 "$digest" --arg reason "$reason" \
+        '{role:$role,path:$path,basename:$basename,bytes:$bytes,sha256:$sha256,included:true,reason:$reason,skip_reason:null}'
+}
+
+# Bash existence predicates hide errors such as an unsearchable parent. Confirm
+# absence by successfully enumerating the first missing component's parent;
+# never turn a permission/listing failure into a successful optional omission.
+document_optional_path_missing() {
+    local remaining="$1" current="$PWD" component target listing last
+    if [[ "$remaining" == /* ]]; then
+        current=/
+        remaining="${remaining#/}"
+    fi
+    while [[ -n "$remaining" ]]; do
+        component="${remaining%%/*}"
+        last=false
+        if [[ "$remaining" == */* ]]; then
+            remaining="${remaining#*/}"
+        else
+            remaining=""
+            last=true
+        fi
+        [[ -n "$component" && "$component" != . ]] || continue
+        if [[ ! -d "$current" || ! -x "$current" ]]; then
+            print_error "Cannot search optional document parent: $current"
+            return "$EXIT_CONFIG_ERROR"
+        fi
+        target="${current%/}/$component"
+        if [[ "$last" != true && -d "$target" ]]; then
+            current="$target"
+            continue
+        fi
+        if ! listing=$(find -H "$current" -mindepth 1 -maxdepth 1 -print0 | (
+            found=false
+            while IFS= read -r -d '' entry; do
+                [[ "$entry" != "$target" ]] || found=true
+            done
+            printf '%s\n' "$found"
+        )); then
+            print_error "Cannot inspect optional document parent: $current"
+            return "$EXIT_CONFIG_ERROR"
+        fi
+        if [[ "$listing" == false ]]; then
+            return 0
+        fi
+        print_error "Optional document path is present or changed; cannot safely skip: $1"
+        return "$EXIT_CONFIG_ERROR"
+    done
+    print_error "Optional document path has no file component: $1"
+    return "$EXIT_CONFIG_ERROR"
+}
+
+build_document_manifest() {
+    local readme="$1" spec="$2" impl="$3" include_impl="$4" impl_reason="${5:-optional}"
+    if ! command -v jq >/dev/null 2>&1; then
+        print_error "Document manifest preview requires jq"
+        return "$EXIT_DEPENDENCY_ERROR"
+    fi
+    local readme_row spec_row impl_row skip_reason
+    document_manifest_path_valid "$impl" || return $?
+    readme_row=$(document_file_metadata "$readme" readme required) || return $?
+    spec_row=$(document_file_metadata "$spec" spec required) || return $?
+    if [[ "$include_impl" == true && -n "$impl" && ( -e "$impl" || -L "$impl" ) ]]; then
+        impl_row=$(document_file_metadata "$impl" implementation "$impl_reason") || return $?
+    else
+        skip_reason=not_requested
+        if [[ "$include_impl" == true ]]; then
+            skip_reason=missing_optional
+            [[ -n "$impl" ]] || skip_reason=not_configured
+            if [[ -n "$impl" ]]; then
+                document_optional_path_missing "$impl" || return $?
+            fi
+        fi
+        impl_row=$(jq -nc --arg path "${impl#"$PWD/"}" --arg basename "${impl##*/}" \
+            --arg reason "$impl_reason" --arg skip "$skip_reason" \
+            '{role:"implementation",path:$path,basename:$basename,bytes:null,sha256:null,included:false,reason:$reason,skip_reason:$skip}') || return $?
+    fi
+    # Buffer all rows before publishing: a later required/read/hash failure
+    # must never leak a successful partial manifest to stdout.
+    jq -ncS --argjson readme "$readme_row" --argjson spec "$spec_row" --argjson impl "$impl_row" \
+        '{v:1,files:([$readme,$spec,$impl] | sort_by(.role,.path))}'
+}
+
+format_document_manifest() {
+    # JSON-quoted paths keep quotes, line breaks and control characters literal.
+    jq -r '
+        "Current local document metadata preview (not a sent attachment receipt)",
+        (.files | sort_by(.role,.path)[] |
+            if .included then
+                "\(.role): \(.path | @json) — \(.bytes) bytes; sha256=\(.sha256); reason=\(.reason)"
+            else
+                "\(.role): \(.path | @json) — skipped (\(.skip_reason)); reason=\(.reason)"
+            end)
+    ' <<< "$1"
+}
+
 is_valid_workflow_name() {
     [[ "${1:-}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]
 }
@@ -3244,6 +3412,8 @@ run_round() {
     local keep_browser="${KEEP_BROWSER:-false}"
     local skip_preflight="${SKIP_PREFLIGHT:-false}"
     local enable_retry="${ENABLE_RETRY:-true}"
+    local show_manifest="${SHOW_MANIFEST:-false}"
+    local impl_reason=optional
 
     print_banner
 
@@ -3282,6 +3452,7 @@ run_round() {
         if (( round_num % impl_every_n == 0 )); then
             verbose "impl_every_n=$impl_every_n: round $round_num triggers automatic impl inclusion"
             include_impl=true
+            impl_reason=impl_every_n
         fi
     fi
 
@@ -3313,6 +3484,25 @@ run_round() {
     if [[ -z "$output_dir" ]]; then
         print_error "Output directory not configured in $config_path"
         exit $EXIT_CONFIG_ERROR
+    fi
+
+    if [[ "$show_manifest" == true ]]; then
+        local manifest result=0
+        manifest=$(build_document_manifest "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$impl_reason") || result=$?
+        if [[ "$result" -ne 0 ]]; then
+            if [[ "$result" -eq "$EXIT_DEPENDENCY_ERROR" ]]; then
+                apr_emit_error_code_tag dependency_missing
+            else
+                apr_emit_error_code_tag config_error
+            fi
+            return "$result"
+        fi
+        if [[ "${STATS_JSON:-false}" == true ]]; then
+            printf '%s\n' "$manifest"
+        else
+            format_document_manifest "$manifest" >&2
+        fi
+        return "$EXIT_SUCCESS"
     fi
 
     # Run pre-flight checks (unless skipped or dry-run/render mode)
@@ -6759,6 +6949,7 @@ show_help() {
         gum style --faint "  -i, --include-impl   Include implementation document" >&2
         gum style --faint "  -d, --dry-run        Preview without sending to GPT Pro" >&2
         gum style --faint "  -r, --render         Render bundle for manual paste" >&2
+        gum style --faint "  --show-manifest      Preview local document metadata without Oracle" >&2
         gum style --faint "  -c, --copy           Copy rendered bundle to clipboard" >&2
         gum style --faint "  -o, --output FILE    Output to file (integrate/export)" >&2
         gum style --faint "  --wait               Wait for completion (blocking)" >&2
@@ -6768,7 +6959,7 @@ show_help() {
         gum style --faint "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         gum style --faint "  --hours NUM          Status window in hours (default: 72)" >&2
         gum style --faint "  --detailed           Show detailed metrics in stats" >&2
-        gum style --faint "  --json               Output stats as raw JSON" >&2
+        gum style --faint "  --json               Output stats/manifest as raw JSON" >&2
         gum style --faint "  --export FORMAT      Export stats (json, csv, md)" >&2
         gum style --faint "  --rounds RANGE       Filter export rounds (e.g. 3-5 or 1,3,5)" >&2
         gum style --faint "  --since ISO_DATE     Filter export rounds since timestamp" >&2
@@ -6868,6 +7059,7 @@ show_help() {
         echo "  -i, --include-impl   Include implementation document" >&2
         echo "  -d, --dry-run        Preview without sending to GPT Pro" >&2
         echo "  -r, --render         Render bundle for manual paste" >&2
+        echo "  --show-manifest      Preview local document metadata without Oracle" >&2
         echo "  -c, --copy           Copy rendered bundle to clipboard" >&2
         echo "  -o, --output FILE    Output to file (integrate/export)" >&2
         echo "  --wait               Wait for completion (blocking)" >&2
@@ -6877,7 +7069,7 @@ show_help() {
         echo "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         echo "  --hours NUM          Status window in hours (default: 72)" >&2
         echo "  --detailed           Show detailed metrics in stats" >&2
-        echo "  --json               Output stats as raw JSON" >&2
+        echo "  --json               Output stats/manifest as raw JSON" >&2
         echo "  --export FORMAT      Export stats (json, csv, md)" >&2
         echo "  --rounds RANGE       Filter export rounds (e.g. 3-5 or 1,3,5)" >&2
         echo "  --since ISO_DATE     Filter export rounds since timestamp" >&2
@@ -6986,6 +7178,7 @@ main() {
     WORKFLOW=""
     INCLUDE_IMPL=false
     DRY_RUN=false
+    SHOW_MANIFEST=false
     RENDER=false
     COPY=false
     WAIT_MODE=false
@@ -7030,6 +7223,10 @@ main() {
                 ;;
             -r|--render)
                 RENDER=true
+                shift
+                ;;
+            --show-manifest)
+                SHOW_MANIFEST=true
                 shift
                 ;;
             -c|--copy)
@@ -7165,7 +7362,7 @@ main() {
 
     local oracle_required=false
     if [[ "$command_is_round" == "true" || "$command" == "run" ]]; then
-        if [[ "$DRY_RUN" == "true" && "$RENDER" != "true" ]]; then
+        if [[ "$SHOW_MANIFEST" == true || ( "$DRY_RUN" == "true" && "$RENDER" != "true" ) ]]; then
             oracle_required=false
         else
             oracle_required=true
@@ -7187,7 +7384,7 @@ main() {
         fi
     else
         # Best-effort Oracle detection for dry-run output
-        if [[ "$command_is_round" == "true" || "$command" == "run" ]]; then
+        if [[ "$SHOW_MANIFEST" != true && ( "$command_is_round" == "true" || "$command" == "run" ) ]]; then
             if ! check_oracle; then
                 ORACLE_CMD=("oracle")
                 [[ "$QUIET_MODE" != "true" ]] && print_warning "Oracle not found; dry run will use a placeholder command"
