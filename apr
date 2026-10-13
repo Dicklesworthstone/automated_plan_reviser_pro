@@ -1014,6 +1014,7 @@ preflight_check() {
     local spec_path="$2"
     local impl_path="${3:-}"
     local has_warnings=false
+    local documents_validated="${4:-false}"
 
     verbose "preflight_check: readme=$readme_path spec=$spec_path impl=${impl_path:-<none>}"
 
@@ -1045,6 +1046,12 @@ preflight_check() {
         print_warning "Oracle stability patch failed - responses may be truncated"
         print_warning "Set APR_NO_ORACLE_PATCH=1 to disable this warning"
         has_warnings=true
+    fi
+    # CLI execution already applied the canonical document policy. This legacy
+    # direct readiness interface must not reintroduce different run warnings.
+    if [[ "$documents_validated" == true ]]; then
+        [[ "$has_warnings" != true ]] || return 2
+        return 0
     fi
 
     # Check source files exist and are readable
@@ -1139,6 +1146,7 @@ preflight_check() {
 
 PROMPT_QC_REASON=""
 PROMPT_QC_DETAILS=""
+PROMPT_QC_HITS='[]'
 
 # Validate that the prompt we send to Oracle/ChatGPT does not contain obvious
 # unexpanded placeholders (e.g. {{README}}). APR does NOT expand mustache-style
@@ -1158,18 +1166,48 @@ prompt_quality_check() {
     PROMPT_QC_REASON=""
     PROMPT_QC_DETAILS=""
 
-    # Escape hatch for advanced use (default is strict).
-    if [[ "${APR_ALLOW_CURLY_PLACEHOLDERS:-}" == "1" ]]; then
-        return 0
-    fi
-
-    # Guard: '{{' / '}}' in the prompt almost always means "expected substitution"
-    # but nothing will substitute it.
-    if [[ "$prompt" == *'{{'* || "$prompt" == *'}}'* ]]; then
+    PROMPT_QC_HITS='[]'
+    local hits scan_fences="${APR_QC_SCAN_FENCES:-0}"
+    [[ "${APR_FAIL_ON_WARN:-0}" != 1 ]] || scan_fences=1
+    hits=$(awk -v fences="$scan_fences" -v curly="${APR_ALLOW_CURLY_PLACEHOLDERS:-0}" \
+        -v shell="${APR_QC_SHELL_PLACEHOLDERS:-1}" -v quotes="${APR_QC_IGNORE_QUOTES:-0}" \
+        -v allow="${APR_QC_ALLOW_TOKENS:-}" '
+        BEGIN {n=split(allow,allowed,"\n");fence="";width=0;hits=0}
+        {
+            line=$0;mark=line;sub(/^ ? ? ?/,"",mark)
+            if(match(mark,/^```+|^~~~+/)) {
+                delimiter=substr(mark,1,RLENGTH);tail=substr(mark,RLENGTH+1)
+                if(fence=="") {fence=substr(delimiter,1,1);width=length(delimiter)}
+                else if(substr(delimiter,1,1)==fence && length(delimiter)>=width && tail~/^[[:space:]]*$/) {fence="";width=0}
+                next
+            }
+            if(fence!="" && fences!=1)next
+            if(quotes==1 && line~/^[[:space:]]*>/)next
+            for(i=1;i<=n;i++) if(allowed[i]!="") {
+                remaining=line;prefix=""
+                while((at=index(remaining,allowed[i]))>0) {
+                    suffix=substr(remaining,at+length(allowed[i]))
+                    prefix=prefix substr(remaining,1,at-1)
+                    if(allowed[i]~/^\$[A-Z_][A-Z0-9_]*$/ && substr(suffix,1,1)~/[[:alnum:]_]/)prefix=prefix allowed[i]
+                    remaining=suffix
+                }
+                line=prefix remaining
+            }
+            bad=(curly!=1 && (index(line,"{{")||index(line,"}}")))
+            if(shell!=0 && line~/\$\{[^}]+\}|\$[A-Z_][A-Z0-9_]*/)bad=1
+            if(line~/<(REPLACE_ME|INSERT|FILL_ME|YOUR_[A-Z_]+)>/ || line~/(^|[^[:alnum:]_])TODO:|(^|[^[:alnum:]_])TBD([^[:alnum:]_]|$)/)bad=1
+            if(bad && hits<8) {print NR "\t" substr($0,1,160);hits++}
+        }
+    ' <<< "$prompt") || return 1
+    if [[ -n "$hits" ]]; then
         PROMPT_QC_REASON="Prompt contains unexpanded placeholders ('{{' / '}}'). APR does not substitute these."
+        if [[ "$prompt" != *'{{'* && "$prompt" != *'}}'* ]]; then
+            PROMPT_QC_REASON="Prompt contains unfilled markers; replace them with concrete instructions or allow exact literal tokens."
+        fi
+        PROMPT_QC_HITS=$(printf '%s\n' "$hits" | jq -Rsc 'split("\n")|map(select(length>0)|split("\t")|{line:(.[0]|tonumber),text:(.[1:]|join("\t"))})') || return 1
 
         local prompt_hits cfg_hits
-        prompt_hits=$(awk -v label="$label" 'hits < 8 && (index($0,"{{") || index($0,"}}")) { printf "  %s:%d: %s\n", label, NR, $0; hits++ }' <<< "$prompt")
+        prompt_hits=$(printf '%s\n' "$hits" | awk -F '\t' -v label="$label" '{printf "  %s:%d: %s\n",label,$1,$2}')
 
         cfg_hits=""
         if [[ -n "$config_path" && -f "$config_path" ]]; then
@@ -1183,7 +1221,7 @@ Why this fails:
 - APR already attaches the files via Oracle; the prompt should reference them by name.
 
 Fix:
-- Remove {{...}} placeholders from your workflow templates.
+- Remove unfilled markers from your workflow templates.
 - Replace with instructions like: "Read the attached README.md" / "Read the attached spec file".
 
 Offending lines:
@@ -1194,6 +1232,7 @@ ${cfg_hits:-  (no config hits captured)}
 
 Override (not recommended):
 - Set APR_ALLOW_CURLY_PLACEHOLDERS=1 to bypass this guard.
+- Or allow exact literal tokens with newline-separated APR_QC_ALLOW_TOKENS.
 EOF
         )
 
@@ -2053,7 +2092,9 @@ build_revision_prompt() {
         return "$EXIT_CONFIG_ERROR"
     fi
     if ! metadata=$(jq -er '
-        def quoted: @json | gsub("\\{"; "\\u007b") | gsub("\\}"; "\\u007d");
+        def quoted: @json | gsub("\\{"; "\\u007b") | gsub("\\}"; "\\u007d") |
+            gsub("\\$";"\\u0024") | gsub("<";"\\u003c") | gsub(">";"\\u003e") |
+            gsub("TODO:";"\\u0054ODO:") | gsub("TBD";"\\u0054BD");
         if .v != 1 or (.files | length) != 3 then error("Invalid document manifest") else
         "Observed local input metadata (not a sent attachment receipt):",
         (.files | sort_by(.role,.path)[] |
@@ -2074,11 +2115,23 @@ build_revision_prompt() {
 # updates software. Findings are data; renderers choose stderr or robot JSON.
 validation_add_finding() {
     local severity="$1" code="$2" message="$3" hint="$4" file="$5" label="$6" details="${7:-}"
-    local finding
+    local finding source_line=null
     [[ -n "$details" ]] || details='{}'
+    if [[ -f "$file" && -r "$file" ]]; then
+        source_line=$(awk -v key="$label" '
+            function indent(s){match(s,/^[[:space:]]*/);return RLENGTH}
+            block {if($0~/^[[:space:]]*$/ || indent($0)>level)next;block=0}
+            $0~/^[[:space:]]*[^#][^:]*:[[:space:]]*[|>][-+]?[[:space:]]*(#.*)?$/ {
+                if($0~"^[[:space:]]*" key ":") {print NR;exit}
+                block=1;level=indent($0);next
+            }
+            $0~"^[[:space:]]*" key ":[[:space:]]*" {print NR;exit}
+        ' "$file") || return "$EXIT_CONFIG_ERROR"
+        source_line="${source_line:-null}"
+    fi
     finding=$(jq -nc --arg code "$code" --arg message "$message" --arg hint "$hint" \
-        --arg file "$file" --arg label "$label" --argjson details "$details" \
-        '{code:$code,message:$message,hint:$hint,source:{file:(if $file=="" then null else $file end),line:null,label:$label},details:$details}') || return "$EXIT_CONFIG_ERROR"
+        --arg file "$file" --arg label "$label" --argjson line "$source_line" --argjson details "$details" \
+        '{code:$code,message:$message,hint:$hint,source:{file:(if $file=="" then null else $file end),line:$line,label:$label},details:$details}') || return "$EXIT_CONFIG_ERROR"
     if [[ "$severity" == error ]]; then
         VALIDATION_ERRORS=$(jq -nc --argjson findings "$VALIDATION_ERRORS" --argjson finding "$finding" '$findings+[$finding]')
     else
@@ -2087,8 +2140,11 @@ validation_add_finding() {
 }
 
 validate_workflow_local() {
-    local workflow="$1" round="${2:-1}" requested="${3:-false}"
-    local VALIDATION_ERRORS='[]' VALIDATION_WARNINGS='[]' resolved='{}'
+    if ! command -v jq >/dev/null 2>&1;then
+        print_error "Local validation requires jq";apr_emit_error_code_tag dependency_missing;return "$EXIT_DEPENDENCY_ERROR"
+    fi
+    local workflow="$1" round="${2-1}" requested="${3:-false}"
+    local VALIDATION_ERRORS='[]' VALIDATION_WARNINGS='[]' resolved='{}' policy_warnings='[]' policy_overrides='[]'
     local config="$CONFIG_DIR/workflows/$workflow.yaml" code=ok
     if ! is_valid_workflow_name "$workflow"; then
         validation_add_finding error usage_error "Invalid workflow name" "Use letters, digits, dots, hyphens and underscores" "" workflow
@@ -2096,7 +2152,9 @@ validate_workflow_local() {
     if is_non_negative_int "$round"; then
         while [[ "${#round}" -gt 1 && "$round" == 0* ]]; do round="${round#0}"; done
     fi
-    if ! is_non_negative_int "$round" || [[ "${#round}" -gt 9 ]]; then
+    if [[ -z "$round" ]]; then
+        validation_add_finding error usage_error "Round number required" "Choose a valid round number" "" round
+    elif ! is_non_negative_int "$round" || [[ "${#round}" -gt 9 ]]; then
         validation_add_finding error usage_error "Round must be a non-negative integer of at most nine digits" "Choose a valid round number" "" round
     fi
     if [[ "$requested" != true && "$requested" != false ]]; then
@@ -2123,9 +2181,26 @@ validate_workflow_local() {
                 validation_add_finding error config_error "Cannot read workflow configuration" "Check readability and YAML scalar values" "$config" config
             else
                 local readme="${values[0]}" spec="${values[1]}" impl="${values[2]}" model="${values[3]}"
-                local thinking="${values[4]}" output="${values[5]}" cadence="${values[6]}" include="$requested" reason=optional
+                local thinking="${values[4]}" output="${values[5]}" cadence="${values[6]}" raw_cadence="${values[6]}" include="$requested" reason=optional
                 [[ -n "$model" ]] || validation_add_finding error config_error "Model not configured in workflow" "Set oracle.model" "$config" model
                 [[ -n "$output" ]] || validation_add_finding error config_error "Output directory not configured in workflow" "Set rounds.output_dir" "$config" output_dir
+                local warning_count
+                warning_count=$(jq length <<< "$VALIDATION_WARNINGS")
+                case "$model" in
+                    '5.2 Thinking'|gpt-5.2-pro) ;;
+                    *)
+                        if [[ -n "$model" ]]; then
+                            validation_add_finding warning validation_failed "Model '$model' is outside APR's extended-reasoning defaults" "Use oracle.model: 5.2 Thinking or gpt-5.2-pro; intentionally override with APR_ALLOW_NONPRO_MODELS=1" "$config" model '{"policy":"model"}'
+                        fi ;;
+                esac
+                if [[ "$thinking" != heavy && "$thinking" != extended ]]; then
+                    validation_add_finding warning validation_failed "Thinking time '${thinking:-missing}' is below APR's intended extended reasoning" "Set oracle.thinking_time: heavy; intentionally override with APR_ALLOW_LIGHT_THINKING=1" "$config" thinking_time '{"policy":"thinking_time"}'
+                fi
+                policy_warnings=$(jq -c --argjson start "$warning_count" '.[$start:]' <<< "$VALIDATION_WARNINGS")
+                if [[ "${APR_ALLOW_NONPRO_MODELS:-0}" == 1 ]]; then policy_overrides=$(jq -c '.+["nonpro_models"]' <<< "$policy_overrides"); fi
+                if [[ "${APR_ALLOW_LIGHT_THINKING:-0}" == 1 ]]; then policy_overrides=$(jq -c '.+["light_thinking"]' <<< "$policy_overrides"); fi
+                VALIDATION_WARNINGS=$(jq -c --argjson overrides "$policy_overrides" \
+                    'map(select((.details.policy=="model" and ($overrides|index("nonpro_models"))!=null or .details.policy=="thinking_time" and ($overrides|index("light_thinking"))!=null)|not))' <<< "$VALIDATION_WARNINGS")
                 if [[ -n "$cadence" ]]; then
                     if is_non_negative_int "$cadence" && [[ "${#cadence}" -le 9 ]]; then
                         while [[ "${#cadence}" -gt 1 && "$cadence" == 0* ]]; do cadence="${cadence#0}"; done
@@ -2141,10 +2216,16 @@ validate_workflow_local() {
                     if ! template=$(build_revision_template "$variant" "$config") || [[ -z "$template" ]]; then
                         validation_add_finding error validation_failed "Cannot build $label" "Provide a nonempty workflow template" "$config" "$label"
                     elif ! prompt_quality_check "$template" "$config" "$label"; then
-                        validation_add_finding error validation_failed "$PROMPT_QC_REASON ($label)" "Remove unexpanded placeholders" "$config" "$label"
+                        validation_add_finding error validation_failed "$PROMPT_QC_REASON ($label)" "Replace unfilled markers; fence literal code examples or allow exact tokens" "$config" "$label" "$(jq -nc --argjson hits "$PROMPT_QC_HITS" '{hits:$hits}')"
                     fi
                 done
                 local manifest='null' prompt='' effective=false manifest_result=0
+                if [[ -z "$readme" || ! -f "$readme" ]]; then
+                    validation_add_finding error config_error "README not found: $readme" "Provide the required README or fix documents.readme" "$readme" readme
+                fi
+                if [[ -z "$spec" || ! -f "$spec" ]]; then
+                    validation_add_finding error config_error "Spec not found: $spec" "Provide the required specification or fix documents.spec" "$spec" spec
+                fi
                 manifest=$(build_document_manifest "$readme" "$spec" "$impl" "$include" "$reason") || manifest_result=$?
                 if [[ "$manifest_result" -ne 0 ]]; then
                     local manifest_code=config_error
@@ -2153,15 +2234,32 @@ validate_workflow_local() {
                     manifest='null'
                 else
                     effective=$(jq -r '.files[] | select(.role=="implementation") | .included' <<< "$manifest") || return "$EXIT_CONFIG_ERROR"
-                    local row role bytes path
+                    local row role bytes path threshold strict_threshold policy_field policy_value policy_invalid
                     while IFS= read -r row; do
                         role=$(jq -r .role <<< "$row"); bytes=$(jq -r .bytes <<< "$row"); path=$(jq -r .path <<< "$row")
+                        threshold=64;strict_threshold='';policy_invalid=false
+                        for policy_field in "${role}_warn_bytes" "${role}_strict_bytes"; do
+                            policy_value=$(get_config_value "$policy_field" "$config") || return "$EXIT_CONFIG_ERROR"
+                            policy_value=$(yaml_unquote "$policy_value") || return "$EXIT_CONFIG_ERROR"
+                            [[ -n "$policy_value" ]] || continue
+                            while [[ "${#policy_value}" -gt 1 && "$policy_value" == 0* ]]; do policy_value="${policy_value#0}"; done
+                            if ! is_non_negative_int "$policy_value" || [[ "${#policy_value}" -gt 9 ]]; then
+                                validation_add_finding error config_error "Invalid byte threshold '$policy_field'" "Set a non-negative integer of at most nine digits" "$config" "$policy_field"
+                                policy_invalid=true;continue
+                            fi
+                            if [[ "$policy_field" == *_warn_bytes ]]; then threshold="$policy_value";else strict_threshold="$policy_value";fi
+                        done
+                        [[ "$policy_invalid" == false ]] || continue
+                        [[ $(jq -r .included <<< "$row") == true ]] || continue
                         if [[ "$bytes" -eq 0 ]]; then
                             validation_add_finding error validation_failed "$role document is empty: $path" "Provide useful document content" "$path" "$role" "$(jq -nc --arg role "$role" --argjson bytes "$bytes" '{role:$role,bytes:$bytes}')"
-                        elif [[ "$bytes" -lt 64 ]]; then
-                            validation_add_finding warning validation_failed "$role document is suspiciously small (${bytes} bytes): $path" "Check that the document is complete" "$path" "$role" "$(jq -nc --arg role "$role" --argjson bytes "$bytes" '{role:$role,bytes:$bytes,threshold:64}')"
+                        elif [[ "$bytes" -lt "$threshold" ]]; then
+                            validation_add_finding warning validation_failed "$role document is suspiciously small (${bytes} bytes): $path" "Check document completeness or configure ${role}_warn_bytes" "$path" "$role" "$(jq -nc --arg role "$role" --argjson bytes "$bytes" --argjson threshold "$threshold" '{role:$role,bytes:$bytes,threshold:$threshold}')"
                         fi
-                    done < <(jq -c '.files[] | select(.included)' <<< "$manifest")
+                        if [[ "${APR_FAIL_ON_WARN:-0}" == 1 && -n "$strict_threshold" && "$bytes" -lt "$strict_threshold" ]]; then
+                            validation_add_finding error validation_failed "$role document is below its strict threshold (${bytes} bytes): $path" "Provide complete content or intentionally adjust ${role}_strict_bytes" "$path" "$role" "$(jq -nc --arg role "$role" --argjson bytes "$bytes" --argjson threshold "$strict_threshold" '{role:$role,bytes:$bytes,threshold:$threshold}')"
+                        fi
+                    done < <(jq -c '.files[]' <<< "$manifest")
                     if ! prompt=$(build_revision_prompt "$effective" "$config" "$manifest") || [[ -z "$prompt" ]]; then
                         validation_add_finding error validation_failed "Cannot assemble selected prompt" "Check document metadata and workflow template" "$config" prompt
                     elif ! prompt_quality_check "$prompt" "$config" "assembled prompt"; then
@@ -2172,22 +2270,44 @@ validate_workflow_local() {
                 [[ -z "$prompt" ]] || prompt_hash=$(printf '%s' "$prompt" | document_sha256_stdin) || return "$EXIT_CONFIG_ERROR"
                 resolved=$(jq -nc --arg workflow "$workflow" --argjson round "$round" --arg config "$config" \
                     --arg readme "$readme" --arg spec "$spec" --arg impl "$impl" --arg model "$model" --arg thinking "$thinking" --arg output "$output" \
-                    --argjson requested "$requested" --argjson effective "$effective" --arg reason "$reason" --argjson manifest "$manifest" --arg hash "$prompt_hash" \
+                    --argjson requested "$requested" --argjson effective "$effective" --arg reason "$reason" --argjson manifest "$manifest" --arg hash "$prompt_hash" --arg cadence "$raw_cadence" \
                     '{workflow:$workflow,round:$round,config_path:$config,readme_path:$readme,spec_path:$spec,implementation_path:$impl,model:$model,thinking_time:$thinking,
-                      output_dir:$output,include_impl_requested:$requested,include_impl_effective:$effective,impl_reason:$reason,manifest:$manifest,
+                      output_dir:$output,impl_every_n:$cadence,include_impl_requested:$requested,include_impl_effective:$effective,impl_reason:$reason,manifest:$manifest,
                       prompt_hash:(if $hash=="" then null else $hash end)}') || return "$EXIT_CONFIG_ERROR"
+                if ((10#$round > 1)); then
+                    local previous=$((10#$round-1)) previous_file
+                    previous_file="$CONFIG_DIR/rounds/$workflow/round_${previous}.md"
+                    if [[ ! -f "$previous_file" ]]; then
+                        validation_add_finding warning validation_failed "Previous round $previous not found - starting fresh?" "Confirm the intended round or retain the previous review" "$previous_file" previous_round
+                    fi
+                fi
             fi
         fi
     fi
+    if [[ "${APR_FAIL_ON_WARN:-0}" == 1 && "$VALIDATION_WARNINGS" != '[]' ]]; then
+        VALIDATION_ERRORS=$(jq -nc --argjson errors "$VALIDATION_ERRORS" --argjson warnings "$VALIDATION_WARNINGS" '$errors+($warnings|map(.+{strict:true}))')
+    fi
     if [[ "$VALIDATION_ERRORS" != '[]' ]]; then code=$(jq -r '.[0].code' <<< "$VALIDATION_ERRORS"); fi
     jq -nc --arg code "$code" --argjson errors "$VALIDATION_ERRORS" --argjson warnings "$VALIDATION_WARNINGS" --argjson resolved "$resolved" \
-        '{valid:($errors|length==0),code:$code,errors:$errors,warnings:$warnings,resolved:$resolved}'
+        --argjson policy "$policy_warnings" --argjson overrides "$policy_overrides" \
+        '{valid:($errors|length==0),code:$code,errors:$errors,warnings:$warnings,resolved:$resolved,policy_warnings:$policy,policy_overrides:$overrides}'
+}
+
+validation_apply_resolved() {
+    local result="$1" index value
+    local names=(readme_path spec_path impl_path model thinking_time output_dir impl_every_n)
+    local keys=(readme_path spec_path implementation_path model thinking_time output_dir impl_every_n)
+    # Bash dynamic scope assigns only these explicit caller-local routing names.
+    for ((index=0;index<${#names[@]};index++));do
+        value=$(jq -r --arg key "${keys[index]}" '.resolved[$key]+"."' <<< "$result") || return "$EXIT_CONFIG_ERROR"
+        printf -v "${names[index]}" '%s' "${value%.}"
+    done
 }
 
 render_local_validation() {
     local result="$1" message
-    while IFS= read -r message; do print_error "$message"; done < <(jq -r '.errors[].message' <<< "$result")
-    while IFS= read -r message; do print_warning "$message"; done < <(jq -r '.warnings[].message' <<< "$result")
+    while IFS= read -r message; do print_error "$message"; done < <(jq -r '.errors[]|"\(.source.file // .source.label):\(.source.line // "?"): \(.message) Hint: \(.hint)"+([(.details.hits // [])[]|" Prompt line \(.line): \(.text)"]|join(""))' <<< "$result")
+    while IFS= read -r message; do print_warning "$message"; done < <(jq -r '.warnings[]|"\(.source.file // .source.label):\(.source.line // "?"): \(.message) Hint: \(.hint)"' <<< "$result")
 }
 
 cmd_lint() {
@@ -2416,13 +2536,14 @@ queue_observe_run() {
         [[ -z "$bound" || "$bound" == "$run_id" ]] || return "$EXIT_CONFIG_ERROR"
         state=$(jq -r .state <<< "$record")
         owner=$(jq -r '.owner_pid // empty' <<< "$record")
+        private="$CONFIG_DIR/runs/$workflow/$run_id/terminal.meta.json"
         if [[ "$state" != started ]]; then
             # Publication of the canonical terminal record precedes the
             # private terminal link. Wait through that real handoff window.
-            private="$CONFIG_DIR/runs/$workflow/$run_id/terminal.meta.json"
             if [[ "$file" != "$private" ]]; then
                 if [[ -f "$private" && ! -L "$private" ]]; then continue; fi
                 if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then sleep 0.2; continue; fi
+                [[ ! -f "$private" || -L "$private" ]] || continue
                 print_error "Queue entry $id lacks its private terminal record; preserving the canonical outcome"
                 return "$EXIT_BUSY_ERROR"
             fi
@@ -2438,6 +2559,10 @@ queue_observe_run() {
             return 0
         fi
         if [[ ! "$owner" =~ ^[0-9]+$ ]] || ! kill -0 "$owner" 2>/dev/null; then
+            # A worker may publish/link and exit after our started snapshot.
+            # Reconcile that exact private record once; a dead started private
+            # record remains busy instead of spinning or launching new work.
+            if [[ "$file" != "$private" && -f "$private" && ! -L "$private" ]]; then continue; fi
             print_error "Queue entry $id has a nonterminal run; preserving it without launching a duplicate"
             return "$EXIT_BUSY_ERROR"
         fi
@@ -2496,6 +2621,8 @@ queue_run_data() (
             launch=$(
                 ROBOT_MODE=true; ROBOT_COMPACT=true; ROBOT_FORMAT=json; ROBOT_STATS=false
                 WORKFLOW="$workflow"; INCLUDE_IMPL="$include"
+                # A direct-run escape hatch never waives FIFO entry validity.
+                export APR_NO_LINT=0
                 export APR_QUEUE_ENTRY_ID="$id"
                 export APR_BUSY_WAIT_SECONDS="${APR_BUSY_WAIT_SECONDS:-infinite}"
                 ORACLE_BUSY_WAIT_SECONDS="$APR_BUSY_WAIT_SECONDS"
@@ -2933,7 +3060,7 @@ apr_capture_replay_bundle() {
         print_error "Selected template changed before capture; refusing a different prompt"
         return "$EXIT_CONFIG_ERROR"
     fi
-    prompt_quality_check "$captured_prompt" "$captured" prompt || return "$EXIT_CONFIG_ERROR"
+    [[ "${APR_NO_LINT:-0}" == 1 ]] || prompt_quality_check "$captured_prompt" "$captured" prompt || return "$EXIT_CONFIG_ERROR"
     printf '%s' "$prompt" > "$root/prompt.txt" || return "$EXIT_CONFIG_ERROR"
     prompt_metadata=$(document_file_metadata "$root/prompt.txt" readme required) || return $?
     config_metadata=$(document_file_metadata "$captured" readme required) || return $?
@@ -3127,12 +3254,27 @@ apr_run_early_error() {
     elif [[ "$result" -ne 0 ]]; then
         return "$result"
     fi
+    apr_bind_validation || return $?
     ledger_write_finish_error "$code" "$exit_code"
+}
+
+apr_bind_validation() {
+    if [[ -n "${APR_RUN_VALIDATION:-}" ]]; then
+        local candidate validation
+        validation=$(jq -c --argjson strict "$([[ "${APR_FAIL_ON_WARN:-0}" == 1 ]] && echo true || echo false)" \
+            --argjson bypass "$([[ "${APR_NO_LINT:-0}" == 1 ]] && echo true || echo false)" \
+            '{strict:$strict,bypassed:$bypass,policy_warnings:(.policy_warnings // []),policy_overrides:(.policy_overrides // [])}' <<< "$APR_RUN_VALIDATION") || return "$EXIT_CONFIG_ERROR"
+        candidate=$(umask 077;mktemp "${APR_LEDGER_FILE%/*}/.ledger-validation.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+        jq -c --argjson validation "$validation" '.validation=$validation' "$APR_LEDGER_RECORD" > "$candidate" || return "$EXIT_CONFIG_ERROR"
+        ledger_publish "$candidate" || return $?
+        APR_LEDGER_RECORD="$candidate"
+    fi
 }
 
 apr_run_begin() {
     local workflow="$1" round="$2" slug="$3" config="$4" output="$5"
     ledger_write_start "$workflow" "$round" "$slug" "$config" "$output" || return $?
+    apr_bind_validation || return $?
     APR_RUN_OUTPUT="$APR_LEDGER_DIR/output.md"
     APR_RUN_OUTPUT_PATH="$output"
     APR_RUN_PRIOR_OUTPUT=""
@@ -4586,6 +4728,10 @@ EOF
 
 run_round() (
     local round_num="$1"
+    while [[ "${#round_num}" -gt 1 && "$round_num" == 0* ]]; do round_num="${round_num#0}";done
+    if ! is_non_negative_int "$round_num" || [[ "${#round_num}" -gt 9 ]];then
+        apr_emit_error_code_tag usage_error;print_error "Round must be a non-negative integer of at most nine digits";return "$EXIT_USAGE_ERROR"
+    fi
     local workflow="${WORKFLOW:-default}"
     local include_impl="${INCLUDE_IMPL:-false}"
     local dry_run="${DRY_RUN:-false}"
@@ -4603,6 +4749,7 @@ run_round() (
     APR_LEDGER_RECORD=""
     APR_RUN_ERROR_CODE=""
     APR_RUN_OUTPUT=""
+    APR_RUN_VALIDATION='{}'
     APR_REPLAY_BUNDLE='null'; APR_REPLAY_CONFIG_FILE=''; APR_REPLAY_FILE_ARGS=()
     if [[ "$show_manifest" != true && "$dry_run" != true && "$render" != true ]]; then
         APR_RUN_ACTIVE=true
@@ -4614,6 +4761,27 @@ run_round() (
     fi
 
     print_banner
+
+    local validation_code
+    if [[ "${APR_NO_LINT:-0}" == 1 ]]; then
+        print_warning "Local lint explicitly bypassed; the run ledger records this choice"
+    elif [[ "$show_manifest" != true ]]; then
+        APR_RUN_VALIDATION=$(validate_workflow_local "$workflow" "$round_num" "$include_impl") || return $?
+        render_local_validation "$APR_RUN_VALIDATION"
+        validation_code=$(jq -r .code <<< "$APR_RUN_VALIDATION")
+        if [[ "$validation_code" != ok ]]; then
+            APR_RUN_ERROR_CODE="$validation_code";apr_emit_error_code_tag "$validation_code"
+            return "$(apr_exit_code_for_code "$validation_code")"
+        fi
+        round_num=$(jq -r .resolved.round <<< "$APR_RUN_VALIDATION")
+    fi
+    if [[ "$show_manifest" != true && ( "$dry_run" != true || "$render" == true ) ]]; then
+        if ! check_oracle; then
+            APR_RUN_ERROR_CODE=dependency_missing;apr_emit_error_code_tag dependency_missing
+            print_error "Oracle not available";return "$EXIT_DEPENDENCY_ERROR"
+        fi
+        oracle_detect_features || true
+    fi
 
     verbose "Starting run_round: round=$round_num workflow=$workflow"
     verbose "Options: include_impl=$include_impl dry_run=$dry_run render=$render"
@@ -4637,6 +4805,9 @@ run_round() (
 
     # Parse config (simple grep-based for now)
     local readme_path spec_path impl_path model output_dir impl_every_n thinking_time
+    if [[ "${APR_NO_LINT:-0}" != 1 && "$show_manifest" != true ]];then
+        validation_apply_resolved "$APR_RUN_VALIDATION" || return $?
+    else
     readme_path=$(yaml_unquote "$(get_config_value "readme" "$config_path")")
     spec_path=$(yaml_unquote "$(get_config_value "spec" "$config_path")")
     impl_path=$(yaml_unquote "$(get_config_value "implementation" "$config_path")")
@@ -4644,10 +4815,11 @@ run_round() (
     output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$config_path")")
     impl_every_n=$(yaml_unquote "$(get_config_value "impl_every_n" "$config_path")")
     thinking_time=$(yaml_unquote "$(get_config_value "thinking_time" "$config_path")")
+    fi
 
     # Auto-include implementation every N rounds if configured
-    if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]]; then
-        if (( round_num % impl_every_n == 0 )); then
+    if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "${#impl_every_n}" -le 9 ]] && ((10#$impl_every_n > 0)); then
+        if (( 10#$round_num % 10#$impl_every_n == 0 )); then
             verbose "impl_every_n=$impl_every_n: round $round_num triggers automatic impl inclusion"
             include_impl=true
             impl_reason=impl_every_n
@@ -4687,25 +4859,17 @@ run_round() (
     # Preserve existing preflight diagnostics/order. The standalone metadata
     # preview bypasses all Oracle checks, as before.
     if [[ "$show_manifest" != true ]]; then
-        if [[ "$skip_preflight" != "true" && "$dry_run" != "true" && "$render" != "true" ]]; then
+        if [[ "${APR_NO_LINT:-0}" != 1 && "$skip_preflight" != "true" && "$dry_run" != "true" && "$render" != "true" ]]; then
             local impl_for_preflight=""
             [[ "$include_impl" == "true" && -n "$impl_path" ]] && impl_for_preflight="$impl_path"
             local preflight_result=0
-            preflight_check "$readme_path" "$spec_path" "$impl_for_preflight" || preflight_result=$?
+            preflight_check "$readme_path" "$spec_path" "$impl_for_preflight" true || preflight_result=$?
             if [[ $preflight_result -eq 1 ]]; then
                 print_error "Pre-flight checks failed. Fix the issues above and try again."
                 print_info "Use --no-preflight to skip these checks (not recommended)"
                 exit $EXIT_CONFIG_ERROR
             fi
             # preflight_result=2 means warnings only, continue execution.
-            local local_validation
-            local_validation=$(validate_workflow_local "$workflow" "$round_num" "$include_impl") || return $?
-            if [[ $(jq -r .valid <<< "$local_validation") != true ]]; then
-                render_local_validation "$local_validation"
-                APR_RUN_ERROR_CODE=$(jq -r .code <<< "$local_validation")
-                apr_emit_error_code_tag "$APR_RUN_ERROR_CODE"
-                return "$(apr_exit_code_for_code "$APR_RUN_ERROR_CODE")"
-            fi
         else
             verbose "Skipping pre-flight checks (skip_preflight=$skip_preflight dry_run=$dry_run render=$render)"
             local required_path
@@ -4720,7 +4884,9 @@ run_round() (
     # Keep requested inclusion/reason even when the optional file is absent.
     # Use this same observation for final prompt and attachment selection.
     local manifest result=0
-    manifest=$(build_document_manifest "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$impl_reason") || result=$?
+    if [[ "${APR_NO_LINT:-0}" != 1 && "$show_manifest" != true ]];then
+        manifest=$(jq -c .resolved.manifest <<< "$APR_RUN_VALIDATION") || return "$EXIT_CONFIG_ERROR"
+    else manifest=$(build_document_manifest "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$impl_reason") || result=$?;fi
     if [[ "$result" -ne 0 ]]; then
         if [[ "$result" -eq "$EXIT_DEPENDENCY_ERROR" ]]; then
             apr_emit_error_code_tag dependency_missing
@@ -4801,6 +4967,11 @@ run_round() (
     # Build prompt using shared function
     local prompt
     prompt=$(build_revision_prompt "$include_impl" "$config_path" "$manifest") || return "$EXIT_CONFIG_ERROR"
+    if [[ "${APR_NO_LINT:-0}" != 1 && "$show_manifest" != true ]] &&
+        [[ $(printf '%s' "$prompt" | document_sha256_stdin) != "$(jq -r .resolved.prompt_hash <<< "$APR_RUN_VALIDATION")" ]];then
+        APR_RUN_ERROR_CODE=attachment_mismatch;apr_emit_error_code_tag attachment_mismatch
+        print_error "Template changed after local validation; refusing a different prompt";return "$EXIT_CONFIG_ERROR"
+    fi
     if [[ -z "$prompt" ]]; then
         APR_RUN_ERROR_CODE=validation_failed
         apr_emit_error_code_tag validation_failed
@@ -4815,7 +4986,7 @@ run_round() (
     fi
 
     # Quality gate: refuse to run if the prompt contains obvious unexpanded placeholders.
-    if ! prompt_quality_check "$prompt" "$config_path" "prompt"; then
+    if [[ "${APR_NO_LINT:-0}" != 1 ]] && ! prompt_quality_check "$prompt" "$config_path" "prompt"; then
         APR_RUN_ERROR_CODE=validation_failed
         apr_emit_error_code_tag validation_failed
         if [[ "$ROBOT_MODE" == "true" ]]; then
@@ -7285,137 +7456,23 @@ robot_init() {
 
 # Robot: Validate - Pre-run validation
 robot_validate() {
-    local round_num="${1:-}"
-    local workflow="${WORKFLOW:-default}"
-    local errors=()
-    local warnings=()
-
-    if [[ -z "$round_num" ]]; then
-        errors+=("Round number required")
-    elif ! is_non_negative_int "$round_num"; then
-        errors+=("Round must be a non-negative integer")
-    fi
-
-    if [[ ! -d "$CONFIG_DIR" ]]; then
-        errors+=("Not initialized - run 'apr robot init'")
-    fi
-
-    local wf_file="$CONFIG_DIR/workflows/${workflow}.yaml"
-    if [[ ! -f "$wf_file" ]]; then
-        errors+=("Workflow '$workflow' not found")
-    else
-        # Check required documents exist
-        local readme spec impl model output_dir impl_every_n
-        local include_impl="${INCLUDE_IMPL:-false}" impl_reason=optional
-        readme=$(yaml_unquote "$(get_config_value "readme" "$wf_file" 2>/dev/null || echo "")")
-        spec=$(yaml_unquote "$(get_config_value "spec" "$wf_file" 2>/dev/null || echo "")")
-        impl=$(yaml_unquote "$(get_config_value "implementation" "$wf_file" 2>/dev/null || echo "")")
-        impl_every_n=$(yaml_unquote "$(get_config_value "impl_every_n" "$wf_file" 2>/dev/null || echo "")")
-        model=$(yaml_unquote "$(get_config_value "model" "$wf_file" 2>/dev/null || echo "")")
-        output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$wf_file" 2>/dev/null || echo "")")
-
-        if [[ -z "$readme" || ! -f "$readme" ]]; then
-            errors+=("README not found: $readme")
-        fi
-        if [[ -z "$spec" || ! -f "$spec" ]]; then
-            errors+=("Spec not found: $spec")
-        fi
-        if [[ -z "$model" ]]; then
-            errors+=("Model not configured in workflow")
-        fi
-        if [[ -z "$output_dir" ]]; then
-            errors+=("Output directory not configured in workflow")
-        fi
-
-        # Prompt quality checks (fail fast before expensive Oracle runs).
-        local prompt_no_impl=""
-        if ! prompt_no_impl=$(build_revision_template "false" "$wf_file") || [[ -z "$prompt_no_impl" ]]; then
-            errors+=("Cannot build template")
-        else
-            if ! prompt_quality_check "$prompt_no_impl" "$wf_file" "template"; then
-                errors+=("$PROMPT_QC_REASON (template)")
-            fi
-        fi
-
-        local prompt_with_impl=""
-        if ! prompt_with_impl=$(build_revision_template "true" "$wf_file") || [[ -z "$prompt_with_impl" ]]; then
-            errors+=("Cannot build template_with_impl")
-        else
-            if ! prompt_quality_check "$prompt_with_impl" "$wf_file" "template_with_impl"; then
-                errors+=("$PROMPT_QC_REASON (template_with_impl)")
-            fi
-        fi
-
-        # Validate the same selected metadata and assembled bytes as execution.
-        # Invalid round arguments must never enter cadence arithmetic.
-        if is_non_negative_int "$round_num"; then
-            if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]] && (( round_num % impl_every_n == 0 )); then
-                include_impl=true
-                impl_reason=impl_every_n
-            fi
-            local manifest prompt
-            if ! manifest=$(build_document_manifest "$readme" "$spec" "$impl" "$include_impl" "$impl_reason"); then
-                errors+=("Cannot observe selected document metadata")
-            elif ! include_impl=$(jq -r '.files[] | select(.role=="implementation") | .included' <<< "$manifest") || \
-                 ! prompt=$(build_revision_prompt "$include_impl" "$wf_file" "$manifest") || [[ -z "$prompt" ]]; then
-                errors+=("Cannot assemble selected prompt")
-            elif ! prompt_quality_check "$prompt" "$wf_file" "assembled prompt"; then
-                errors+=("$PROMPT_QC_REASON (assembled prompt)")
-            fi
-        fi
-    fi
-
-    # Check Oracle
-    if ! command -v oracle &>/dev/null; then
-        if [[ -n "${APR_NO_NPX:-}" ]] || ! command -v npx &>/dev/null; then
-            errors+=("Oracle not available")
-        fi
-    fi
-
-    # Check for previous round if not round 1
-    if is_non_negative_int "$round_num" && [[ "$round_num" -gt 1 ]]; then
-        local prev=$((round_num - 1))
-        local prev_file="$CONFIG_DIR/rounds/$workflow/round_${prev}.md"
-        if [[ ! -f "$prev_file" ]]; then
-            warnings+=("Previous round $prev not found - starting fresh?")
-        fi
-    fi
-
-    local valid=true
-    [[ ${#errors[@]} -gt 0 ]] && valid=false
-
-    local errors_json warnings_json
-    errors_json=$(printf '%s\n' "${errors[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')
-    warnings_json=$(printf '%s\n' "${warnings[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')
-
-    local data
-    data=$(jq -nc \
-        --argjson valid "$valid" \
-        --argjson errors "$errors_json" \
-        --argjson warnings "$warnings_json" \
-        --arg workflow "$workflow" \
-        --arg round "$round_num" \
-        '{valid: $valid, errors: $errors, warnings: $warnings, workflow: $workflow, round: $round}')
-
-    if [[ "$valid" == "true" ]]; then
-        robot_json true "ok" "$data"
-    else
-        local fail_code="validation_failed"
-        # Prefer argument errors over environment/config state. If the user
-        # invokes `apr robot validate` without a round, that's a usage error
-        # regardless of whether .apr is initialized.
-        if [[ -z "$round_num" ]] || ! is_non_negative_int "$round_num"; then
-            fail_code="usage_error"
-        elif [[ ! -d "$CONFIG_DIR" ]]; then
-            fail_code="not_configured"
-        fi
-        robot_fail "$fail_code" "$data" "Fix errors before running"
-    fi
+    local result code data
+    result=$(validate_workflow_local "${WORKFLOW:-default}" "${1:-}" "${INCLUDE_IMPL:-false}") || return $?
+    code=$(jq -r .code <<< "$result")
+    # Keep legacy string arrays for existing clients; typed findings are the
+    # exact canonical result, with no independent validity/Oracle decision.
+    data=$(jq -c '.+{findings:{errors:.errors,warnings:.warnings},errors:[.errors[].message],warnings:[.warnings[].message]}' <<< "$result") || return "$EXIT_CONFIG_ERROR"
+    if [[ "$code" == ok ]]; then robot_json true ok "$data"
+    else robot_fail "$code" "$data" "Fix local workflow findings before running";fi
 }
 
 # Robot: Run - Execute a revision round
 robot_run() (
     local round_num="${1:-}"
+    while [[ "${#round_num}" -gt 1 && "$round_num" == 0* ]]; do round_num="${round_num#0}";done
+    if ! is_non_negative_int "$round_num" || [[ "${#round_num}" -gt 9 ]];then
+        robot_fail usage_error '{"argument":"round"}' "Round must be a non-negative integer of at most nine digits";return $?
+    fi
     local workflow="${WORKFLOW:-default}"
     local include_impl="${INCLUDE_IMPL:-false}"
     local impl_reason=optional
@@ -7423,6 +7480,7 @@ robot_run() (
     APR_LEDGER_RECORD=""
     APR_RUN_OUTPUT=""
     APR_RUN_ERROR_CODE=""
+    APR_RUN_VALIDATION='{}'
     APR_REPLAY_BUNDLE='null'; APR_REPLAY_CONFIG_FILE=''; APR_REPLAY_FILE_ARGS=()
     # Preserve robot's ordinary retry policy unless waiting is explicitly
     # requested. A positive budget/infinite opts its worker into the same loop.
@@ -7452,12 +7510,17 @@ robot_run() (
     trap 'exit 143' TERM
 
     local local_validation validation_code
-    local_validation=$(validate_workflow_local "$workflow" "$round_num" "$include_impl") || return $?
+    if [[ "${APR_NO_LINT:-0}" == 1 ]]; then
+        print_warning "Local lint explicitly bypassed; the run ledger records this choice"
+        local_validation='{"valid":true,"code":"ok","errors":[],"warnings":[]}'
+    else local_validation=$(validate_workflow_local "$workflow" "$round_num" "$include_impl") || return $?;fi
+    APR_RUN_VALIDATION="$local_validation"
     if [[ $(jq -r .valid <<< "$local_validation") != true ]]; then
         validation_code=$(jq -r .code <<< "$local_validation")
         robot_fail "$validation_code" "$local_validation" "Fix local workflow findings before running"
         return $?
     fi
+    if [[ "${APR_NO_LINT:-0}" != 1 ]]; then round_num=$(jq -r .resolved.round <<< "$local_validation"); fi
 
     # Check Oracle
     if ! check_oracle; then
@@ -7475,6 +7538,9 @@ robot_run() (
 
     # Parse config
     local readme_path spec_path impl_path model output_dir impl_every_n thinking_time
+    if [[ "${APR_NO_LINT:-0}" != 1 ]];then
+        validation_apply_resolved "$local_validation" || return $?
+    else
     readme_path=$(yaml_unquote "$(get_config_value "readme" "$config_path")")
     spec_path=$(yaml_unquote "$(get_config_value "spec" "$config_path")")
     impl_path=$(yaml_unquote "$(get_config_value "implementation" "$config_path")")
@@ -7482,10 +7548,11 @@ robot_run() (
     output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$config_path")")
     impl_every_n=$(yaml_unquote "$(get_config_value "impl_every_n" "$config_path")")
     thinking_time=$(yaml_unquote "$(get_config_value "thinking_time" "$config_path")")
+    fi
 
     # Auto-include implementation every N rounds if configured
-    if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]]; then
-        if (( round_num % impl_every_n == 0 )); then
+    if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "${#impl_every_n}" -le 9 ]] && ((10#$impl_every_n > 0)); then
+        if (( 10#$round_num % 10#$impl_every_n == 0 )); then
             verbose "impl_every_n=$impl_every_n: round $round_num triggers automatic impl inclusion"
             include_impl=true
             impl_reason=impl_every_n
@@ -7512,7 +7579,8 @@ robot_run() (
     fi
 
     local manifest manifest_result=0
-    manifest=$(build_document_manifest "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$impl_reason") || manifest_result=$?
+    if [[ "${APR_NO_LINT:-0}" != 1 ]];then manifest=$(jq -c .resolved.manifest <<< "$local_validation") || return "$EXIT_CONFIG_ERROR"
+    else manifest=$(build_document_manifest "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$impl_reason") || manifest_result=$?;fi
     if [[ "$manifest_result" -ne 0 ]]; then
         local manifest_code=config_error
         [[ "$manifest_result" -ne "$EXIT_DEPENDENCY_ERROR" ]] || manifest_code=dependency_missing
@@ -7578,8 +7646,13 @@ robot_run() (
             "Check document metadata and workflow template"
         return $?
     fi
+    if [[ "${APR_NO_LINT:-0}" != 1 ]] &&
+        [[ $(printf '%s' "$prompt" | document_sha256_stdin) != "$(jq -r .resolved.prompt_hash <<< "$local_validation")" ]];then
+        APR_RUN_ERROR_CODE=attachment_mismatch
+        robot_fail attachment_mismatch '{"kind":"template_drift"}' "Template changed after local validation; refusing a different prompt";return $?
+    fi
 
-    if ! prompt_quality_check "$prompt" "$config_path" "prompt"; then
+    if [[ "${APR_NO_LINT:-0}" != 1 ]] && ! prompt_quality_check "$prompt" "$config_path" "prompt"; then
         release_lock 2>/dev/null || true
         robot_fail "validation_failed" "$(jq -nc --arg err "$PROMPT_QC_REASON" '{errors:[$err]}')" \
             "Fix workflow template (remove {{...}} placeholders) before running"
@@ -8093,6 +8166,9 @@ robot_help() {
         options: {
             "-w, --workflow NAME": "Workflow name (default: from config)",
             "-i, --include-impl": "Include implementation document",
+            "--round N": "Round for lint/validate",
+            "--fail-on-warn": "Promote local policy warnings and scan fenced prompt examples",
+            "--no-lint": "Explicitly bypass local lint for run; recorded in ledger",
             "-f, --format FORMAT": "Robot output format: json or toon (env: APR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)",
             "--stats": "Show token savings statistics (JSON vs TOON byte comparison)",
             "--compact": "Minified JSON output"
@@ -8137,6 +8213,13 @@ cmd_robot() {
 
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --fail-on-warn)
+                export APR_FAIL_ON_WARN=1;shift ;;
+            --no-lint)
+                export APR_NO_LINT=1;shift ;;
+            --round)
+                [[ -n "${2:-}" ]] || { robot_fail usage_error '{}' "--round requires an integer";return $?; }
+                LINT_ROUND="$2";shift 2 ;;
             --compact)
                 ROBOT_COMPACT=true
                 shift
@@ -8224,10 +8307,10 @@ cmd_robot() {
             robot_init
             ;;
         validate)
-            robot_validate "${robot_args[0]:-}"
+            robot_validate "${LINT_ROUND:-${robot_args[0]:-}}"
             ;;
         lint)
-            cmd_lint "${robot_args[0]:-1}"
+            cmd_lint "${LINT_ROUND:-${robot_args[0]:-1}}"
             ;;
         replay)
             cmd_replay "${robot_args[@]}"
@@ -8321,7 +8404,10 @@ show_help() {
         gum style --faint "  --wait               Wait for completion (blocking)" >&2
         gum style --faint "  --login              Manual login mode (first-time setup)" >&2
         gum style --faint "  --keep-browser       Keep browser open after completion" >&2
-        gum style --faint "  --no-preflight       Skip pre-flight validation checks" >&2
+        gum style --faint "  --no-preflight       Skip Oracle readiness checks; local lint still applies" >&2
+        gum style --faint "  --round N            Round for lint (default 1)" >&2
+        gum style --faint "  --fail-on-warn       Strict local policy; includes fenced prompt examples" >&2
+        gum style --faint "  --no-lint            Explicit direct-run bypass, recorded in ledger" >&2
         gum style --faint "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         gum style --faint "  --hours NUM          Status window in hours (default: 72)" >&2
         gum style --faint "  --detailed           Show detailed metrics in stats" >&2
@@ -8434,7 +8520,10 @@ show_help() {
         echo "  --wait               Wait for completion (blocking)" >&2
         echo "  --login              Manual login mode (first-time setup)" >&2
         echo "  --keep-browser       Keep browser open after completion" >&2
-        echo "  --no-preflight       Skip pre-flight validation checks" >&2
+        echo "  --no-preflight       Skip Oracle readiness checks; local lint still applies" >&2
+        echo "  --round N            Round for lint (default 1)" >&2
+        echo "  --fail-on-warn       Strict local policy; includes fenced prompt examples" >&2
+        echo "  --no-lint            Explicit direct-run bypass, recorded in ledger" >&2
         echo "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         echo "  --hours NUM          Status window in hours (default: 72)" >&2
         echo "  --detailed           Show detailed metrics in stats" >&2
@@ -8572,6 +8661,13 @@ main() {
 
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --fail-on-warn)
+                export APR_FAIL_ON_WARN=1;shift ;;
+            --no-lint)
+                export APR_NO_LINT=1;shift ;;
+            --round)
+                [[ "$command" == lint && -n "${2:-}" ]] || { print_error "--round requires lint and an integer";return "$EXIT_USAGE_ERROR"; }
+                LINT_ROUND="$2";shift 2 ;;
             -w|--workflow)
                 if [[ -z "${2:-}" || "$2" == -* ]]; then
                     print_error "Option -w requires a workflow name"
@@ -8747,11 +8843,8 @@ main() {
 
     local oracle_required=false
     if [[ "$command_is_round" == "true" || "$command" == "run" ]]; then
-        if [[ "$SHOW_MANIFEST" == true || ( "$DRY_RUN" == "true" && "$RENDER" != "true" ) ]]; then
-            oracle_required=false
-        else
-            oracle_required=true
-        fi
+        # run_round gates local lint before provider discovery/readiness.
+        oracle_required=false
     elif [[ "$command" == "status" || "$command" == "attach" ]]; then
         oracle_required=true
     fi
@@ -8777,18 +8870,13 @@ main() {
         fi
     else
         # Best-effort Oracle detection for dry-run output
-        if [[ "$SHOW_MANIFEST" != true && ( "$command_is_round" == "true" || "$command" == "run" ) ]]; then
-            if ! check_oracle; then
-                ORACLE_CMD=("oracle")
-                [[ "$QUIET_MODE" != "true" ]] && print_warning "Oracle not found; dry run will use a placeholder command"
-            fi
-        fi
+        if [[ "$command_is_round" == true || "$command" == run ]]; then ORACLE_CMD=(oracle);fi
     fi
 
     # Execute command
     case "$command" in
         lint)
-            cmd_lint "${positional_args[0]:-1}"
+            cmd_lint "${LINT_ROUND:-${positional_args[0]:-1}}"
             ;;
         replay)
             cmd_replay "${positional_args[@]}"

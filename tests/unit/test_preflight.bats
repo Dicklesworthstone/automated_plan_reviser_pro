@@ -235,6 +235,12 @@ create_path_without_oracle() {
     ln -s "$(command -v mkdir)" "$mock_bin/mkdir"
     ln -s "$(command -v rm)" "$mock_bin/rm"
     ln -s "$(command -v cat)" "$mock_bin/cat"
+    # Offline validation still needs real metadata/QC tools; only Oracle/npx
+    # are intentionally absent. Missing hashing tools is a different failure.
+    local tool
+    for tool in base64 tr tee wc sha256sum; do
+        ln -s "$(command -v "$tool")" "$mock_bin/$tool"
+    done
 
     echo "$mock_bin"
 }
@@ -391,7 +397,7 @@ assert_json_array_contains() {
 
     log_test_actual "exit code" "$status"
     [[ "$status" -eq 4 ]]
-    [[ "$output" == *"Required file not found"* ]]
+    [[ "$output" == *"README not found: $TEST_PROJECT/MISSING_README.md"* && "$output" == *APR_ERROR_CODE=config_error* ]]
 }
 
 @test "run_round: include_impl with no implementation configured warns and continues" {
@@ -455,7 +461,7 @@ assert_json_array_contains() {
     [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=not_configured"* ]]
 }
 
-@test "robot_validate: workflow not found returns validation_failed" {
+@test "robot_validate: workflow not found returns canonical config_error" {
     mkdir -p ".apr/workflows"
     echo "default_workflow: default" > ".apr/config.yaml"
 
@@ -463,9 +469,9 @@ assert_json_array_contains() {
 
     assert_valid_json "$CAPTURED_STDOUT"
     assert_json_value "$CAPTURED_STDOUT" ".ok" "false"
-    assert_json_value "$CAPTURED_STDOUT" ".code" "validation_failed"
-    assert_json_array_contains "$CAPTURED_STDOUT" ".data.errors" "Workflow 'default' not found"
-    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
+    assert_json_value "$CAPTURED_STDOUT" ".code" "config_error"
+    jq -e 'any(.data.findings.errors[];.source.file==".apr/workflows/default.yaml" and (.hint|length)>0 and .code=="config_error")' <<< "$CAPTURED_STDOUT"
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=config_error"* ]]
 }
 
 @test "robot_validate: README missing populates errors" {
@@ -477,9 +483,9 @@ assert_json_array_contains() {
 
     assert_valid_json "$CAPTURED_STDOUT"
     assert_json_value "$CAPTURED_STDOUT" ".ok" "false"
-    assert_json_value "$CAPTURED_STDOUT" ".code" "validation_failed"
+    assert_json_value "$CAPTURED_STDOUT" ".code" "config_error"
     assert_json_array_contains "$CAPTURED_STDOUT" ".data.errors" "README not found: $TEST_PROJECT/MISSING_README.md"
-    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=config_error"* ]]
 }
 
 @test "robot_validate: spec missing populates errors" {
@@ -491,12 +497,12 @@ assert_json_array_contains() {
 
     assert_valid_json "$CAPTURED_STDOUT"
     assert_json_value "$CAPTURED_STDOUT" ".ok" "false"
-    assert_json_value "$CAPTURED_STDOUT" ".code" "validation_failed"
+    assert_json_value "$CAPTURED_STDOUT" ".code" "config_error"
     assert_json_array_contains "$CAPTURED_STDOUT" ".data.errors" "Spec not found: $TEST_PROJECT/MISSING_SPEC.md"
-    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=config_error"* ]]
 }
 
-@test "robot_validate: oracle missing populates errors" {
+@test "robot_validate: local validity stays usable without Oracle" {
     create_docs
     write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
 
@@ -512,10 +518,10 @@ assert_json_array_contains() {
     export PATH
 
     assert_valid_json "$CAPTURED_STDOUT"
-    assert_json_value "$CAPTURED_STDOUT" ".ok" "false"
-    assert_json_value "$CAPTURED_STDOUT" ".code" "validation_failed"
-    assert_json_array_contains "$CAPTURED_STDOUT" ".data.errors" "Oracle not available"
-    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
+    assert_json_value "$CAPTURED_STDOUT" ".ok" "true"
+    assert_json_value "$CAPTURED_STDOUT" ".code" "ok"
+    jq -e '.data.valid and (.data.errors|length)==0 and (.data.findings.errors|length)==0 and (.data.resolved.prompt_hash|test("^[a-f0-9]{64}$"))' <<< "$CAPTURED_STDOUT"
+    [[ -z "$CAPTURED_STDERR" ]]
 }
 
 @test "robot_validate: previous round missing yields warnings but ok true" {
@@ -1305,7 +1311,7 @@ assert_recorded_document() {
     create_prompt_binding_fixture
     write_workflow_config "$TEST_PROJECT/absent-README.md" "$TEST_PROJECT/SPEC.md"
     capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry
-    [[ "$CAPTURED_STATUS" -eq 4 && "$CAPTURED_STDERR" == *'Pre-flight failed: README not found'* ]]
+    [[ "$CAPTURED_STATUS" -eq 4 && "$CAPTURED_STDERR" == *"README not found: $TEST_PROJECT/absent-README.md"* && "$CAPTURED_STDERR" == *APR_ERROR_CODE=config_error* ]]
     [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
 }
 
@@ -1346,7 +1352,7 @@ assert_recorded_document() {
     printf '\ntemplate: |\n  {{README}}\n  ' >> .apr/workflows/default.yaml
     printf '%98304s\n' '' | tr ' ' x >> .apr/workflows/default.yaml
     capture_streams bash "$APR_SCRIPT" run 1 --render
-    [[ "$CAPTURED_STATUS" -eq 1 && "$CAPTURED_STDERR" == *'Prompt contains unexpanded placeholders'* ]]
+    [[ "$CAPTURED_STATUS" -eq 4 && "$CAPTURED_STDERR" == *'Prompt contains unexpanded placeholders'* && "$CAPTURED_STDERR" == *APR_ERROR_CODE=validation_failed* ]]
     [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
 }
 
@@ -1389,7 +1395,7 @@ assert_recorded_document() {
     [[ "$DRY_RUN" == true ]]
     build_document_manifest() { printf '%s\n' '{"v":1,"files":[{"role":"readme","path":"README.md","basename":"README.md","bytes":1,"sha256":"{{BAD}}","included":true,"reason":"required"},{"role":"spec","path":"SPEC.md","basename":"SPEC.md","bytes":1,"sha256":"ok","included":true,"reason":"required"},{"role":"implementation","path":"IMPL.md","basename":"IMPL.md","included":false,"reason":"optional","skip_reason":"not_requested"}]}'; }
     capture_streams run_round 1
-    [[ "$CAPTURED_STATUS" -eq 1 && "$CAPTURED_STDERR" == *'Prompt contains unexpanded placeholders'* ]]
+    [[ "$CAPTURED_STATUS" -eq 4 && "$CAPTURED_STDERR" == *'Prompt contains unexpanded placeholders'* && "$CAPTURED_STDERR" == *APR_ERROR_CODE=validation_failed* ]]
     [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
 }
 

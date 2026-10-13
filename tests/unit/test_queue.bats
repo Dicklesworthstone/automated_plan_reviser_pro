@@ -75,7 +75,7 @@ EOF
     capture_streams bash "$APR_SCRIPT" robot lint 1 --compact
     [[ "$CAPTURED_STATUS" -eq 4 ]]
     assert_json_value "$CAPTURED_STDOUT" .code validation_failed
-    jq -e 'any(.data.errors[]; .source.label=="template_with_impl" and .source.line==null and .code=="validation_failed")' <<< "$CAPTURED_STDOUT"
+    jq -e 'any(.data.errors[]; .source.label=="template_with_impl" and .source.line==10 and .code=="validation_failed" and .details.hits[0].line==1)' <<< "$CAPTURED_STDOUT"
     [[ ! -f "$APR_QUEUE_PROBES" ]]
     capture_streams bash "$APR_SCRIPT" robot run 1 --compact
     [[ "$CAPTURED_STATUS" -eq 4 && ! -f "$APR_QUEUE_PROBES" ]]
@@ -441,6 +441,33 @@ EOF
     wait "$runner_pid"
     jq -e '.ok and .data.counts.done==1' "$TEST_DIR/first-run.json"
     [[ $(cat "$APR_QUEUE_COUNT") -eq 1 ]]
+}
+
+@test "queue runner: a private terminal published at dead-owner check reconciles without another producer" {
+    queue_test_producer
+    bash "$APR_SCRIPT" queue add 1 --json > "$TEST_DIR/enqueue.json"
+    bash "$APR_SCRIPT" robot queue run --once --compact > "$TEST_DIR/completed.json"
+    local entry record private run_id
+    entry=$(queue_status_data default | jq -c .entries[0])
+    record=.apr/rounds/default/round_1.meta.json
+    run_id=$(jq -r .run_id "$record")
+    private=".apr/runs/default/$run_id/terminal.meta.json"
+    cp "$private" "$TEST_DIR/known-terminal"
+    mv -n "$private" "$TEST_DIR/retained-terminal"
+    cp "$record" "$TEST_DIR/known-canonical"
+    mv -n "$record" "$TEST_DIR/retained-canonical"
+    jq '.state="started"|.owner_pid=99999999|.finished_at=null|.duration_ms=null|.outcome={ok:null,code:null,exit_code:null,oracle_exit_code:null,output_path:null}|del(.output_observation)' "$TEST_DIR/known-canonical" > "$record"
+    ledger_validate < "$record"
+    kill() {
+        [[ "$1" == -0 && "$2" == 99999999 ]] || return 1
+        cp "$TEST_DIR/known-terminal" "$private"
+        return 1
+    }
+    capture_streams queue_observe_run default "$entry"
+    [[ "$CAPTURED_STATUS" -eq 0 && $(cat "$APR_QUEUE_COUNT") -eq 1 ]]
+    jq -e '.record.state=="finished" and .record.outcome.ok and .record.output_observation.bytes>2000' <<< "$CAPTURED_STDOUT"
+    cmp "$TEST_DIR/known-terminal" "$private"
+    cmp "$TEST_DIR/retained-terminal" "$private"
 }
 
 @test "queue runner: explicit busy exhaustion retains pending work and blocks later producer launches" {

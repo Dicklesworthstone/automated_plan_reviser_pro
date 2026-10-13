@@ -1158,10 +1158,59 @@ commands use `ok/code/data/hint/meta`. Local lint returns typed `errors[]` and
 `warnings[]`, source paths, resolved document selection and observed hashes.
 It checks both template variants, selected files and the assembled prompt.
 The queue uses the same locally validated robot execution path and shared
-ledger/output/busy helpers. Existing `robot validate` retains its older diagnostic
-compatibility surface; broader validation-policy convergence remains unfinished.
+ledger/output/busy helpers. `robot validate` uses the same offline decision and
+canonical codes. It preserves legacy message arrays and exposes the identical
+typed core result in `data.findings`. Oracle readiness is checked when execution
+starts, rather than making offline validity depend on an installed provider.
 Queue commands reject preview/render/copy flags before executing or changing
 requests; use `lint` or `run --show-manifest` for an offline preview.
+
+#### Local validation policies
+
+```bash
+apr lint --round 1 --json
+apr robot validate 1 --compact
+apr run 1 --fail-on-warn --wait
+APR_FAIL_ON_WARN=1 apr robot run 1 --compact
+```
+
+Human/robot execution and dry/render previews use the shared local validator
+before provider discovery. Errors identify files, best-effort YAML lines,
+prompt line hits and remediation. Required selected documents must be nonempty.
+By default, selected documents below64 bytes warn; customize per-role scalars
+`readme_warn_bytes`, `spec_warn_bytes`, `implementation_warn_bytes` (for example
+under `lint:`). A zero warning threshold permits intentionally tiny nonempty
+documents. Optional `readme_strict_bytes`, `spec_strict_bytes`, and
+`implementation_strict_bytes` add fatal minimums in strict mode. Thresholds and
+normalized round/cadence values must be nonnegative integers of at most nine
+digits. Invalid policy values are errors even for an unselected document role.
+`--fail-on-warn` or `APR_FAIL_ON_WARN=1` promotes every remaining warning to a
+fatal finding, including a missing prior review.
+
+QC rejects unfilled mustache markers, `${VAR}`/uppercase `$VAR`, high-signal
+`<REPLACE_ME>`/`<INSERT>`/`<FILL_ME>`/`<YOUR_NAME>` markers, `TODO:` and `TBD`.
+Default QC ignores actual backtick/tilde fenced examples; strict mode scans
+their contents. Closing fences must match their opening type and width.
+`APR_QC_SCAN_FENCES=1` enables that scan independently. Explicitly set
+`APR_QC_SHELL_PLACEHOLDERS=0` for literal shell-variable discussions, or
+`APR_QC_IGNORE_QUOTES=1` to skip blockquote examples. For isolated literal
+tokens use newline-separated `APR_QC_ALLOW_TOKENS`; allowing `$FOO` does not
+allow `$FOOBAR`. Legacy `APR_ALLOW_CURLY_PLACEHOLDERS=1` permits curly syntax
+only. Template variants and final generated prompts are checked. JSON-quoted
+manifest filenames escape marker characters without altering actual names;
+authored lines resembling metadata are still checked.
+
+Models outside `5.2 Thinking`/`gpt-5.2-pro` and missing or lighter thinking time
+produce concrete policy warnings. Setup's strong/heavy defaults remain quiet.
+Intentional experiments can set `APR_ALLOW_NONPRO_MODELS=1` and/or
+`APR_ALLOW_LIGHT_THINKING=1`. Run ledgers retain fired policy warnings, override
+categories and strictness, including refused attempts; no environment dump or
+raw prompt is added. These are local quality heuristics, not model-quality proof.
+
+`--no-preflight` skips legacy readiness extras while retaining local lint.
+Direct `run --no-lint` explicitly bypasses local policy, warns, and records
+`validation.bypassed`; required attachment custody and round bounds still apply.
+Queue entries always apply lint, even if the caller set `APR_NO_LINT=1`.
 
 History is `.apr/queue/<workflow>.events.jsonl`: version `1.0.0`, UTC timestamp,
 monotonic sequence, event ID, workflow and entry ID on every whole-line event.

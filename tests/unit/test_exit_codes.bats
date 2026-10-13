@@ -154,11 +154,16 @@ load '../helpers/test_helper.bash'
 
     # Hide oracle/npx from the script. Some environments include npx in /usr/bin,
     # which would otherwise trigger the npx fallback and attempt a real run.
-    run env PATH="/usr/bin:/bin" APR_NO_NPX=1 "$APR_SCRIPT" run 1
+    local offline_bin="$TEST_DIR/offline-tools" tool
+    mkdir "$offline_bin"
+    for tool in bash jq awk date mktemp mkdir cat base64 tr tee wc sha256sum;do
+        ln -s "$(command -v "$tool")" "$offline_bin/$tool"
+    done
+    run env PATH="$offline_bin:/usr/bin:/bin" APR_NO_NPX=1 "$APR_SCRIPT" run 1
 
     # Should fail due to missing Oracle
-    # Exit code 3 (dependency) or include error message about Oracle
-    [[ $status -eq 3 ]] || [[ "$output" =~ [Oo]racle ]]
+    # Both class and diagnostic are required; local metadata tools are present.
+    [[ $status -eq 3 && "$output" =~ [Oo]racle && "$output" == *APR_ERROR_CODE=dependency_missing* ]]
 }
 
 # =============================================================================
@@ -227,7 +232,7 @@ load '../helpers/test_helper.bash'
     assert_json_value "$output" ".data.configured" "true"
 }
 
-@test "apr robot validate with nonexistent workflow returns validation_failed" {
+@test "apr robot validate with nonexistent workflow returns canonical config_error" {
     cd "$TEST_PROJECT"
     "$APR_SCRIPT" robot init >/dev/null
 
@@ -237,8 +242,9 @@ load '../helpers/test_helper.bash'
 
     assert_valid_json "$output"
     assert_json_value "$output" ".ok" "false"
-    assert_json_value "$output" ".code" "validation_failed"
-    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=validation_failed"* ]]
+    assert_json_value "$output" ".code" "config_error"
+    jq -e 'any(.data.findings.errors[];.source.file==".apr/workflows/nonexistent.yaml" and .code=="config_error" and (.hint|length)>0)' <<< "$output"
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=config_error"* ]]
 }
 
 # =============================================================================
