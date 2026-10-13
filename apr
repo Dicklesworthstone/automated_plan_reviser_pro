@@ -2094,6 +2094,8 @@ ledger_validate() {
         (.inputs.status | IN("pending","complete","failed")) and
         (.inputs.files | type=="array") and
         (all(.inputs.files[];
+            (type=="object" and has("role") and has("path") and has("basename") and has("bytes") and
+             has("sha256") and has("included") and has("inclusion_reason") and has("skip_reason")) and
             (.role | IN("readme","spec","implementation")) and
             (.path | type=="string") and (.basename | type=="string") and
             (.included | type=="boolean") and
@@ -2103,10 +2105,17 @@ ledger_validate() {
         (.inputs.prompt_hash | .==null or digest) and
         (if .inputs.status=="complete" then
             (.inputs.prompt_hash | digest) and (.config.sha256 | digest) and
+            (.inputs.files | length)==3 and
+            ([.inputs.files[].role] | unique | length)==3 and
             ([.inputs.files[] | select(.role=="readme" and .included)] | length)==1 and
             ([.inputs.files[] | select(.role=="spec" and .included)] | length)==1 and
             ([.inputs.files[] | select(.role=="implementation")] | length)==1 and
-            (.inputs.manifest | .v==1 and (.files | length)==3)
+            (.inputs.manifest | .v==1 and (.files | type=="array" and length==3) and
+                all(.files[]; type=="object" and has("role") and has("path") and has("basename") and
+                    has("bytes") and has("sha256") and has("included") and has("reason") and has("skip_reason"))) and
+            ((.inputs.files | map({role,path:(.display_path // .path),basename,bytes,sha256,included,
+                reason:.inclusion_reason,skip_reason}) | sort_by(.role)) ==
+             (.inputs.manifest.files | map({role,path,basename,bytes,sha256,included,reason,skip_reason}) | sort_by(.role)))
          else .inputs.prompt_hash==null end) and
         (.invocation | type=="object" and has("engine") and has("model") and has("thinking_time") and
             has("remote_host") and has("oracle_flags_used") and has("oracle_args")) and

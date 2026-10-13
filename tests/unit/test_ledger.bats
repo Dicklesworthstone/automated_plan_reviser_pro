@@ -31,7 +31,7 @@ ledger_complete_fixture() {
         .inputs.files=[{role:"readme",path:"README.md",basename:"README.md",bytes:0,sha256:$hash,included:true,inclusion_reason:"required",skip_reason:null},
             {role:"spec",path:"SPEC.md",basename:"SPEC.md",bytes:0,sha256:$hash,included:true,inclusion_reason:"required",skip_reason:null},
             {role:"implementation",path:"IMPL.md",basename:"IMPL.md",bytes:null,sha256:null,included:false,inclusion_reason:"optional",skip_reason:"not_requested"}] |
-        .inputs.manifest={v:1,files:.inputs.files} | .invocation.model="5.2 Thinking"'
+        .inputs.manifest={v:1,files:(.inputs.files | map(.reason=.inclusion_reason | del(.inclusion_reason)))} | .invocation.model="5.2 Thinking"'
 }
 
 @test "ledger schema: started partial and complete observations are valid" {
@@ -84,4 +84,13 @@ ledger_complete_fixture() {
         run ledger_validate <<< "$(ledger_complete_fixture | jq "$mutation")"
         [[ "$status" -ne 0 ]]
     done
+}
+
+@test "ledger schema: complete file manifest binding rejects extra missing or contradictory rows" {
+    local mutation
+    for mutation in '.inputs.files += [.inputs.files[2] | .role="readme"]' 'del(.inputs.files[2].bytes)' 'del(.inputs.files[0].skip_reason)' '.inputs.manifest.files={a:1,b:2,c:3}' '.inputs.manifest.files[0].sha256=("0"*64)' '.inputs.manifest.files[0].reason="optional"'; do
+        run ledger_validate <<< "$(ledger_complete_fixture | jq "$mutation")"
+        [[ "$status" -ne 0 ]]
+    done
+    ledger_complete_fixture | jq '.inputs.files[0].display_path=.inputs.files[0].path | .inputs.files[0].path="/configured/project/README.md"' | ledger_validate
 }

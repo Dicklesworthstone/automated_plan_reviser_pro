@@ -1025,6 +1025,11 @@ one README, one specification and one implementation row (possibly skipped),
 the manifest and the final prompt hash. Metadata failures may retain partial
 observations with `inputs.status: "failed"`; they never claim a complete bundle.
 Input hashes remain local observations rather than immutable sent bytes.
+The inline manifest retains the shared helper's `reason` and display path;
+ledger file rows use `inclusion_reason` and the configured path. An optional
+`display_path` records a differing normalized display name. After that explicit
+mapping, all three rows must agree on role, basename, bytes, hash, inclusion and
+skip reason; an unrelated three-row manifest is invalid.
 
 Started records have null finish/duration and null outcome `ok/code/exit_code`.
 Successful records require `state: "finished"`, complete observed inputs,
