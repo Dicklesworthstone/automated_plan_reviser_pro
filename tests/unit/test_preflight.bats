@@ -1148,6 +1148,31 @@ assert_recorded_files() {
     cmp "$TEST_DIR/expected-files-$record" "$APR_FIXTURE_PROMPT_DIR/files-$record"
 }
 
+# Real execution now consumes independent retained copies. Preserve the old
+# selection/order/content contract and additionally bind actual NUL argv to
+# snapshot role/basename, logical source identity and independently read bytes.
+# Render/dry-run keep assert_recorded_files and their configured-path contract.
+assert_recorded_snapshot_files() {
+    local record="$1" actual source role bundle expected index=0
+    shift
+    local arguments=()
+    while IFS= read -r -d '' actual; do arguments+=("$actual"); done < "$APR_FIXTURE_PROMPT_DIR/files-$record"
+    [[ "${#arguments[@]}" -eq "$#" ]]
+    for source in "$@"; do
+        actual="${arguments[$index]}"
+        role=readme
+        if [[ "$index" -gt 0 ]]; then role=spec; [[ "$#" -ne 3 || "$index" -ne 1 ]] || role=implementation; fi
+        [[ "$actual" == .apr/runs/default/*/inputs/"$role"/"${source##*/}" ]]
+        bundle="${actual%/inputs/*}/inputs/bundle.json"
+        expected=$(jq -r --arg role "$role" --arg source "$source" '.files[]|select(.role==$role and .source_path==$source)|.snapshot_path' "$bundle")
+        [[ "$actual" == "${actual%/inputs/*}/$expected" && -f "$actual" && ! -L "$actual" ]]
+        cmp "$source" "$actual"
+        jq -e --arg role "$role" --arg hash "$(document_sha256_stdin < "$source")" --argjson bytes "$(wc -c < "$source" | tr -d ' ')" \
+            'any(.files[];.role==$role and .sha256==$hash and .bytes==$bytes)' "$bundle"
+        index=$((index+1))
+    done
+}
+
 assert_recorded_document() {
     local record="$1" role="$2" path="$3" reason="$4" digest bytes
     digest=$(shasum -a 256 < "$path")
@@ -1164,7 +1189,7 @@ assert_recorded_document() {
     printf '\000\377A\r\n\n' > README.md
     capture_streams bash "$APR_SCRIPT" run 1 --include-impl --wait --no-retry --no-preflight
     [[ "$CAPTURED_STATUS" -eq 0 && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
-    assert_recorded_files 1 "$TEST_PROJECT/README.md" "$TEST_PROJECT/IMPL.md" "$TEST_PROJECT/SPEC.md"
+    assert_recorded_snapshot_files 1 "$TEST_PROJECT/README.md" "$TEST_PROJECT/IMPL.md" "$TEST_PROJECT/SPEC.md"
     assert_recorded_document 1 readme README.md required
     assert_recorded_document 1 implementation IMPL.md optional
     assert_recorded_document 1 spec SPEC.md required
@@ -1181,7 +1206,7 @@ assert_recorded_document() {
     [[ "$CAPTURED_STATUS" -eq 0 && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
     assert_json_value "$CAPTURED_STDOUT" '.data.status' completed
     assert_json_value "$CAPTURED_STDOUT" '.data.include_impl' false
-    assert_recorded_files 1 "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    assert_recorded_snapshot_files 1 "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
     assert_recorded_document 1 readme README.md required
     assert_recorded_document 1 spec SPEC.md required
     [[ "$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-1")" == *'skipped=not_requested; reason=optional'* ]]
@@ -1201,7 +1226,7 @@ assert_recorded_document() {
     capture_streams bash "$APR_SCRIPT" robot run 4 --compact
     [[ "$CAPTURED_STATUS" -eq 0 && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
     assert_json_value "$CAPTURED_STDOUT" '.data.include_impl' true
-    assert_recorded_files 2 "$TEST_PROJECT/README.md" "$TEST_PROJECT/IMPL.md" "$TEST_PROJECT/SPEC.md"
+    assert_recorded_snapshot_files 2 "$TEST_PROJECT/README.md" "$TEST_PROJECT/IMPL.md" "$TEST_PROJECT/SPEC.md"
     cmp "$APR_FIXTURE_PROMPT_DIR/prompt-1" "$APR_FIXTURE_PROMPT_DIR/prompt-2"
 }
 

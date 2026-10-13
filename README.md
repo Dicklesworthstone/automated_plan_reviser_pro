@@ -1051,8 +1051,8 @@ Oracle status is retained separately from the caller exit; legacy human and
 robot exits may differ until the broader error-contract work is complete.
 
 Remote hosts contain only host/port authority, never user information, URLs,
-query parameters or tokens. No environment dump, raw configuration contents,
-cookies or prompt text is stored. Oracle arguments redact authentication values
+query parameters or tokens. Ledger metadata embeds no environment dump, raw
+configuration, cookies or prompt body. Oracle arguments redact authentication values
 and the prompt body; the prompt hash binds the latter. Attempt counts include
 every actual producer launch; retry counts exclude busy-policy retries. Busy
 wait duration measures status-probe/sleep time, not useful model execution, at
@@ -1093,8 +1093,49 @@ in the redacted ledger or public JSON.
 
 Successful runs also retain `output_observation.sha256` and `bytes`. Queue
 execution adds `queue_entry_id`, binding the actual run to its durable request.
-Input observations still cannot reproduce changed or missing documents;
-immutable sent-bundle replay remains unfinished under its original Bead.
+New executions retain a private input bundle for deterministic local replay
+after original files or templates change or disappear. This pins local producer
+input bytes; it does not establish live model acknowledgement.
+
+### Exact Input Replay
+
+```bash
+apr replay 4 --json                    # Validate saved bundle; metadata only
+apr replay 4 --json --include-bytes    # Export exact prompt/doc bytes as base64
+apr robot replay 4 --compact
+apr replay .apr/runs/default/<run-id>/terminal.meta.json --json
+```
+
+Each real human/robot/queue execution captures selected independent document
+copies under `.apr/runs/<workflow>/<run-id>/inputs/<role>/<original-basename>`.
+Role directories distinguish duplicate basenames. Every producer and retry uses
+those saved paths and the same final prompt, preserving configured/display
+identity, inclusion reason and file order in metadata. Capture verifies the
+accepted document hashes and resolved routing/selection; conflicting concurrent
+changes fail before a producer. Previews still create no execution bundle.
+
+The private `prompt.txt` preserves the exact `-p` bytes. A safe `config.yaml`
+retains APR-applied scalars and template blocks, excluding unknown authentication
+keys and unrelated comments. Its digest is distinct from the digest of the
+single observed original configuration stream. `bundle.json` binds run identity,
+the manifest, saved file sizes/hashes, safe resolved configuration and prompt
+digest. Ledger `replay` references that completed descriptor by path and SHA256;
+public metadata contains no raw input/configuration/prompt body or credentials.
+Saved files have private, read-only modes. Partial failed captures are retained.
+
+Replay resolves the bundle relative to the retained canonical/private record,
+including historical generations and invocation from another working directory.
+It validates every saved file/hash and run/manifest binding, refuses symlinks,
+and never rebuilds with current templates or falls back to changed live files.
+Legacy hash-only records, missing snapshots and changed saved bytes fail clearly.
+No Oracle, package fallback, update probe, network call or paid review occurs.
+
+`--include-bytes` explicitly exports private document and prompt contents; keep
+that export private. Without it, both human and robot JSON report verified
+metadata only. Original raw configuration is not exported. This reproduces
+local producer inputs, including binary bytes and trailing newlines, rather
+than promising identical future model responses, browser/model ACK, authenticated
+custody against an owner rewriting hashes, or power-loss durability.
 
 ### Persistent Queue and Local Lint
 

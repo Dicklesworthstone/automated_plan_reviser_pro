@@ -1859,10 +1859,20 @@ get_config_value() {
                 line = $0
                 sub("^[[:space:]]*" key ":[[:space:]]*", "", line)
                 sub(/[[:space:]]*$/, "", line)
-                if (line !~ /^["\047]/) {
-                    sub(/[[:space:]]+#.*$/, "", line)
-                    sub(/[[:space:]]*$/, "", line)
+                quote=""; escaped=0; start=1
+                if(substr(line,1,1)=="\"" || substr(line,1,1)=="\047") {quote=substr(line,1,1);start=2}
+                for(i=start;i<=length(line);i++) {
+                    c=substr(line,i,1)
+                    if(escaped) {escaped=0;continue}
+                    if(quote=="\"" && c=="\\") {escaped=1;continue}
+                    if(quote!="") {
+                        if(c==quote) {
+                            if(quote=="\047" && substr(line,i+1,1)=="\047") {i++;continue}
+                            quote=""
+                        }
+                    } else if(c=="#" && i>1 && substr(line,i-1,1)~/[[:space:]]/) {line=substr(line,1,i-1);break}
                 }
+                sub(/[[:space:]]*$/, "", line)
                 print line
                 exit
             }
@@ -2825,14 +2835,214 @@ ledger_redact_args() {
 
 # Call only with the shared manifest and exact final -p bytes selected for this
 # producer. Paths describe configured inputs; hashes remain local observations.
+APR_REPLAY_BUNDLE='null'
+APR_REPLAY_CONFIG_FILE=''
+APR_REPLAY_SOURCE_CONFIG_HASH=''
+APR_REPLAY_FILE_ARGS=()
+
+# Verification and export consume one identical byte stream. Encoded payloads
+# go through stdin, never shell argv; binary bytes and large bundles survive.
+apr_observe_stream() {
+    local source="$1" encode="${2:-false}" digest bytes encoded
+    # Read the source once. All subsequent observations decode this exact
+    # captured stream, never reopen a changing source or mix collector writes.
+    encoded=$(base64 < "$source" | tr -d '\r\n') || return "$EXIT_CONFIG_ERROR"
+    digest=$(printf '%s' "$encoded" | base64 --decode | document_sha256_stdin) || return "$EXIT_CONFIG_ERROR"
+    bytes=$(printf '%s' "$encoded" | base64 --decode | LC_ALL=C wc -c) || return "$EXIT_CONFIG_ERROR"
+    bytes="${bytes//[[:space:]]/}"
+    [[ "$digest" =~ ^[a-f0-9]{64}$ && "$bytes" =~ ^[0-9]+$ ]] || return "$EXIT_CONFIG_ERROR"
+    printf '%s' "$encoded" | jq -Rsc --arg hash "$digest" --argjson bytes "$bytes" --argjson encode "$encode" \
+        '{sha256:$hash,bytes:$bytes}+(if $encode then {base64:.} else {} end)'
+}
+
+# Serialize only values/templates APR actually applies, once each. Unused
+# credential objects, duplicate keys and outside comments never get retained.
+apr_capture_config() {
+    local source="$1" destination="$2" observation raw field value template
+    observation=$(apr_observe_stream "$source" true) || return $?
+    APR_REPLAY_SOURCE_CONFIG_HASH=$(jq -r .sha256 <<< "$observation")
+    raw=$(jq -r .base64 <<< "$observation" | base64 --decode) || return "$EXIT_CONFIG_ERROR"
+    {
+        for field in readme spec implementation model thinking_time output_dir impl_every_n; do
+            value=$(get_config_value "$field" - <<< "$raw") || return "$EXIT_CONFIG_ERROR"
+            value=$(yaml_unquote "$value") || return "$EXIT_CONFIG_ERROR"
+            printf '%s: %s\n' "$field" "$(yaml_quote "$value")" || return "$EXIT_CONFIG_ERROR"
+        done
+        for field in template template_with_impl; do
+            template=$(get_yaml_block "$field" - <<< "$raw") || return "$EXIT_CONFIG_ERROR"
+            [[ -n "$template" ]] || continue
+            printf '%s: |\n' "$field"
+            printf '%s\n' "$template" | sed 's/^/  /' || return "$EXIT_CONFIG_ERROR"
+        done
+    } > "$destination"
+}
+
+apr_replay_observe_file() {
+    local path="$1" row="$2" encode="${3:-false}" observation
+    observation=$(apr_observe_stream "$path" "$encode") || return $?
+    printf '%s' "$observation" | jq -ce --argjson row "$row" --arg path "$path" '
+        select(.bytes==$row.bytes and .sha256==$row.sha256) |
+        $row+{snapshot_path:$path}+(if has("base64") then {base64:.base64} else {} end)' || return "$EXIT_CONFIG_ERROR"
+}
+
+apr_capture_replay_bundle() {
+    local config="$1" manifest="$2" prompt="$3" expected="$4" root="$APR_LEDGER_DIR/inputs"
+    local captured field value resolved='{}' role source copy_source basename target row metadata documents='[]' prompt_metadata config_metadata bundle candidate
+    APR_REPLAY_BUNDLE='null'; APR_REPLAY_CONFIG_FILE=''; APR_REPLAY_SOURCE_CONFIG_HASH=''; APR_REPLAY_FILE_ARGS=()
+    umask 077
+    [[ ! -e "$root" && ! -L "$root" ]] || return "$EXIT_CONFIG_ERROR"
+    mkdir "$root" || return "$EXIT_CONFIG_ERROR"
+    captured="$root/config.yaml"
+    apr_capture_config "$config" "$captured" || return $?
+    for field in readme spec implementation model thinking_time output_dir impl_every_n; do
+        value=$(get_config_value "$field" "$captured") || return "$EXIT_CONFIG_ERROR"
+        value=$(yaml_unquote "$value") || return "$EXIT_CONFIG_ERROR"
+        resolved=$(jq -nc --argjson resolved "$resolved" --arg key "$field" --arg value "$value" '$resolved+{($key):$value}') || return "$EXIT_CONFIG_ERROR"
+    done
+    if [[ $(jq -cS . <<< "$resolved") != "$(jq -cS . <<< "$expected")" ]]; then
+        print_error "Workflow routing or selection changed before input capture; retained the attempted bundle"
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    # Match the accepted observation instead of silently refreshing a changing
+    # source. Copies are independent inodes; retries receive only these paths.
+    for role in readme implementation spec; do
+        row=$(jq -c --arg role "$role" '.files[]|select(.role==$role and .included)' <<< "$manifest") || return "$EXIT_CONFIG_ERROR"
+        [[ -n "$row" ]] || continue
+        source=$(jq -r --arg role "$role" 'if $role=="readme" then .readme elif $role=="spec" then .spec else .implementation end' <<< "$resolved")
+        basename=$(jq -r '.basename+"."' <<< "$row"); basename="${basename%.}"
+        [[ -n "$basename" && "$basename" != . && "$basename" != .. && "$basename" != */* ]] || return "$EXIT_CONFIG_ERROR"
+        mkdir "$root/$role" || return "$EXIT_CONFIG_ERROR"
+        target="$root/$role/$basename"
+        copy_source="$source"
+        [[ "$copy_source" == /* ]] || copy_source="./$copy_source"
+        cp "$copy_source" "$target" || return "$EXIT_CONFIG_ERROR"
+        metadata=$(document_file_metadata "$target" "$role" required) || return $?
+        if ! jq -ne --argjson row "$row" --argjson copy "$metadata" '$row.bytes==$copy.bytes and $row.sha256==$copy.sha256' >/dev/null; then
+            print_error "Selected $role bytes changed before capture; refusing a different bundle"
+            return "$EXIT_CONFIG_ERROR"
+        fi
+        documents=$(jq -nc --argjson documents "$documents" --argjson row "$row" --arg source "$source" --arg path "inputs/$role/$basename" \
+            '$documents+[$row+{source_path:$source,snapshot_path:$path}]') || return "$EXIT_CONFIG_ERROR"
+        APR_REPLAY_FILE_ARGS+=(--file "$target")
+        chmod 400 "$target" || return "$EXIT_CONFIG_ERROR"
+    done
+    local effective captured_prompt
+    effective=$(jq -r '.files[]|select(.role=="implementation")|.included' <<< "$manifest")
+    captured_prompt=$(build_revision_prompt "$effective" "$captured" "$manifest") || return "$EXIT_CONFIG_ERROR"
+    if [[ "$captured_prompt" != "$prompt" ]]; then
+        print_error "Selected template changed before capture; refusing a different prompt"
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    prompt_quality_check "$captured_prompt" "$captured" prompt || return "$EXIT_CONFIG_ERROR"
+    printf '%s' "$prompt" > "$root/prompt.txt" || return "$EXIT_CONFIG_ERROR"
+    prompt_metadata=$(document_file_metadata "$root/prompt.txt" readme required) || return $?
+    config_metadata=$(document_file_metadata "$captured" readme required) || return $?
+    bundle=$(jq -nc --arg id "$APR_LEDGER_RUN_ID" --arg workflow "$APR_RUN_WORKFLOW" --arg round "$APR_RUN_ROUND" \
+        --argjson manifest "$manifest" --argjson documents "$documents" --argjson config "$config_metadata" \
+        --argjson resolved "$resolved" --argjson prompt "$prompt_metadata" --arg source_hash "$APR_REPLAY_SOURCE_CONFIG_HASH" \
+        '{schema_version:"1.0.0",run_id:$id,workflow:$workflow,round:($round|tonumber),manifest:$manifest,files:$documents,
+          config:{snapshot_path:"inputs/config.yaml",bytes:$config.bytes,sha256:$config.sha256,source_sha256:$source_hash,resolved:$resolved},
+          prompt:{snapshot_path:"inputs/prompt.txt",bytes:$prompt.bytes,sha256:$prompt.sha256}}') || return "$EXIT_CONFIG_ERROR"
+    printf '%s\n' "$bundle" > "$root/bundle.json" || return "$EXIT_CONFIG_ERROR"
+    metadata=$(document_file_metadata "$root/bundle.json" readme required) || return $?
+    APR_REPLAY_BUNDLE=$(jq -nc --arg hash "$(jq -r .sha256 <<< "$metadata")" \
+        '{schema_version:"1.0.0",snapshot_path:"inputs/bundle.json",sha256:$hash}') || return "$EXIT_CONFIG_ERROR"
+    chmod 400 "$captured" "$root/prompt.txt" "$root/bundle.json" || return "$EXIT_CONFIG_ERROR"
+    APR_REPLAY_CONFIG_FILE="$captured"
+    # Keep the replay descriptor in the started ledger before a producer can
+    # launch. ledger_bind_inputs will bind the same saved prompt/config bytes.
+    candidate=$(umask 077; mktemp "${APR_LEDGER_FILE%/*}/.ledger-bundle.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    jq -c --argjson bundle "$APR_REPLAY_BUNDLE" '.replay=$bundle' "$APR_LEDGER_RECORD" > "$candidate" || return "$EXIT_CONFIG_ERROR"
+    ledger_publish "$candidate" || return $?
+    APR_LEDGER_RECORD="$candidate"
+}
+
+apr_replay_data() {
+    local record_path="$1" include_bytes="${2:-false}" record workflow id parent config_root run_dir bundle_file bundle row path observation files prompt config
+    [[ "$record_path" == /* ]] || record_path="$PWD/$record_path"
+    [[ -f "$record_path" && -r "$record_path" && ! -L "$record_path" ]] || return "$EXIT_CONFIG_ERROR"
+    record=$(cat "$record_path") || return "$EXIT_CONFIG_ERROR"
+    ledger_validate <<< "$record" || return "$EXIT_CONFIG_ERROR"
+    workflow=$(jq -r .workflow <<< "$record"); id=$(jq -r .run_id <<< "$record")
+    [[ "$id" =~ ^[A-Za-z0-9_.-]+$ && "$id" != . && "$id" != .. ]] || return "$EXIT_CONFIG_ERROR"
+    if ! jq -e '.replay.schema_version=="1.0.0" and .replay.snapshot_path=="inputs/bundle.json" and (.replay.sha256|test("^[a-f0-9]{64}$"))' <<< "$record" >/dev/null; then
+        print_error "This record has no retained input bundle; replay will not fall back to current files"
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    parent=$(cd "${record_path%/*}" && pwd -P) || return "$EXIT_CONFIG_ERROR"
+    if [[ "$parent" == */rounds/"$workflow" ]]; then config_root="${parent%/rounds/"$workflow"}"
+    elif [[ "${parent%/*}" == */runs/"$workflow" ]]; then config_root="${parent%/runs/"$workflow"/*}"
+    else return "$EXIT_CONFIG_ERROR"; fi
+    run_dir="$config_root/runs/$workflow/$id"
+    for path in "$config_root/runs" "$config_root/runs/$workflow" "$run_dir" "$run_dir/inputs"; do
+        [[ -d "$path" && ! -L "$path" ]] || return "$EXIT_CONFIG_ERROR"
+    done
+    bundle_file="$run_dir/inputs/bundle.json"
+    [[ -f "$bundle_file" && ! -L "$bundle_file" ]] || return "$EXIT_CONFIG_ERROR"
+    observation=$(apr_observe_stream "$bundle_file" true) || return $?
+    [[ $(jq -r .sha256 <<< "$observation") == "$(jq -r .replay.sha256 <<< "$record")" ]] || return "$EXIT_CONFIG_ERROR"
+    bundle=$(jq -r .base64 <<< "$observation" | base64 --decode | jq -sce 'select(length==1 and (.[0]|type=="object"))|.[0]') || return "$EXIT_CONFIG_ERROR"
+    jq -e --arg wf "$workflow" --arg id "$id" --argjson round "$(jq .round <<< "$record")" --argjson record "$record" '
+        .schema_version=="1.0.0" and .workflow==$wf and .run_id==$id and .round==$round and
+        .manifest==$record.inputs.manifest and .prompt.snapshot_path=="inputs/prompt.txt" and
+        .prompt.sha256==$record.inputs.prompt_hash and .config.snapshot_path=="inputs/config.yaml" and
+        .config.source_sha256==$record.config.sha256 and (.files|type=="array") and
+        ([.files[].role]|unique|length)==(.files|length) and
+        ([.files[]|del(.snapshot_path,.source_path)]|sort_by(.role))==([.manifest.files[]|select(.included)]|sort_by(.role)) and
+        all(.files[];(.role|IN("readme","spec","implementation")) and .snapshot_path==("inputs/"+.role+"/"+.basename) and
+            (.basename|type=="string" and length>0 and .!="." and .!=".." and (contains("/")|not)) and
+            (. as $file | .source_path==($record.inputs.files[]|select(.role==$file.role)|.path)))
+    ' <<< "$bundle" >/dev/null || return "$EXIT_CONFIG_ERROR"
+    files=$(
+      while IFS= read -r row; do
+        path=$(jq -r '.snapshot_path+"."' <<< "$row"); path="${path%.}"
+        [[ ! -L "$run_dir/inputs/$(jq -r .role <<< "$row")" && -f "$run_dir/$path" && ! -L "$run_dir/$path" ]] || return "$EXIT_CONFIG_ERROR"
+        apr_replay_observe_file "$run_dir/$path" "$row" "$include_bytes" || return $?
+      done < <(jq -c '.files[]' <<< "$bundle") | jq -sc .
+    ) || return "$EXIT_CONFIG_ERROR"
+    for path in prompt config; do
+        row=$(jq -c --arg key "$path" '.[$key]' <<< "$bundle")
+        local snapshot; snapshot=$(jq -r .snapshot_path <<< "$row")
+        [[ -f "$run_dir/$snapshot" && ! -L "$run_dir/$snapshot" ]] || return "$EXIT_CONFIG_ERROR"
+        if [[ "$path" == prompt ]]; then prompt=$(apr_replay_observe_file "$run_dir/$snapshot" "$row" "$include_bytes") || return $?
+        else apr_replay_observe_file "$run_dir/$snapshot" "$row" false > /dev/null || return $?; fi
+    done
+    config=$(jq -c '.config.resolved|{readme,spec,implementation,model,thinking_time,output_dir,impl_every_n}' <<< "$bundle")
+    printf '%s\n%s\n' "$files" "$prompt" | jq -sc --arg wf "$workflow" --arg id "$id" --argjson round "$(jq .round <<< "$record")" \
+        --argjson config "$config" --argjson manifest "$(jq -c .manifest <<< "$bundle")" \
+        '{schema_version:"1.0.0",workflow:$wf,round:$round,run_id:$id,manifest:$manifest,resolved_config:$config,prompt:.[1],files:.[0]}'
+}
+
+cmd_replay() {
+    local argument="${1:-}" record result=0 data code=ok
+    if ! command -v jq >/dev/null 2>&1; then print_error "Replay requires jq"; apr_emit_error_code_tag dependency_missing; return "$EXIT_DEPENDENCY_ERROR"; fi
+    if [[ "$#" -ne 1 || -z "$argument" ]]; then result=$EXIT_USAGE_ERROR
+    elif is_non_negative_int "$argument"; then record="$CONFIG_DIR/rounds/${WORKFLOW:-default}/round_${argument}.meta.json"
+    else record="$argument"; fi
+    if [[ "$result" -eq 0 ]]; then data=$(apr_replay_data "$record" "${REPLAY_INCLUDE_BYTES:-false}") || result=$?; fi
+    if [[ "$result" -ne 0 ]]; then
+        code=validation_failed; [[ "$result" -ne 2 ]] || code=usage_error
+        if [[ "$ROBOT_MODE" == true ]]; then robot_fail "$code" '{"kind":"replay_unavailable"}' "Use a retained canonical/private record with an intact input bundle"; return $?; fi
+        print_error "Cannot replay the retained input bundle"; apr_emit_error_code_tag "$code"; return "$result"
+    fi
+    if [[ "$ROBOT_MODE" == true ]]; then robot_json true ok "$data"
+    elif [[ "${STATS_JSON:-false}" == true ]]; then printf '%s\n' "$data"
+    else
+        jq -r '"Retained input bundle: \(.workflow) round \(.round), run \(.run_id)",(.files[]|"\(.role): \(.snapshot_path) (\(.bytes) bytes)")' <<< "$data" >&2
+        print_info "Use --json --include-bytes to export exact prompt/document bytes; keep that export private"
+    fi
+}
+
 ledger_bind_inputs() {
     local manifest="$1" prompt="$2" readme="$3" spec="$4" implementation="$5" model="$6" thinking="$7"
     shift 7
     local config_path config_hash prompt_hash invocation candidate result=0 authority
     [[ -n "$APR_LEDGER_RECORD" ]] || return "$EXIT_CONFIG_ERROR"
     config_path=$(jq -r '.config.path // empty' "$APR_LEDGER_RECORD") || return "$EXIT_CONFIG_ERROR"
+    [[ -z "$APR_REPLAY_CONFIG_FILE" ]] || config_path="$APR_REPLAY_CONFIG_FILE"
     [[ -n "$config_path" && -f "$config_path" && -r "$config_path" ]] || return "$EXIT_CONFIG_ERROR"
     config_hash=$(document_sha256_stdin < "$config_path") || return "$EXIT_CONFIG_ERROR"
+    [[ -z "$APR_REPLAY_SOURCE_CONFIG_HASH" ]] || config_hash="$APR_REPLAY_SOURCE_CONFIG_HASH"
     prompt_hash=$(printf '%s' "$prompt" | document_sha256_stdin) || return "$EXIT_CONFIG_ERROR"
     invocation=$(ledger_redact_args "$@") || return "$EXIT_CONFIG_ERROR"
     authority=$(ledger_remote_authority "${ORACLE_REMOTE_HOST:-}")
@@ -4393,6 +4603,7 @@ run_round() (
     APR_LEDGER_RECORD=""
     APR_RUN_ERROR_CODE=""
     APR_RUN_OUTPUT=""
+    APR_REPLAY_BUNDLE='null'; APR_REPLAY_CONFIG_FILE=''; APR_REPLAY_FILE_ARGS=()
     if [[ "$show_manifest" != true && "$dry_run" != true && "$render" != true ]]; then
         APR_RUN_ACTIVE=true
         APR_RUN_ROUND="$round_num"
@@ -4688,6 +4899,17 @@ run_round() (
         return "$begin_result"
     fi
     output_file="$APR_RUN_OUTPUT_PATH"
+
+    local replay_expected replay_result=0
+    replay_expected=$(jq -nc --arg readme "$readme_path" --arg spec "$spec_path" --arg implementation "$impl_path" \
+        --arg model "$model" --arg thinking_time "$thinking_time" --arg output_dir "$output_dir" --arg impl_every_n "$impl_every_n" \
+        '{readme:$readme,spec:$spec,implementation:$implementation,model:$model,thinking_time:$thinking_time,output_dir:$output_dir,impl_every_n:$impl_every_n}') || return "$EXIT_CONFIG_ERROR"
+    apr_capture_replay_bundle "$config_path" "$manifest" "$prompt" "$replay_expected" || replay_result=$?
+    if [[ "$replay_result" -ne 0 ]]; then
+        APR_RUN_ERROR_CODE=attachment_mismatch; apr_emit_error_code_tag attachment_mismatch
+        return "$replay_result"
+    fi
+    file_args=("${APR_REPLAY_FILE_ARGS[@]}")
 
     # Build Oracle command
     local oracle_args=(
@@ -6853,22 +7075,20 @@ robot_json() {
 
     local result
     if [[ -n "$hint" ]]; then
-        result=$(jq -nc \
+        result=$(printf '%s' "$data" | jq -c \
             --argjson ok "$ok" \
             --arg code "$code" \
-            --argjson data "$data" \
             --arg hint "$hint" \
             --arg v "$VERSION" \
             --arg ts "$ts" \
-            '{ok: $ok, code: $code, data: $data, hint: $hint, meta: {v: $v, ts: $ts}}')
+            '{ok: $ok, code: $code, data: ., hint: $hint, meta: {v: $v, ts: $ts}}')
     else
-        result=$(jq -nc \
+        result=$(printf '%s' "$data" | jq -c \
             --argjson ok "$ok" \
             --arg code "$code" \
-            --argjson data "$data" \
             --arg v "$VERSION" \
             --arg ts "$ts" \
-            '{ok: $ok, code: $code, data: $data, meta: {v: $v, ts: $ts}}')
+            '{ok: $ok, code: $code, data: ., meta: {v: $v, ts: $ts}}')
     fi
 
     if [[ "${ROBOT_FORMAT:-json}" == "toon" ]]; then
@@ -7203,6 +7423,7 @@ robot_run() (
     APR_LEDGER_RECORD=""
     APR_RUN_OUTPUT=""
     APR_RUN_ERROR_CODE=""
+    APR_REPLAY_BUNDLE='null'; APR_REPLAY_CONFIG_FILE=''; APR_REPLAY_FILE_ARGS=()
     # Preserve robot's ordinary retry policy unless waiting is explicitly
     # requested. A positive budget/infinite opts its worker into the same loop.
     local ORACLE_BUSY_WAIT_SECONDS="$ORACLE_BUSY_WAIT_SECONDS"
@@ -7385,6 +7606,19 @@ robot_run() (
         --heartbeat 30
         -p "$prompt"
     )
+
+    local replay_expected replay_result=0
+    replay_expected=$(jq -nc --arg readme "$readme_path" --arg spec "$spec_path" --arg implementation "$impl_path" \
+        --arg model "$model" --arg thinking_time "$thinking_time" --arg output_dir "$output_dir" --arg impl_every_n "$impl_every_n" \
+        '{readme:$readme,spec:$spec,implementation:$implementation,model:$model,thinking_time:$thinking_time,output_dir:$output_dir,impl_every_n:$impl_every_n}') || return "$EXIT_CONFIG_ERROR"
+    apr_capture_replay_bundle "$config_path" "$manifest" "$prompt" "$replay_expected" || replay_result=$?
+    if [[ "$replay_result" -ne 0 ]]; then
+        APR_RUN_ERROR_CODE=attachment_mismatch
+        robot_fail attachment_mismatch '{"kind":"input_capture"}' "Accepted inputs changed or could not be retained; inspect the private attempt before retrying"
+        return $?
+    fi
+    oracle_args=(--engine browser -m "$model" "${APR_REPLAY_FILE_ARGS[@]}" --browser-attachments never --slug "$slug" \
+        --write-output "$APR_RUN_OUTPUT" --files-report --heartbeat 30 -p "$prompt")
 
     [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && oracle_args+=(--notify)
     [[ -z "$thinking_time" ]] || oracle_args+=(--browser-thinking-time "$thinking_time")
@@ -7846,6 +8080,7 @@ robot_help() {
             init: "Initialize .apr directory",
             validate: "Pre-run validation (apr robot validate <round>)",
             lint: "Offline local workflow validation (apr robot lint [round])",
+            replay: "Validate retained input bundle offline (replay <round|record>; --include-bytes exports private prompt/doc bytes)",
             queue: "Persistent FIFO queue: add <round>, status, cancel <id>, run [--once|--until-empty|--max N], doctor",
             run: "Execute revision round (apr robot run <round>)",
             show: "View round content (apr robot show <round>)",
@@ -7922,6 +8157,10 @@ cmd_robot() {
                 ROBOT_FORMAT_OVERRIDE="${1#*=}"
                 shift
                 ;;
+            --include-bytes)
+                [[ "$robot_cmd" == replay ]] || { robot_fail usage_error '{}' "--include-bytes requires replay"; return $?; }
+                REPLAY_INCLUDE_BYTES=true; shift
+                ;;
             --once|--until-empty|--max)
                 if [[ "$robot_cmd" != queue ]]; then robot_fail usage_error '{}' "Queue option requires the queue command"; return $?; fi
                 robot_args+=("$1")
@@ -7990,6 +8229,9 @@ cmd_robot() {
         lint)
             cmd_lint "${robot_args[0]:-1}"
             ;;
+        replay)
+            cmd_replay "${robot_args[@]}"
+            ;;
         queue)
             cmd_queue "${robot_args[@]}"
             ;;
@@ -8042,6 +8284,7 @@ show_help() {
 
         gum style --foreground 214 --bold "COMMANDS" >&2
         gum style --foreground 39 "  Core Workflow" >&2
+        echo "    replay <round|meta>   Validate saved inputs offline (--include-bytes exports)" >&2
         echo "    lint [round]         Validate local workflow without Oracle" >&2
         echo "    queue <action>       Add/status/cancel/run/doctor persistent work" >&2
         echo "    $(gum style --foreground 82 'run <round>')        Run a revision round" >&2
@@ -8155,6 +8398,7 @@ show_help() {
         echo "" >&2
         echo -e "${BOLD}${YELLOW}COMMANDS${NC}" >&2
         echo -e "  ${CYAN}Core Workflow${NC}" >&2
+        echo "    replay <round|meta>   Validate saved inputs offline (--include-bytes exports)" >&2
         echo "    lint [round]         Validate local workflow without Oracle" >&2
         echo "    queue <action>       Add/status/cancel/run/doctor persistent work" >&2
         echo -e "    ${GREEN}run <round>${NC}        Run a revision round" >&2
@@ -8271,7 +8515,7 @@ main() {
 
     # Check for updates (opt-in, non-blocking)
     case "${1:-}" in
-        lint|queue|robot) ;;
+        lint|queue|replay|robot) ;;
         *) check_for_updates ;;
     esac
 
@@ -8356,6 +8600,10 @@ main() {
             --show-manifest)
                 SHOW_MANIFEST=true
                 shift
+                ;;
+            --include-bytes)
+                [[ "$command" == replay ]] || { print_error "--include-bytes requires replay"; return "$EXIT_USAGE_ERROR"; }
+                REPLAY_INCLUDE_BYTES=true; shift
                 ;;
             --once|--until-empty|--max)
                 if [[ "$command" != queue ]]; then print_error "Queue option requires the queue command"; return "$EXIT_USAGE_ERROR"; fi
@@ -8541,6 +8789,9 @@ main() {
     case "$command" in
         lint)
             cmd_lint "${positional_args[0]:-1}"
+            ;;
+        replay)
+            cmd_replay "${positional_args[@]}"
             ;;
         queue)
             cmd_queue "${positional_args[@]}"
