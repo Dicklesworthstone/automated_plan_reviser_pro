@@ -1323,6 +1323,7 @@ run_oracle_once() {
     fi
 
     local pipeline_status=()
+    APR_ATTEMPTS_COUNT=$((${APR_ATTEMPTS_COUNT:-0} + 1))
     {
         if "${ORACLE_CMD[@]}" "$@" 2>&1 1>&3 3>&- | tee "$stderr_file" >&2; then
             pipeline_status=("${PIPESTATUS[@]}")
@@ -1353,7 +1354,10 @@ run_oracle_with_retry() {
     local backoff="$INITIAL_BACKOFF"
     local exit_code=0
     local busy_started=-1 busy_elapsed=0 busy_count=0
-    local busy_delay="$ORACLE_BUSY_MIN_SLEEP" remaining=0 probe_seconds=0
+    local busy_delay="$ORACLE_BUSY_MIN_SLEEP" remaining=0 probe_seconds=0 wait_segment=0 ordinary_retry=false
+    local attempts_before=0 retry_reason=""
+
+    ledger_reset_execution
 
     verbose "run_oracle_with_retry: max_attempts=$MAX_RETRY_ATTEMPTS initial_backoff=$INITIAL_BACKOFF"
 
@@ -1369,8 +1373,15 @@ run_oracle_with_retry() {
         verbose "Oracle attempt $attempt/$MAX_RETRY_ATTEMPTS"
 
         # Classification belongs to this attempt, never to an accumulated log.
+        attempts_before=$APR_ATTEMPTS_COUNT
+        retry_reason=$ORACLE_FAILURE_KIND
         exit_code=0
         run_oracle_once "$@" || exit_code=$?
+        if [[ "$ordinary_retry" == true ]] && ((APR_ATTEMPTS_COUNT > attempts_before)); then
+            APR_RETRIES_COUNT=$((APR_RETRIES_COUNT + 1))
+            APR_RETRY_REASONS=$(jq -nc --argjson reasons "$APR_RETRY_REASONS" --arg reason "$retry_reason" '$reasons+[$reason]') || return "$EXIT_CONFIG_ERROR"
+        fi
+        ordinary_retry=false
 
         # A failed diagnostic sink is not permission to launch Oracle again:
         # it may already have produced useful output or charged for the run.
@@ -1386,6 +1397,8 @@ run_oracle_with_retry() {
         fi
 
         if [[ "$ORACLE_FAILURE_KIND" == busy && "$ORACLE_BUSY_WAIT_SECONDS" != 0 ]]; then
+            APR_BUSY_WAIT_COUNT=$((APR_BUSY_WAIT_COUNT + 1))
+            wait_segment=$SECONDS
             ((busy_started >= 0)) || busy_started=$SECONDS
             busy_elapsed=$((SECONDS - busy_started))
             busy_count=$((busy_count + 1))
@@ -1409,6 +1422,7 @@ run_oracle_with_retry() {
             if [[ "$ORACLE_BUSY_WAIT_SECONDS" != infinite ]]; then
                 remaining=$((ORACLE_BUSY_WAIT_SECONDS - busy_elapsed))
                 if ((remaining <= 0)); then
+                    APR_BUSY_WAIT_TOTAL_MS=$((APR_BUSY_WAIT_TOTAL_MS + (SECONDS - wait_segment) * 1000))
                     print_error "Oracle still busy after ${busy_elapsed}s; wait budget exhausted during advisory status. Oracle serve is single-flight."
                     return "$EXIT_BUSY_ERROR"
                 fi
@@ -1416,6 +1430,7 @@ run_oracle_with_retry() {
             fi
             print_info "Oracle is busy (single-flight); waited ${busy_elapsed}s, retrying in ${delay}s (budget: ${ORACLE_BUSY_WAIT_SECONDS}s). Wait for the active review or inspect 'oracle status'."
             sleep "$delay"
+            APR_BUSY_WAIT_TOTAL_MS=$((APR_BUSY_WAIT_TOTAL_MS + (SECONDS - wait_segment) * 1000))
             # Do not start another producer at/after the deadline. Once a
             # producer starts, let its useful review finish normally.
             busy_elapsed=$((SECONDS - busy_started))
@@ -1452,6 +1467,7 @@ run_oracle_with_retry() {
             backoff=$((backoff * 3))
         fi
 
+        ordinary_retry=true
         ((attempt++))
     done
 
@@ -2145,6 +2161,210 @@ ledger_validate() {
          end)
         end
     ' >/dev/null
+}
+
+# Acquire an already-open descriptor. The pathname is retained: unlinking a
+# locked inode lets a second process lock a different inode at the same path.
+apr_kernel_lock() {
+    local descriptor="$1" result=0
+    if command -v flock >/dev/null 2>&1; then
+        flock -n -E "$EXIT_BUSY_ERROR" "$descriptor" || result=$?
+    elif command -v lockf >/dev/null 2>&1; then
+        lockf -s -t 0 "$descriptor" || result=$?
+        [[ "$result" -ne 75 ]] || result=$EXIT_BUSY_ERROR
+    else
+        print_error "Persistent run records require flock or BSD lockf"
+        return "$EXIT_DEPENDENCY_ERROR"
+    fi
+    case "$result" in
+        0|12) return "$result" ;;
+        *) print_error "Cannot acquire the run-record lock"; return "$EXIT_CONFIG_ERROR" ;;
+    esac
+}
+
+APR_LEDGER_FILE=""
+APR_LEDGER_RECORD=""
+APR_LEDGER_DIR=""
+APR_LEDGER_RUN_ID=""
+APR_ATTEMPTS_COUNT=0
+APR_RETRIES_COUNT=0
+APR_BUSY_WAIT_COUNT=0
+APR_BUSY_WAIT_TOTAL_MS=0
+APR_RETRY_REASONS='[]'
+
+ledger_reset_execution() {
+    APR_ATTEMPTS_COUNT=0
+    APR_RETRIES_COUNT=0
+    APR_BUSY_WAIT_COUNT=0
+    APR_BUSY_WAIT_TOTAL_MS=0
+    APR_RETRY_REASONS='[]'
+    ORACLE_EXIT_CODE=0
+    ORACLE_FAILURE_KIND=ok
+}
+
+# The candidate remains immutable after publication. A hard-link alias is
+# renamed in the canonical directory; no earlier version is removed. CAS on
+# the complete previous bytes rejects stale same-run updates, too.
+ledger_publish() (
+    local candidate="$1" initial="${2:-false}" current_id current_state result=0
+    umask 077
+    ledger_validate < "$candidate" || return "$EXIT_CONFIG_ERROR"
+    exec 8>>"${APR_LEDGER_FILE}.lock" || return "$EXIT_CONFIG_ERROR"
+    apr_kernel_lock 8 || return $?
+    if [[ -L "$APR_LEDGER_FILE" || ( -e "$APR_LEDGER_FILE" && ! -f "$APR_LEDGER_FILE" ) ]]; then
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    if [[ -f "$APR_LEDGER_FILE" ]]; then
+        ledger_validate < "$APR_LEDGER_FILE" || return "$EXIT_CONFIG_ERROR"
+        current_id=$(jq -r .run_id "$APR_LEDGER_FILE") || return "$EXIT_CONFIG_ERROR"
+        current_state=$(jq -r .state "$APR_LEDGER_FILE") || return "$EXIT_CONFIG_ERROR"
+        if [[ "$initial" == true ]]; then
+            [[ "$current_state" != started ]] || return "$EXIT_BUSY_ERROR"
+            ln "$APR_LEDGER_FILE" "$APR_LEDGER_DIR/prior.meta.json" || return "$EXIT_CONFIG_ERROR"
+        else
+            [[ "$current_id" == "$APR_LEDGER_RUN_ID" && "$current_state" == started ]] || return "$EXIT_BUSY_ERROR"
+            cmp -s "$APR_LEDGER_RECORD" "$APR_LEDGER_FILE" || return "$EXIT_BUSY_ERROR"
+        fi
+    elif [[ "$initial" != true ]]; then
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    ln "$candidate" "${candidate}.publish" || return "$EXIT_CONFIG_ERROR"
+    mv -f "${candidate}.publish" "$APR_LEDGER_FILE" || result=$?
+    [[ "$result" -eq 0 ]] || return "$EXIT_CONFIG_ERROR"
+)
+
+# Start is deliberately usable before config/doc validation. A process crash
+# leaves a valid pending record, without invented hashes or terminal success.
+ledger_write_start() {
+    local workflow="$1" round="$2" slug="$3" config_path="${4:-}" output_path="${5:-}"
+    local canonical_dir candidate result=0
+    [[ "$workflow" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] && is_non_negative_int "$round" || return "$EXIT_USAGE_ERROR"
+    canonical_dir="$CONFIG_DIR/rounds/$workflow"
+    APR_LEDGER_FILE="$canonical_dir/round_${round}.meta.json"
+    APR_LEDGER_RECORD=""
+    APR_LEDGER_RUN_ID=""
+    APR_LEDGER_DIR=""
+    ledger_reset_execution
+    mkdir -p "$canonical_dir" "$CONFIG_DIR/runs/$workflow" || return "$EXIT_CONFIG_ERROR"
+    APR_LEDGER_DIR=$(umask 077; mktemp -d "$CONFIG_DIR/runs/$workflow/round_${round}.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    APR_LEDGER_RUN_ID="${APR_LEDGER_DIR##*/}"
+    candidate=$(umask 077; mktemp "$canonical_dir/.round_${round}.record.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    jq -nc --arg id "$APR_LEDGER_RUN_ID" --arg workflow "$workflow" --arg round "$round" \
+        --arg slug "$slug" --arg config "$config_path" --arg output "$output_path" \
+        --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson epoch "$(date +%s)" \
+        --argjson owner "${BASHPID:-$$}" \
+        '{schema_version:"1.0.0",run_id:$id,workflow:$workflow,round:($round|tonumber),slug:$slug,
+          state:"started",started_at:$started,started_epoch_s:$epoch,owner_pid:$owner,finished_at:null,duration_ms:null,
+          config:{path:(if $config=="" then null else $config end),sha256:null},
+          inputs:{status:"pending",files:[],manifest:null,prompt_hash:null},
+          invocation:{engine:"browser",model:null,thinking_time:null,remote_host:null,oracle_flags_used:[],oracle_args:[]},
+          execution:{attempts_count:0,retries_count:0,busy_wait_count:0,busy_wait_total_ms:0,retry_reasons:[]},
+          outcome:{ok:null,code:null,exit_code:null,oracle_exit_code:null,output_path:(if $output=="" then null else $output end)}}' \
+        > "$candidate" || return "$EXIT_CONFIG_ERROR"
+    ledger_publish "$candidate" true || result=$?
+    [[ "$result" -eq 0 ]] || return "$result"
+    APR_LEDGER_RECORD="$candidate"
+}
+
+ledger_remote_authority() {
+    local authority="${1:-}"
+    authority="${authority#*://}"
+    authority="${authority##*@}"
+    authority="${authority%%/*}"
+    authority="${authority%%\?*}"
+    authority="${authority%%\#*}"
+    if [[ -n "$authority" ]] && jq -ne --arg host "$authority" '$host | test("^[A-Za-z0-9_.:\\[\\]-]+$")' >/dev/null; then
+        printf '%s' "$authority"
+    fi
+    return 0
+}
+
+# Record only APR-owned argument names and safe values. Unknown options,
+# wrapper arguments, authentication and prompt bodies never enter the record.
+ledger_redact_args() {
+    local argument value authority args='[]' flags='[]'
+    while [[ "$#" -gt 0 ]]; do
+        argument="$1"; shift
+        case "$argument" in
+            --engine|-m|--file|--slug|--write-output|--browser-thinking-time|--heartbeat|--browser-attachments)
+                [[ "$#" -gt 0 ]] || return "$EXIT_CONFIG_ERROR"
+                value="$1"; shift ;;
+            -p|--remote-token)
+                [[ "$#" -gt 0 ]] || return "$EXIT_CONFIG_ERROR"
+                shift; value='[redacted]' ;;
+            --remote-host)
+                [[ "$#" -gt 0 ]] || return "$EXIT_CONFIG_ERROR"
+                authority=$(ledger_remote_authority "$1"); shift
+                value="$authority" ;;
+            --files-report|--notify|--browser-manual-login|--browser-keep-browser)
+                value="" ;;
+            *) argument='[redacted argument]'; value="" ;;
+        esac
+        args=$(jq -nc --argjson args "$args" --arg argument "$argument" --arg value "$value" \
+            '$args + [$argument] + (if $value=="" then [] else [$value] end)') || return "$EXIT_CONFIG_ERROR"
+        [[ "$argument" == '[redacted argument]' ]] || flags=$(jq -nc --argjson flags "$flags" --arg flag "$argument" '$flags+[$flag]') || return "$EXIT_CONFIG_ERROR"
+    done
+    jq -nc --argjson args "$args" --argjson flags "$flags" '{oracle_args:$args,oracle_flags_used:$flags}'
+}
+
+# Call only with the shared manifest and exact final -p bytes selected for this
+# producer. Paths describe configured inputs; hashes remain local observations.
+ledger_bind_inputs() {
+    local manifest="$1" prompt="$2" readme="$3" spec="$4" implementation="$5" model="$6" thinking="$7"
+    shift 7
+    local config_path config_hash prompt_hash invocation candidate result=0 authority
+    [[ -n "$APR_LEDGER_RECORD" ]] || return "$EXIT_CONFIG_ERROR"
+    config_path=$(jq -r '.config.path // empty' "$APR_LEDGER_RECORD") || return "$EXIT_CONFIG_ERROR"
+    [[ -n "$config_path" && -f "$config_path" && -r "$config_path" ]] || return "$EXIT_CONFIG_ERROR"
+    config_hash=$(document_sha256_stdin < "$config_path") || return "$EXIT_CONFIG_ERROR"
+    prompt_hash=$(printf '%s' "$prompt" | document_sha256_stdin) || return "$EXIT_CONFIG_ERROR"
+    invocation=$(ledger_redact_args "$@") || return "$EXIT_CONFIG_ERROR"
+    authority=$(ledger_remote_authority "${ORACLE_REMOTE_HOST:-}")
+    candidate=$(umask 077; mktemp "${APR_LEDGER_FILE%/*}/.ledger-update.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    jq -c --arg config_hash "$config_hash" --arg prompt_hash "$prompt_hash" --argjson manifest "$manifest" \
+        --arg readme "$readme" --arg spec "$spec" --arg impl "$implementation" --arg model "$model" \
+        --arg thinking "$thinking" --arg authority "$authority" --argjson invocation "$invocation" \
+        '.config.sha256=$config_hash | .inputs={status:"complete",prompt_hash:$prompt_hash,manifest:$manifest,
+          files:($manifest.files | map(.display_path=.path | .path=(if .role=="readme" then $readme elif .role=="spec" then $spec else $impl end) |
+            .inclusion_reason=.reason | del(.reason)))} |
+         .invocation=($invocation+{engine:"browser",model:$model,thinking_time:(if $thinking=="" then null else $thinking end),
+            remote_host:(if $authority=="" then null else $authority end)})' "$APR_LEDGER_RECORD" \
+        > "$candidate" || return "$EXIT_CONFIG_ERROR"
+    ledger_publish "$candidate" || result=$?
+    [[ "$result" -eq 0 ]] || return "$result"
+    APR_LEDGER_RECORD="$candidate"
+}
+
+ledger_write_finish() {
+    local state="$1" code="$2" exit_code="$3" output_path="${4:-}" native="${5:-null}"
+    local candidate now result=0
+    [[ -n "$APR_LEDGER_RECORD" ]] || return "$EXIT_CONFIG_ERROR"
+    now=$(date +%s) || return "$EXIT_CONFIG_ERROR"
+    candidate=$(umask 077; mktemp "${APR_LEDGER_FILE%/*}/.ledger-finish.XXXXXX") || return "$EXIT_CONFIG_ERROR"
+    jq -c --arg state "$state" --arg code "$code" --argjson exit "$exit_code" --arg output "$output_path" \
+        --argjson native "$native" --arg finish "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson now "$now" \
+        --argjson attempts "$APR_ATTEMPTS_COUNT" --argjson retries "$APR_RETRIES_COUNT" \
+        --argjson busy "$APR_BUSY_WAIT_COUNT" --argjson busy_ms "$APR_BUSY_WAIT_TOTAL_MS" \
+        --argjson reasons "$APR_RETRY_REASONS" \
+        '.state=$state | .finished_at=$finish | .duration_ms=([0,($now-.started_epoch_s)*1000]|max) |
+         (if .inputs.status=="pending" then .inputs.status="failed" else . end) |
+         .execution={attempts_count:$attempts,retries_count:$retries,busy_wait_count:$busy,busy_wait_total_ms:$busy_ms,retry_reasons:$reasons} |
+         .outcome={ok:($state=="finished"),code:$code,exit_code:$exit,oracle_exit_code:$native,
+            output_path:(if $output=="" then null else $output end)}' "$APR_LEDGER_RECORD" \
+        > "$candidate" || return "$EXIT_CONFIG_ERROR"
+    ledger_publish "$candidate" || result=$?
+    [[ "$result" -eq 0 ]] || return "$result"
+    APR_LEDGER_RECORD="$candidate"
+}
+
+ledger_write_finish_success() {
+    local output="$1"
+    validate_output_file "$output" || return "$EXIT_CONFIG_ERROR"
+    ledger_write_finish finished ok 0 "$output" "${ORACLE_EXIT_CODE:-0}"
+}
+
+ledger_write_finish_error() {
+    ledger_write_finish failed "$1" "$2" "${3:-}" "${4:-null}"
 }
 
 # -----------------------------------------------------------------------------

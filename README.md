@@ -1004,6 +1004,16 @@ run record before publishing the new canonical record. Optional fields may be
 added within version 1; removing or renaming fields requires a major version
 change. Readers reject unsupported versions and contradictory outcomes.
 
+The writer retains each private record candidate, atomically renames a hard-link
+alias in the canonical directory, and retains the previous terminal record in
+the next run's private `.apr/runs/<workflow>/round_<N>.*` directory. A stable lock
+file is never unlinked. A new run refuses to replace a started record; updates
+compare both run identity and the entire previous record to reject stale writers.
+Malformed candidates and failed publication leave the canonical bytes intact.
+This protects whole JSON records against process interruption; it does not claim
+power-loss durability or a transaction spanning multiple files. Kernel locking
+requires `flock` or BSD `lockf` and fails closed if neither is available.
+
 The required fields are:
 
 | Field | Meaning |
@@ -1050,8 +1060,12 @@ the available clock resolution. Optional `warnings`, `overrides`, `trim` and
 `redaction` fields may extend the record without changing these meanings.
 
 The executable `ledger_validate` check and state fixtures exercise this contract.
-The writer and automatic execution hooks are implemented under their separate
-original Beads; defining this contract alone does not establish persisted runs.
+`ledger_write_start`, `ledger_bind_inputs`, `ledger_write_finish_success` and
+`ledger_write_finish_error` provide the shared writer API. Writer tests exercise
+real files, separate-process interruption, both kernel lock backends, publication
+failure and concurrent readers. Automatic human/robot/queue execution hooks
+remain under the original integration Beads; writer API proof alone does not
+establish those command paths or exact replay of changed document contents.
 
 ### GPT Pro Extended Thinking Stability
 
