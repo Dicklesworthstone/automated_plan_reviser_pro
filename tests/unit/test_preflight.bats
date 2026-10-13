@@ -46,6 +46,25 @@ case "${1:-}" in
         exit "${APR_FIXTURE_STATUS_EXIT:-0}"
         ;;
 esac
+# Opt-in exact argv capture for prompt binding cases. Capability probes have no
+# file arguments and never create records. Preserve original fixture behavior.
+if [[ -n "${APR_FIXTURE_PROMPT_DIR:-}" ]]; then
+    has_files=false
+    for arg in "$@"; do [[ "$arg" != --file ]] || has_files=true; done
+    if [[ "$has_files" == true ]]; then
+        record=0
+        [[ ! -f "$APR_FIXTURE_PROMPT_DIR/count" ]] || record=$(cat "$APR_FIXTURE_PROMPT_DIR/count")
+        record=$((record + 1))
+        printf '%s\n' "$record" > "$APR_FIXTURE_PROMPT_DIR/count"
+        args=("$@")
+        for ((idx=0; idx<${#args[@]}; idx++)); do
+            case "${args[idx]}" in
+                -p) printf '%s' "${args[idx+1]}" > "$APR_FIXTURE_PROMPT_DIR/prompt-$record" ;;
+                --file) printf '%s\0' "${args[idx+1]}" >> "$APR_FIXTURE_PROMPT_DIR/files-$record" ;;
+            esac
+        done
+    fi
+fi
 for arg in "$@"; do
     if [[ "$arg" == --render ]]; then
         printf '%s\n' 'Offline notification capability preview.'
@@ -1112,4 +1131,270 @@ assert_json_array_contains() {
     capture_streams build_document_manifest README.md SPEC.md missing.md true optional
     [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" ]]
     [[ "$CAPTURED_STDERR" == *'fixture: directory read failed'* && "$CAPTURED_STDERR" == *'Cannot inspect optional document parent'* ]]
+}
+
+create_prompt_binding_fixture() {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
+    create_oracle_failure_fixture success
+    export APR_FIXTURE_PROMPT_DIR="$TEST_DIR/prompt-records"
+    mkdir -p "$APR_FIXTURE_PROMPT_DIR"
+}
+
+assert_recorded_files() {
+    local record="$1"
+    shift
+    printf '%s\0' "$@" > "$TEST_DIR/expected-files-$record"
+    cmp "$TEST_DIR/expected-files-$record" "$APR_FIXTURE_PROMPT_DIR/files-$record"
+}
+
+assert_recorded_document() {
+    local record="$1" role="$2" path="$3" reason="$4" digest bytes
+    digest=$(shasum -a 256 < "$path")
+    digest="${digest%% *}"
+    bytes=$(wc -c < "$path")
+    bytes="${bytes//[[:space:]]/}"
+    local prompt
+    prompt=$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-$record")
+    [[ "$prompt" == *"$role: path="*"; bytes=$bytes; sha256=$digest; reason=$reason"* ]]
+}
+
+@test "prompt binding: foreground sends exact selected files and observed byte metadata" {
+    create_prompt_binding_fixture
+    printf '\000\377A\r\n\n' > README.md
+    capture_streams bash "$APR_SCRIPT" run 1 --include-impl --wait --no-retry --no-preflight
+    [[ "$CAPTURED_STATUS" -eq 0 && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+    assert_recorded_files 1 "$TEST_PROJECT/README.md" "$TEST_PROJECT/IMPL.md" "$TEST_PROJECT/SPEC.md"
+    assert_recorded_document 1 readme README.md required
+    assert_recorded_document 1 implementation IMPL.md optional
+    assert_recorded_document 1 spec SPEC.md required
+    local prompt
+    prompt=$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-1")
+    [[ "$prompt" == 'Observed local input metadata (not a sent attachment receipt):'* ]]
+    [[ "$prompt" == *'bytes=6; sha256=c2d6098cbf68842ad602337645fae2e17f40f4282f66c573cf5945274971cab9'* ]]
+    [[ "$prompt" == *'First, read this README:'* && -s .apr/rounds/default/round_1.md ]]
+}
+
+@test "prompt binding: robot completes once with clean JSON and omitted implementation metadata" {
+    create_prompt_binding_fixture
+    capture_streams bash "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.status' completed
+    assert_json_value "$CAPTURED_STDOUT" '.data.include_impl' false
+    assert_recorded_files 1 "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    assert_recorded_document 1 readme README.md required
+    assert_recorded_document 1 spec SPEC.md required
+    [[ "$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-1")" == *'skipped=not_requested; reason=optional'* ]]
+    [[ "$CAPTURED_STDOUT" != *'Observed local'* && -s .apr/rounds/default/round_1.md ]]
+}
+
+@test "prompt binding: cadence selects implementation for render robot validate and robot run" {
+    create_prompt_binding_fixture
+    printf '\n  impl_every_n: 4\n' >> .apr/workflows/default.yaml
+    capture_streams bash "$APR_SCRIPT" run 4 --render
+    [[ "$CAPTURED_STATUS" -eq 0 && "$CAPTURED_STDOUT" == 'Offline notification capability preview.' ]]
+    assert_recorded_files 1 "$TEST_PROJECT/README.md" "$TEST_PROJECT/IMPL.md" "$TEST_PROJECT/SPEC.md"
+    assert_recorded_document 1 implementation IMPL.md impl_every_n
+    capture_streams bash "$APR_SCRIPT" robot validate 4 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 && ! -e "$APR_FIXTURE_COUNT" ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.valid' true
+    capture_streams bash "$APR_SCRIPT" robot run 4 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 && "$(cat "$APR_FIXTURE_COUNT")" -eq 1 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.include_impl' true
+    assert_recorded_files 2 "$TEST_PROJECT/README.md" "$TEST_PROJECT/IMPL.md" "$TEST_PROJECT/SPEC.md"
+    cmp "$APR_FIXTURE_PROMPT_DIR/prompt-1" "$APR_FIXTURE_PROMPT_DIR/prompt-2"
+}
+
+@test "prompt binding: missing optional implementation retains request reason with two actual files" {
+    create_prompt_binding_fixture
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/missing.md"
+    printf '\n  impl_every_n: 4\n' >> .apr/workflows/default.yaml
+    capture_streams bash "$APR_SCRIPT" run 4 --render
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_recorded_files 1 "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    [[ "$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-1")" == *'skipped=missing_optional; reason=impl_every_n'* ]]
+    capture_streams bash "$APR_SCRIPT" robot run 4 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.include_impl' false
+    cmp "$APR_FIXTURE_PROMPT_DIR/prompt-1" "$APR_FIXTURE_PROMPT_DIR/prompt-2"
+}
+
+@test "prompt binding: dry run displays exactly the later render prompt and launches no review" {
+    create_prompt_binding_fixture
+    printf '\ntemplate: |\n  Keep this custom instruction verbatim.\n  Preserve useful work.\n' >> .apr/workflows/default.yaml
+    capture_streams bash "$APR_SCRIPT" run 1 --dry-run
+    [[ "$CAPTURED_STATUS" -eq 0 && -z "$CAPTURED_STDOUT" && ! -e "$APR_FIXTURE_COUNT" && ! -e "$APR_FIXTURE_PROMPT_DIR/count" ]]
+    printf '%s\n' "$CAPTURED_STDERR" | awk '/^--- END ASSEMBLED PROMPT ---$/ {copy=0} copy {print} /^--- BEGIN ASSEMBLED PROMPT ---$/ {copy=1}' > "$TEST_DIR/dry-prompt"
+    local dry_prompt
+    dry_prompt=$(cat "$TEST_DIR/dry-prompt")
+    [[ "$dry_prompt" == 'Observed local input metadata'* && "$dry_prompt" == *$'---\n\nKeep this custom instruction verbatim.\nPreserve useful work.' ]]
+    capture_streams bash "$APR_SCRIPT" run 1 --render
+    [[ "$CAPTURED_STATUS" -eq 0 && "$CAPTURED_STDOUT" == 'Offline notification capability preview.' ]]
+    [[ "$dry_prompt" == "$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-1")" ]]
+    assert_recorded_files 1 "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+}
+
+@test "prompt binding: quoted curly filenames survive exact argv and strict final QC" {
+    create_prompt_binding_fixture
+    local name='the {{README}} "quoted".md'
+    cp README.md "$name"
+    write_workflow_config "$TEST_PROJECT/$name" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
+    capture_streams bash "$APR_SCRIPT" run 1 --render
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_recorded_files 1 "$TEST_PROJECT/$name" "$TEST_PROJECT/SPEC.md"
+    local prompt line encoded_path
+    prompt=$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-1")
+    line=$(awk '/^readme: / {print}' <<< "$prompt")
+    encoded_path="${line#readme: path=}"
+    encoded_path="${encoded_path%%; basename=*}"
+    [[ "$(jq -r . <<< "$encoded_path")" == "$name" ]]
+    [[ "$prompt" != *'{{'* && "$prompt" != *'}}'* && "$prompt" == *'\u007b\u007bREADME\u007d\u007d'* ]]
+    prompt_quality_check "$prompt" .apr/workflows/default.yaml assembled
+}
+
+@test "prompt binding: changed document content changes real render metadata without changing its template" {
+    create_prompt_binding_fixture
+    printf '\ntemplate: |\n  Keep this exact template.\n' >> .apr/workflows/default.yaml
+    capture_streams bash "$APR_SCRIPT" run 1 --render
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_recorded_document 1 spec SPEC.md required
+    printf '\nUseful accretive specification.\n' >> SPEC.md
+    capture_streams bash "$APR_SCRIPT" run 1 --render
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_recorded_document 2 spec SPEC.md required
+    [[ "$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-1")" != "$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-2")" ]]
+    [[ "$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-2")" == *$'---\n\nKeep this exact template.' ]]
+    assert_recorded_files 2 "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+}
+
+@test "prompt binding: public unreadable required input fails before render or output creation" {
+    create_prompt_binding_fixture
+    chmod 000 SPEC.md
+    [[ ! -r SPEC.md ]]
+    capture_streams bash "$APR_SCRIPT" run 1 --render
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'Cannot read document metadata'* ]]
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" && ! -d .apr/logs && ! -d .apr/.locks ]]
+}
+
+@test "prompt binding: missing configured README retains normal public preflight diagnostic" {
+    create_prompt_binding_fixture
+    write_workflow_config "$TEST_PROJECT/absent-README.md" "$TEST_PROJECT/SPEC.md"
+    capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry
+    [[ "$CAPTURED_STATUS" -eq 4 && "$CAPTURED_STDERR" == *'Pre-flight failed: README not found'* ]]
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
+}
+
+@test "prompt binding: requested directory implementation fails robot config instead of silently skipping" {
+    create_prompt_binding_fixture
+    mkdir implementation-directory
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/implementation-directory"
+    capture_streams bash "$APR_SCRIPT" robot run 1 --include-impl --compact
+    [[ "$CAPTURED_STATUS" -eq 4 ]]
+    assert_json_value "$CAPTURED_STDOUT" '.code' config_error
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" && ! -d .apr/.locks ]]
+}
+
+@test "prompt binding: robot validate rejects unsearchable requested parent with useful stderr" {
+    create_prompt_binding_fixture
+    mkdir sealed
+    cp IMPL.md sealed/IMPL.md
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/sealed/IMPL.md"
+    chmod 000 sealed
+    [[ ! -x sealed && ! -e sealed/IMPL.md ]]
+    capture_streams bash "$APR_SCRIPT" robot validate 1 --include-impl --compact
+    [[ "$CAPTURED_STATUS" -eq 4 && "$CAPTURED_STDERR" == *'Cannot search optional document parent'* ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.valid' false
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
+}
+
+@test "prompt binding: robot validate still checks the unselected template variant" {
+    create_prompt_binding_fixture
+    printf '\ntemplate: |\n  Read the actual attached documents.\ntemplate_with_impl: |\n  {{IMPLEMENTATION}}\n' >> .apr/workflows/default.yaml
+    capture_streams bash "$APR_SCRIPT" robot validate 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 4 ]]
+    [[ "$(jq -r '.data.errors[]' <<< "$CAPTURED_STDOUT")" == *'(template_with_impl)'* ]]
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
+}
+
+@test "prompt binding: large early unresolved template fails public final QC with zero producer launches" {
+    create_prompt_binding_fixture
+    printf '\ntemplate: |\n  {{README}}\n  ' >> .apr/workflows/default.yaml
+    printf '%98304s\n' '' | tr ' ' x >> .apr/workflows/default.yaml
+    capture_streams bash "$APR_SCRIPT" run 1 --render
+    [[ "$CAPTURED_STATUS" -eq 1 && "$CAPTURED_STDERR" == *'Prompt contains unexpanded placeholders'* ]]
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
+}
+
+@test "prompt binding: large placeholder predicate rejects both tokens without SIGPIPE and retains large clean control" {
+    local padding prompt
+    padding=$(printf '%98304s' '' | tr ' ' x)
+    capture_streams prompt_quality_check "{{README}}$padding" '' large
+    [[ "$CAPTURED_STATUS" -eq 1 && "$PROMPT_QC_REASON" == *'unexpanded placeholders'* ]]
+    capture_streams prompt_quality_check "}}$padding" '' large
+    [[ "$CAPTURED_STATUS" -eq 1 ]]
+    capture_streams prompt_quality_check "$padding" '' large
+    [[ "$CAPTURED_STATUS" -eq 0 && -z "$PROMPT_QC_REASON" ]]
+    prompt=$(printf '{{README}}\n%.0s' {1..128})
+    capture_streams prompt_quality_check "$prompt" '' multiline
+    [[ "$CAPTURED_STATUS" -eq 1 && "$(awk '/^  multiline:/ {n++} END {print n}' <<< "$PROMPT_QC_DETAILS")" -eq 8 ]]
+}
+
+@test "prompt binding: robot validate propagates builder failure instead of empty green success" {
+    create_prompt_binding_fixture
+    build_revision_prompt() { printf '%s\n' 'fixture: assembly failed' >&2; return 4; }
+    capture_streams robot_validate 1
+    [[ "$CAPTURED_STATUS" -eq 4 && "$CAPTURED_STDERR" == *'fixture: assembly failed'* ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.valid' false
+    [[ "$(jq -r '.data.errors[]' <<< "$CAPTURED_STDOUT")" == *'Cannot assemble selected prompt'* ]]
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
+}
+
+@test "prompt binding: metadata collector failure rejects validate without swallowing diagnostic" {
+    create_prompt_binding_fixture
+    wc() { cat >/dev/null; printf '%s\n' 'fixture: count failed' >&2; return 9; }
+    capture_streams robot_validate 1
+    [[ "$CAPTURED_STATUS" -eq 4 && "$CAPTURED_STDERR" == *'fixture: count failed'* ]]
+    assert_json_value "$CAPTURED_STDOUT" '.data.valid' false
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
+}
+
+@test "prompt binding: final QC rejects injected generated metadata before human execution" {
+    create_prompt_binding_fixture
+    DRY_RUN=true
+    [[ "$DRY_RUN" == true ]]
+    build_document_manifest() { printf '%s\n' '{"v":1,"files":[{"role":"readme","path":"README.md","basename":"README.md","bytes":1,"sha256":"{{BAD}}","included":true,"reason":"required"},{"role":"spec","path":"SPEC.md","basename":"SPEC.md","bytes":1,"sha256":"ok","included":true,"reason":"required"},{"role":"implementation","path":"IMPL.md","basename":"IMPL.md","included":false,"reason":"optional","skip_reason":"not_requested"}]}'; }
+    capture_streams run_round 1
+    [[ "$CAPTURED_STATUS" -eq 1 && "$CAPTURED_STDERR" == *'Prompt contains unexpanded placeholders'* ]]
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
+}
+
+@test "prompt binding: real unreadable template configuration fails instead of using a default" {
+    create_prompt_binding_fixture
+    printf '\ntemplate: |\n  Keep this custom template.\n' >> .apr/workflows/default.yaml
+    capture_streams load_prompt_template false .apr/workflows/default.yaml
+    [[ "$CAPTURED_STATUS" -eq 0 && "$CAPTURED_STDOUT" == 'Keep this custom template.' ]]
+    chmod 000 .apr/workflows/default.yaml
+    [[ ! -r .apr/workflows/default.yaml ]]
+    capture_streams load_prompt_template false .apr/workflows/default.yaml
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'Cannot read prompt template configuration'* ]]
+    capture_streams load_prompt_template true .apr/workflows/default.yaml
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" ]]
+}
+
+@test "prompt binding: real failed template reader process rejects public render without fallback" {
+    create_prompt_binding_fixture
+    mkdir -p "$TEST_DIR/reader-bin"
+    cat > "$TEST_DIR/reader-bin/awk" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -v && "${2:-}" == key=template* ]]; then
+    printf '%s\n' 'fixture: template reader process failed' >&2
+    exit 9
+fi
+exec /usr/bin/awk "$@"
+EOF
+    chmod +x "$TEST_DIR/reader-bin/awk"
+    export PATH="$TEST_DIR/reader-bin:$PATH"
+    capture_streams bash "$APR_SCRIPT" run 1 --render
+    [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'fixture: template reader process failed'* ]]
+    [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
 }

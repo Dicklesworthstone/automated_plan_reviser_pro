@@ -1190,15 +1190,15 @@ prompt_quality_check() {
 
     # Guard: '{{' / '}}' in the prompt almost always means "expected substitution"
     # but nothing will substitute it.
-    if printf '%s' "$prompt" | /usr/bin/grep -Fq '{{' || printf '%s' "$prompt" | /usr/bin/grep -Fq '}}'; then
+    if [[ "$prompt" == *'{{'* || "$prompt" == *'}}'* ]]; then
         PROMPT_QC_REASON="Prompt contains unexpanded placeholders ('{{' / '}}'). APR does not substitute these."
 
         local prompt_hits cfg_hits
-        prompt_hits=$(printf '%s\n' "$prompt" | awk -v label="$label" 'index($0,"{{") || index($0,"}}") { printf "  %s:%d: %s\n", label, NR, $0 }' | head -n 8)
+        prompt_hits=$(awk -v label="$label" 'hits < 8 && (index($0,"{{") || index($0,"}}")) { printf "  %s:%d: %s\n", label, NR, $0; hits++ }' <<< "$prompt")
 
         cfg_hits=""
         if [[ -n "$config_path" && -f "$config_path" ]]; then
-            cfg_hits=$(awk 'index($0,"{{") || index($0,"}}") { printf "  %s:%d: %s\n", FILENAME, NR, $0 }' "$config_path" | head -n 8)
+            cfg_hits=$(awk 'hits < 8 && (index($0,"{{") || index($0,"}}")) { printf "  %s:%d: %s\n", FILENAME, NR, $0; hits++ }' "$config_path")
         fi
 
         PROMPT_QC_DETAILS=$(
@@ -1964,30 +1964,33 @@ load_prompt_template() {
     local config_file="$2"
     local template=""
 
-    if [[ -z "$config_file" || ! -f "$config_file" ]]; then
+    if [[ -z "$config_file" ]]; then
         return 0
+    fi
+    if [[ ! -f "$config_file" || ! -r "$config_file" ]]; then
+        print_error "Cannot read prompt template configuration: $config_file"
+        return "$EXIT_CONFIG_ERROR"
     fi
 
     if [[ "$include_impl" == "true" ]]; then
-        template=$(get_yaml_block "template_with_impl" "$config_file")
+        template=$(get_yaml_block "template_with_impl" "$config_file") || return "$EXIT_CONFIG_ERROR"
     fi
 
     if [[ -z "$template" ]]; then
-        template=$(get_yaml_block "template" "$config_file")
+        template=$(get_yaml_block "template" "$config_file") || return "$EXIT_CONFIG_ERROR"
     fi
 
     printf '%s' "$template"
 }
 
-# Build the revision prompt for GPT Pro review
-# Usage: build_revision_prompt [include_impl]
-# Returns prompt via stdout
-build_revision_prompt() {
+# Build the configured/default template without document metadata. Validation
+# checks both variants as well as the final selected prompt.
+build_revision_template() {
     local include_impl="${1:-false}"
     local config_file="${2:-}"
     local template=""
 
-    template=$(load_prompt_template "$include_impl" "$config_file")
+    template=$(load_prompt_template "$include_impl" "$config_file") || return "$EXIT_CONFIG_ERROR"
     if [[ -n "$template" ]]; then
         printf '%s\n' "$template"
         return 0
@@ -2032,6 +2035,36 @@ with the git-diff style change versus the original plan shown below:
 "
 
     printf '%s\n' "$prompt"
+}
+
+# Assemble from the manifest already observed for this run's resolved paths.
+# This describes local input observations, not immutable sent bytes or a model
+# acknowledgement. Escape braces inside JSON-quoted names so legitimate names
+# cannot masquerade as template placeholders; keep template QC strict.
+build_revision_prompt() {
+    local include_impl="$1" config_file="$2" manifest="$3"
+    local template metadata
+    template=$(build_revision_template "$include_impl" "$config_file") || return "$EXIT_CONFIG_ERROR"
+    if [[ -z "$template" ]]; then
+        print_error "Prompt template is empty"
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    if ! metadata=$(jq -er '
+        def quoted: @json | gsub("\\{"; "\\u007b") | gsub("\\}"; "\\u007d");
+        if .v != 1 or (.files | length) != 3 then error("Invalid document manifest") else
+        "Observed local input metadata (not a sent attachment receipt):",
+        (.files | sort_by(.role,.path)[] |
+            if .included then
+                "\(.role): path=\(.path | quoted); basename=\(.basename | quoted); bytes=\(.bytes); sha256=\(.sha256); reason=\(.reason)"
+            else
+                "\(.role): path=\(.path | quoted); basename=\(.basename | quoted); skipped=\(.skip_reason); reason=\(.reason)"
+            end)
+        end
+    ' <<< "$manifest"); then
+        print_error "Cannot assemble document metadata into prompt"
+        return "$EXIT_CONFIG_ERROR"
+    fi
+    printf '%s\n\n---\n\n%s\n' "$metadata" "$template"
 }
 
 # -----------------------------------------------------------------------------
@@ -3486,17 +3519,44 @@ run_round() {
         exit $EXIT_CONFIG_ERROR
     fi
 
-    if [[ "$show_manifest" == true ]]; then
-        local manifest result=0
-        manifest=$(build_document_manifest "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$impl_reason") || result=$?
-        if [[ "$result" -ne 0 ]]; then
-            if [[ "$result" -eq "$EXIT_DEPENDENCY_ERROR" ]]; then
-                apr_emit_error_code_tag dependency_missing
-            else
-                apr_emit_error_code_tag config_error
+    # Preserve existing preflight diagnostics/order. The standalone metadata
+    # preview bypasses all Oracle checks, as before.
+    if [[ "$show_manifest" != true ]]; then
+        if [[ "$skip_preflight" != "true" && "$dry_run" != "true" && "$render" != "true" ]]; then
+            local impl_for_preflight=""
+            [[ "$include_impl" == "true" && -n "$impl_path" ]] && impl_for_preflight="$impl_path"
+            local preflight_result=0
+            preflight_check "$readme_path" "$spec_path" "$impl_for_preflight" || preflight_result=$?
+            if [[ $preflight_result -eq 1 ]]; then
+                print_error "Pre-flight checks failed. Fix the issues above and try again."
+                print_info "Use --no-preflight to skip these checks (not recommended)"
+                exit $EXIT_CONFIG_ERROR
             fi
-            return "$result"
+            # preflight_result=2 means warnings only, continue execution.
+        else
+            verbose "Skipping pre-flight checks (skip_preflight=$skip_preflight dry_run=$dry_run render=$render)"
+            local required_path
+            for required_path in "$readme_path" "$spec_path"; do
+                if [[ ! -f "$required_path" ]]; then
+                    print_error "Required file not found: $required_path"
+                    exit $EXIT_CONFIG_ERROR
+                fi
+            done
         fi
+    fi
+    # Keep requested inclusion/reason even when the optional file is absent.
+    # Use this same observation for final prompt and attachment selection.
+    local manifest result=0
+    manifest=$(build_document_manifest "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$impl_reason") || result=$?
+    if [[ "$result" -ne 0 ]]; then
+        if [[ "$result" -eq "$EXIT_DEPENDENCY_ERROR" ]]; then
+            apr_emit_error_code_tag dependency_missing
+        else
+            apr_emit_error_code_tag config_error
+        fi
+        return "$result"
+    fi
+    if [[ "$show_manifest" == true ]]; then
         if [[ "${STATS_JSON:-false}" == true ]]; then
             printf '%s\n' "$manifest"
         else
@@ -3504,39 +3564,13 @@ run_round() {
         fi
         return "$EXIT_SUCCESS"
     fi
-
-    # Run pre-flight checks (unless skipped or dry-run/render mode)
-    if [[ "$skip_preflight" != "true" && "$dry_run" != "true" && "$render" != "true" ]]; then
-        local impl_for_preflight=""
-        [[ "$include_impl" == "true" && -n "$impl_path" ]] && impl_for_preflight="$impl_path"
-
-        local preflight_result=0
-        preflight_check "$readme_path" "$spec_path" "$impl_for_preflight" || preflight_result=$?
-
-        if [[ $preflight_result -eq 1 ]]; then
-            print_error "Pre-flight checks failed. Fix the issues above and try again."
-            print_info "Use --no-preflight to skip these checks (not recommended)"
-            exit $EXIT_CONFIG_ERROR
-        fi
-        # preflight_result=2 means warnings only, continue execution
-    else
-        verbose "Skipping pre-flight checks (skip_preflight=$skip_preflight dry_run=$dry_run render=$render)"
-        # Basic file validation when preflight is skipped
-        for f in "$readme_path" "$spec_path"; do
-            if [[ ! -f "$f" ]]; then
-                print_error "Required file not found: $f"
-                exit $EXIT_CONFIG_ERROR
-            fi
-        done
-    fi
-
-    if [[ "$include_impl" == "true" ]]; then
+    local requested_impl="$include_impl"
+    include_impl=$(jq -r '.files[] | select(.role=="implementation") | .included' <<< "$manifest") || return "$EXIT_CONFIG_ERROR"
+    if [[ "$requested_impl" == true && "$include_impl" != true ]]; then
         if [[ -z "$impl_path" ]]; then
             print_warning "Implementation document not configured; skipping"
-            include_impl=false
-        elif [[ ! -f "$impl_path" ]]; then
+        else
             print_warning "Implementation file not found: $impl_path"
-            include_impl=false
         fi
     fi
 
@@ -3593,7 +3627,7 @@ run_round() {
 
     # Build prompt using shared function
     local prompt
-    prompt=$(build_revision_prompt "$include_impl" "$config_path")
+    prompt=$(build_revision_prompt "$include_impl" "$config_path" "$manifest") || return "$EXIT_CONFIG_ERROR"
     if [[ -z "$prompt" ]]; then
         if [[ "$ROBOT_MODE" == "true" ]]; then
             robot_json false "validation_failed" '{"errors":["Prompt template is empty"]}' \
@@ -3652,7 +3686,8 @@ run_round() {
         [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && echo "    --notify \\" >&2
         [[ -n "$thinking_time" ]] && echo "    --browser-thinking-time \"$thinking_time\" \\" >&2
         echo "    --heartbeat 30 \\" >&2
-        echo "    -p \"<prompt>\"" >&2
+        echo "    -p (assembled prompt below)" >&2
+        printf '\n--- BEGIN ASSEMBLED PROMPT ---\n%s\n--- END ASSEMBLED PROMPT ---\n' "$prompt" >&2
         exit $EXIT_SUCCESS
     fi
 
@@ -6063,16 +6098,19 @@ robot_validate() {
         errors+=("Workflow '$workflow' not found")
     else
         # Check required documents exist
-        local readme spec model output_dir
+        local readme spec impl model output_dir impl_every_n
+        local include_impl="${INCLUDE_IMPL:-false}" impl_reason=optional
         readme=$(yaml_unquote "$(get_config_value "readme" "$wf_file" 2>/dev/null || echo "")")
         spec=$(yaml_unquote "$(get_config_value "spec" "$wf_file" 2>/dev/null || echo "")")
+        impl=$(yaml_unquote "$(get_config_value "implementation" "$wf_file" 2>/dev/null || echo "")")
+        impl_every_n=$(yaml_unquote "$(get_config_value "impl_every_n" "$wf_file" 2>/dev/null || echo "")")
         model=$(yaml_unquote "$(get_config_value "model" "$wf_file" 2>/dev/null || echo "")")
         output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$wf_file" 2>/dev/null || echo "")")
 
-        if [[ -n "$readme" && ! -f "$readme" ]]; then
+        if [[ -z "$readme" || ! -f "$readme" ]]; then
             errors+=("README not found: $readme")
         fi
-        if [[ -n "$spec" && ! -f "$spec" ]]; then
+        if [[ -z "$spec" || ! -f "$spec" ]]; then
             errors+=("Spec not found: $spec")
         fi
         if [[ -z "$model" ]]; then
@@ -6084,18 +6122,38 @@ robot_validate() {
 
         # Prompt quality checks (fail fast before expensive Oracle runs).
         local prompt_no_impl=""
-        prompt_no_impl=$(build_revision_prompt "false" "$wf_file" 2>/dev/null || echo "")
-        if [[ -n "$prompt_no_impl" ]]; then
+        if ! prompt_no_impl=$(build_revision_template "false" "$wf_file") || [[ -z "$prompt_no_impl" ]]; then
+            errors+=("Cannot build template")
+        else
             if ! prompt_quality_check "$prompt_no_impl" "$wf_file" "template"; then
                 errors+=("$PROMPT_QC_REASON (template)")
             fi
         fi
 
         local prompt_with_impl=""
-        prompt_with_impl=$(build_revision_prompt "true" "$wf_file" 2>/dev/null || echo "")
-        if [[ -n "$prompt_with_impl" ]]; then
+        if ! prompt_with_impl=$(build_revision_template "true" "$wf_file") || [[ -z "$prompt_with_impl" ]]; then
+            errors+=("Cannot build template_with_impl")
+        else
             if ! prompt_quality_check "$prompt_with_impl" "$wf_file" "template_with_impl"; then
                 errors+=("$PROMPT_QC_REASON (template_with_impl)")
+            fi
+        fi
+
+        # Validate the same selected metadata and assembled bytes as execution.
+        # Invalid round arguments must never enter cadence arithmetic.
+        if is_non_negative_int "$round_num"; then
+            if [[ -n "$impl_every_n" && "$impl_every_n" =~ ^[0-9]+$ && "$impl_every_n" -gt 0 ]] && (( round_num % impl_every_n == 0 )); then
+                include_impl=true
+                impl_reason=impl_every_n
+            fi
+            local manifest prompt
+            if ! manifest=$(build_document_manifest "$readme" "$spec" "$impl" "$include_impl" "$impl_reason"); then
+                errors+=("Cannot observe selected document metadata")
+            elif ! include_impl=$(jq -r '.files[] | select(.role=="implementation") | .included' <<< "$manifest") || \
+                 ! prompt=$(build_revision_prompt "$include_impl" "$wf_file" "$manifest") || [[ -z "$prompt" ]]; then
+                errors+=("Cannot assemble selected prompt")
+            elif ! prompt_quality_check "$prompt" "$wf_file" "assembled prompt"; then
+                errors+=("$PROMPT_QC_REASON (assembled prompt)")
             fi
         fi
     fi
@@ -6153,6 +6211,7 @@ robot_run() {
     local round_num="${1:-}"
     local workflow="${WORKFLOW:-default}"
     local include_impl="${INCLUDE_IMPL:-false}"
+    local impl_reason=optional
     # Preserve robot's ordinary retry policy unless waiting is explicitly
     # requested. A positive budget/infinite opts its worker into the same loop.
     local ORACLE_BUSY_WAIT_SECONDS="$ORACLE_BUSY_WAIT_SECONDS"
@@ -6201,6 +6260,7 @@ robot_run() {
         if (( round_num % impl_every_n == 0 )); then
             verbose "impl_every_n=$impl_every_n: round $round_num triggers automatic impl inclusion"
             include_impl=true
+            impl_reason=impl_every_n
         fi
     fi
 
@@ -6223,11 +6283,15 @@ robot_run() {
         return $?
     fi
 
-    if [[ "$include_impl" == "true" ]]; then
-        if [[ -z "$impl_path" || ! -f "$impl_path" ]]; then
-            include_impl=false
-        fi
+    local manifest manifest_result=0
+    manifest=$(build_document_manifest "$readme_path" "$spec_path" "$impl_path" "$include_impl" "$impl_reason") || manifest_result=$?
+    if [[ "$manifest_result" -ne 0 ]]; then
+        local manifest_code=config_error
+        [[ "$manifest_result" -ne "$EXIT_DEPENDENCY_ERROR" ]] || manifest_code=dependency_missing
+        robot_fail "$manifest_code" '{"kind":"document_metadata"}' "Cannot observe selected document metadata"
+        return $?
     fi
+    include_impl=$(jq -r '.files[] | select(.role=="implementation") | .included' <<< "$manifest") || return "$EXIT_CONFIG_ERROR"
 
     # Build session info
     local slug="apr-${workflow}-round-${round_num}"
@@ -6255,18 +6319,17 @@ robot_run() {
 
     # Build file arguments
     local file_args=(--file "$readme_path")
-    if [[ "$include_impl" == "true" && -n "$impl_path" && -f "$impl_path" ]]; then
+    if [[ "$include_impl" == "true" && -n "$impl_path" ]]; then
         file_args+=(--file "$impl_path")
     fi
     file_args+=(--file "$spec_path")
 
     # Build prompt using shared function
     local prompt
-    prompt=$(build_revision_prompt "$include_impl" "$config_path")
-    if [[ -z "$prompt" ]]; then
+    if ! prompt=$(build_revision_prompt "$include_impl" "$config_path" "$manifest") || [[ -z "$prompt" ]]; then
         release_lock 2>/dev/null || true
-        robot_fail "config_error" '{"errors":["Prompt template is empty"]}' \
-            "Add 'template' or 'template_with_impl' to workflow"
+        robot_fail "config_error" '{"errors":["Cannot assemble selected prompt"]}' \
+            "Check document metadata and workflow template"
         return $?
     fi
 

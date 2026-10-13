@@ -976,10 +976,23 @@ rejected rather than silently replaced.
 Hash and size come from the same byte stream. They describe the **current local
 observation**; a later writer or Oracle read may see different bytes. This
 preview does not send documents, acquire a run lock, create output/log artifacts,
-or prepend metadata to review prompts. Automatic prompt/ledger/queue binding is
-still pending. Required-file, unreadable-file and hashing failures return a
+or assemble a review prompt. Required-file, unreadable-file and hashing failures return a
 configuration error with no partial JSON manifest. `--show-manifest` takes
 precedence over review/render flags.
+
+Normal human and robot runs automatically prepend this observed metadata to
+their review prompt, using the same selected files and inclusion reasons as the
+Oracle file arguments. Templates need no metadata placeholders. Dry-run prints
+the complete assembled prompt on stderr; render passes that same prompt to
+Oracle's renderer and preserves its stdout. `apr robot validate` checks both
+template variants and the selected assembled prompt, including document read
+and hashing failures. Literal braces in generated JSON-quoted filenames are
+escaped reversibly; unresolved template placeholders still fail prompt QC.
+
+This binding describes local observations before Oracle reads the files. It does
+not establish immutable transmitted bytes or model acknowledgement. Persistent
+ledger recording of the manifest/final prompt hash and queue integration remain
+pending.
 
 ### GPT Pro Extended Thinking Stability
 
