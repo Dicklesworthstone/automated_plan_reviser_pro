@@ -419,16 +419,29 @@ case "${1:-}" in
     --help) echo "Usage: oracle [options]"; echo "  --notify"; exit 0 ;;
     session) ;;
     *)
-        slug=""
+        slug="" out=""
         while [[ $# -gt 0 ]]; do
             [[ "$1" == "--slug" ]] && { shift; slug="$1"; }
+            [[ "$1" == "--write-output" ]] && { shift; out="$1"; }
             shift
         done
         if [[ -n "$slug" && -z "${SESSION_ORACLE_NO_STORE:-}" ]]; then
             mkdir -p "$sessions"
+            slug="${SESSION_ORACLE_NORMALIZED_SLUG:-$slug}"
             id="$slug" n=2
             while ! mkdir "$sessions/$id" 2>/dev/null; do id="$slug-$n"; n=$((n + 1)); done
-            echo '{"status":"completed"}' > "$sessions/$id/meta.json"
+            jq -nc --arg id "$id" --arg out "${SESSION_ORACLE_UNBOUND:-$out}" --arg created "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+                '{id:$id,createdAt:$created,status:"completed",options:{writeOutputPath:$out,slug:$id}}' > "$sessions/$id/meta.json"
+            echo "Reattach with: oracle session $id"
+            if [[ -n "${SESSION_ORACLE_VALID_OUTPUT:-}" ]]; then
+                for i in $(seq 1 80); do echo "Line $i of the complete producer review answer."; done > "$out"
+            else
+                { for i in $(seq 1 80); do echo "Line $i of the partial producer review answer."; done
+                  printf 'The next critical recommendation is incomplet'
+                } > "$out"
+            fi
+            if [[ -n "${SESSION_ORACLE_RETRY:-}" && "$id" == "$slug" ]]; then exit 7; fi
+            [[ -z "${SESSION_ORACLE_DELAY:-}" ]] || sleep "$SESSION_ORACLE_DELAY"
         fi
         exit 0 ;;
 esac
@@ -509,12 +522,13 @@ EOF
     log_test_actual "stderr" "$CAPTURED_STDERR"
 
     ! grep -q -- "--harvest" "$TEST_DIR/session_oracle_calls"
-    [[ "$CAPTURED_STDERR" == *"belongs to an earlier run"* ]]
+    [[ "$CAPTURED_STDERR" == *"refusing to harvest an unverified session"* ]]
     [[ "$CAPTURED_STDERR" == *"Automatic recovery failed"* ]]
     ! grep -q "Harvested from session" .apr/rounds/default/round_1.md 2>/dev/null
 }
 
 @test "run: truncation recovery with an Oracle lacking --harvest says to upgrade (GH #6)" {
+    setup_session_oracle
     local bin_dir="$TEST_DIR/old_oracle"
     mkdir -p "$bin_dir"
     cat > "$bin_dir/oracle" << 'EOF'
@@ -531,10 +545,11 @@ case "${1:-}" in
             fi
         done
         exit 0 ;;
-    *) exit 0 ;;
+    *) exec "$SESSION_ORACLE_BIN" "$@" ;;
 esac
 EOF
     chmod +x "$bin_dir/oracle"
+    export SESSION_ORACLE_BIN="$TEST_DIR/session_oracle/oracle"
     export PATH="$bin_dir:$PATH" APR_RECOVERY_WAIT_SECS=0
 
     capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
@@ -544,6 +559,80 @@ EOF
     [[ "$CAPTURED_STDERR" == *"Automatic recovery failed"* ]]
     [[ "$CAPTURED_STDERR" == *"unknown option '--harvest'"* ]]
     [[ "$CAPTURED_STDERR" == *"npm install -g @steipete/oracle@latest"* ]]
+}
+
+@test "run: normalized colliding session recovers real truncated output (GH #9)" {
+    setup_session_oracle
+    export APR_RECOVERY_WAIT_SECS=0 SESSION_ORACLE_NORMALIZED_SLUG=apr-site-overview-independen-round
+    local old="$HOME/.oracle/sessions/$SESSION_ORACLE_NORMALIZED_SLUG"
+    mkdir -p "$old"
+    echo '{"id":"apr-site-overview-independen-round","createdAt":"2020-01-01T00:00:00Z","options":{"writeOutputPath":"/another/round.md"}}' > "$old/meta.json"
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    grep -q "session apr-site-overview-independen-round-2 --harvest" "$TEST_DIR/session_oracle_calls"
+    grep -q 'Harvested from session apr-site-overview-independen-round-2' .apr/rounds/default/round_1.md
+    [[ "$CAPTURED_STDERR" == *"Output appears truncated"* ]]
+    local retained
+    retained=$(find .apr/runs/default -name producer.partial.md)
+    [[ -n "$retained" ]]
+    [[ "$(tail -c 9 "$retained")" == incomplet ]]
+    [[ "$CAPTURED_STDOUT" == *"Reattach with: oracle session apr-site-overview-independen-round-2"* ]]
+}
+
+@test "run: monitoring and attach use the actual normalized ID (GH #9)" {
+    setup_session_oracle
+    export SESSION_ORACLE_NORMALIZED_SLUG=apr-normalized-round-2 SESSION_ORACLE_DELAY=2 SESSION_ORACLE_VALID_OUTPUT=1
+    capture_streams "$APR_SCRIPT" run 1 --no-retry
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDERR" == *"apr attach apr-normalized-round-2"* ]]
+    [[ "$CAPTURED_STDERR" == *"session apr-normalized-round-2 --render"* ]]
+    capture_streams "$APR_SCRIPT" attach apr-normalized-round-2
+    grep -q 'session apr-normalized-round-2 --render' "$TEST_DIR/session_oracle_calls"
+}
+
+@test "run: retry recovery harvests the final actual session only (GH #9)" {
+    setup_session_oracle
+    export APR_RECOVERY_WAIT_SECS=0 APR_MAX_RETRIES=2 APR_INITIAL_BACKOFF=0
+    export SESSION_ORACLE_NORMALIZED_SLUG=apr-retry-round SESSION_ORACLE_RETRY=1
+    capture_streams "$APR_SCRIPT" run 1 --wait
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    grep -q 'session apr-retry-round-2 --harvest' "$TEST_DIR/session_oracle_calls"
+    ! grep -q 'session apr-retry-round --harvest' "$TEST_DIR/session_oracle_calls"
+    grep -q 'Harvested from session apr-retry-round-2' .apr/rounds/default/round_1.md
+}
+
+@test "robot run: unverified identity is null and run attach refuses unbound metadata (GH #9)" {
+    setup_session_oracle
+    export SESSION_ORACLE_NORMALIZED_SLUG=apr-other-round SESSION_ORACLE_UNBOUND=/other/run/output.md
+    export SESSION_ORACLE_DELAY=1 SESSION_ORACLE_VALID_OUTPUT=1
+    capture_streams "$APR_SCRIPT" robot run 1
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    jq -e '.data.slug == null and .data.session_id == null and .data.requested_slug == "apr-default-round-1"' <<< "$CAPTURED_STDOUT"
+    [[ "$CAPTURED_STDOUT" != *"apr attach apr-default-round-1"* ]]
+    local target
+    target=$(jq -r .data.attach_target <<< "$CAPTURED_STDOUT")
+    capture_streams "$APR_SCRIPT" attach "$target"
+    [[ "$CAPTURED_STATUS" -eq 4 ]]
+    ! grep -q 'session apr-other-round --render' "$TEST_DIR/session_oracle_calls"
+}
+
+@test "robot run: long mixed case punctuation workflow with implementation returns actual identity (GH #9)" {
+    setup_session_oracle
+    local workflow="Site.OVERVIEW_Independent-$(printf 'LongName%.0s' {1..24})"
+    setup_test_workflow "$workflow"
+    export SESSION_ORACLE_NORMALIZED_SLUG=apr-site-overview-independen-round-3 SESSION_ORACLE_DELAY=1 SESSION_ORACLE_VALID_OUTPUT=1
+    capture_streams "$APR_SCRIPT" robot run 7 -w "$workflow" --include-impl
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    jq -e --arg requested "apr-$workflow-round-7-with-impl" '
+        .data.session_id == "apr-site-overview-independen-round-3" and
+        .data.slug == .data.session_id and .data.requested_slug == $requested and .data.include_impl
+    ' <<< "$CAPTURED_STDOUT"
+    [[ "$CAPTURED_STDOUT" == *"apr attach apr-site-overview-independen-round-3"* ]]
+    local target
+    target=$(jq -r .data.attach_target <<< "$CAPTURED_STDOUT")
+    capture_streams "$APR_SCRIPT" attach "$target"
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    grep -q 'session apr-site-overview-independen-round-3 --render' "$TEST_DIR/session_oracle_calls"
 }
 
 @test "run: failed truncation recovery shows Oracle's reason (GH #6)" {

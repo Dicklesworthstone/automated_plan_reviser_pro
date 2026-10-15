@@ -389,6 +389,14 @@ done
 if [[ -f .apr/rounds/default/round_1.meta.json ]]; then
     cp .apr/rounds/default/round_1.meta.json "$APR_CLI_COUNT.started"
 fi
+if [[ "$APR_CLI_MODE" == harvest_partial || "$APR_CLI_MODE" == harvest_success ]]; then
+    id="apr-normalized-$count"
+    sessions="${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions"
+    mkdir -p "$sessions/$id"
+    jq -nc --arg id "$id" --arg output "$output" --arg created "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+        '{id:$id,createdAt:$created,options:{writeOutputPath:$output}}' > "$sessions/$id/meta.json"
+    printf 'Reattach with: oracle session %s\n' "$id"
+fi
 case "$APR_CLI_MODE" in
     busy) printf 'ERROR: busy: another review is active\n' >&2; exit 7 ;;
     missing) exit 0 ;;
@@ -646,7 +654,7 @@ EOF
     [[ $(cat "$directory/output.md") == 'Incomplete response.' ]]
     [[ $(cat "$directory/output.md.recovery") == 'Useful separately harvested partial answer.' ]]
     [[ $(cat "$directory/output.md.recovery.err") == 'Retained harvest failure diagnostics.' ]]
-    local markers=("$directory"/oracle-start.*) diagnostics=("$directory"/apr-oracle-stderr.*)
+    local markers=("$directory"/oracle-session-start) diagnostics=("$directory"/apr-oracle-stderr.*)
     [[ -f "${markers[0]}" && -f "${diagnostics[0]}" ]]
     [[ ! -s "$APR_REMOVE_AUDIT" ]]
 }

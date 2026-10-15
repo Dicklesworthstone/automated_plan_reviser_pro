@@ -1465,10 +1465,12 @@ apr robot run 5 --workflow fcp-spec --include-impl
   "ok": true,
   "code": "ok",
   "data": {
-    "slug": "apr-fcp-spec-round-5-with-impl",
+    "slug": "apr-fcp-spec-round-5",
+    "session_id": "apr-fcp-spec-round-5",
+    "requested_slug": "apr-fcp-spec-round-5-with-impl",
     "pid": 12345,
     "output_file": ".apr/rounds/fcp-spec/round_5.md",
-    "log_file": ".apr/logs/oracle_apr-fcp-spec-round-5-with-impl.log",
+    "log_file": ".apr/logs/oracle_round_5.ABC123.log.XYZ789",
     "workflow": "fcp-spec",
     "round": 5,
     "include_impl": true,
@@ -1477,7 +1479,7 @@ apr robot run 5 --workflow fcp-spec --include-impl
 }
 ```
 
-The `slug` can be used with `apr attach` to monitor the session. The `output_file` will contain the GPT Pro response once complete, and `log_file` captures Oracle output.
+The `session_id` (also returned as `slug`) is Oracle's actual session identifier and can be used with `apr attach`. `requested_slug` retains APR's original label; Oracle may shorten it or add a collision suffix. If identity cannot yet be verified, `session_id` and `slug` are `null`. The `attach_target` is a stable APR run reference (`run:<workflow>:<run_id>`): pass it to `apr attach` to resolve the actual session after startup or a retry. APR verifies identity using the private output destination, Oracle's creation timestamp, and a fresh session inventory for each producer attempt; ambiguous or stale candidates are never automatically attached or harvested. The `output_file` will contain the GPT Pro response once complete, and `log_file` captures Oracle output.
 
 #### `apr robot help`
 

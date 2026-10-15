@@ -34,6 +34,54 @@ teardown() {
 # Stream Separation Tests (CRITICAL - per AGENTS.md)
 # =============================================================================
 
+session_metadata() {
+    local id="$1" output="$2" created="${3:-$(date -u +%Y-%m-%dT%H:%M:%S.123Z)}"
+    mkdir -p "$ORACLE_HOME_DIR/sessions/$id"
+    jq -nc --arg id "$id" --arg output "$output" --arg created "$created" \
+        '{id:$id,createdAt:$created,status:"completed",options:{writeOutputPath:$output,slug:$id}}' \
+        > "$ORACLE_HOME_DIR/sessions/$id/meta.json"
+}
+
+@test "Oracle identity: output binding excludes concurrent rounds and stale metadata updates" {
+    export ORACLE_HOME_DIR="$TEST_DIR/oracle"
+    local marker="$TEST_DIR/start" output="$TEST_DIR/private/output.md"
+    session_metadata apr-old "$output"
+    oracle_session_snapshot "$marker"
+    # Even a freshly rewritten meta.json must not resurrect an existing ID.
+    session_metadata apr-old "$output"
+    session_metadata apr-collision-99 "$TEST_DIR/other/output.md"
+    session_metadata apr-site-overview-independen-round-2 "$output"
+    run resolve_oracle_session_id "$output" "$marker"
+    [[ "$output" == apr-site-overview-independen-round-2 ]]
+}
+
+@test "Oracle identity: retries exclude earlier attempts and ambiguous matches fail closed" {
+    export ORACLE_HOME_DIR="$TEST_DIR/oracle"
+    local marker="$TEST_DIR/start" destination="$TEST_DIR/private/output.md"
+    oracle_session_snapshot "$marker"
+    session_metadata apr-normalized "$destination"
+    oracle_session_snapshot "$marker"
+    session_metadata apr-normalized-2 "$destination"
+    run resolve_oracle_session_id "$destination" "$marker"
+    [[ "$output" == apr-normalized-2 ]]
+    session_metadata apr-normalized-3 "$destination"
+    run resolve_oracle_session_id "$destination" "$marker"
+    [[ -z "$output" ]]
+}
+
+@test "Oracle identity: creation time and metadata ID independently constrain new directories" {
+    export ORACLE_HOME_DIR="$TEST_DIR/oracle"
+    local marker="$TEST_DIR/start" destination="$TEST_DIR/private/output.md"
+    oracle_session_snapshot "$marker"
+    session_metadata apr-stale "$destination" 2020-01-01T00:00:00Z
+    session_metadata apr-invalid "$destination" invalid
+    mkdir -p "$ORACLE_HOME_DIR/sessions/apr-mismatch"
+    session_metadata apr-actual "$TEST_DIR/other.md"
+    cp "$ORACLE_HOME_DIR/sessions/apr-actual/meta.json" "$ORACLE_HOME_DIR/sessions/apr-mismatch/meta.json"
+    run resolve_oracle_session_id "$destination" "$marker"
+    [[ -z "$output" ]]
+}
+
 @test "print_success: outputs to stderr only" {
     export QUIET_MODE=false
 

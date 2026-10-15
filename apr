@@ -1340,6 +1340,11 @@ run_oracle_once() {
     fi
 
     local pipeline_status=()
+    # A fresh snapshot for EVERY producer attempt excludes earlier retries,
+    # even when they used the same private output destination.
+    if [[ -n "${APR_LEDGER_DIR:-}" ]]; then
+        oracle_session_snapshot "$APR_LEDGER_DIR/oracle-session-start" || return 1
+    fi
     APR_ATTEMPTS_COUNT=$((${APR_ATTEMPTS_COUNT:-0} + 1))
     {
         if "${ORACLE_CMD[@]}" "$@" 2>&1 1>&3 3>&- | tee "$stderr_file" >&2; then
@@ -1568,39 +1573,71 @@ validate_output_file() {
     return 0
 }
 
-# Oracle turns --slug into a unique session ID: when <slug> is already taken
-# (an earlier run of the same round, an earlier retry attempt, or another
-# project with the same workflow name) the new session is <slug>-2, <slug>-3...
-# Recovery must harvest the session THIS run created, never an older one, or
-# it would overwrite the round with a stale answer.
-# Usage: resolve_oracle_session_id <slug> <marker_file>
-# Prints the <slug>/<slug>-N session whose meta.json changed after the marker
-# (created just before Oracle started), preferring the highest suffix. Prints
-# nothing when that cannot be determined.
-resolve_oracle_session_id() {
-    local slug="$1" marker="$2"
-    local sessions_dir="${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions"
-    [[ -n "$slug" && -n "$marker" && -e "$marker" && -d "$sessions_dir" ]] || return 0
+# Requested slugs are labels, not identities. Oracle normalizes them and adds
+# collision suffixes. Match its actual metadata against the private output
+# destination and a pre-launch inventory, independently of the requested label.
+oracle_session_snapshot() {
+    local marker="$1" dir snapshot
+    snapshot=$(mktemp "$marker.XXXXXX") || return 1
+    {
+        date +%s
+        for dir in "${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions/"*; do
+            [[ -d "$dir" ]] && printf '%s\n' "${dir##*/}"
+        done
+        true
+    } > "$snapshot" || return 1
+    mv -f "$snapshot" "$marker"
+}
 
-    local best="" best_n=0 dir name n
-    for dir in "$sessions_dir/$slug" "$sessions_dir/$slug"-*; do
-        [[ -f "$dir/meta.json" ]] || continue
+resolve_oracle_session_id() {
+    local output="$1" marker="$2"
+    local sessions_dir="${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions"
+    [[ -n "$output" && -r "$marker" && -d "$sessions_dir" ]] || return 0
+    local best="" dir name started now inventory
+    local -A existing=()
+    inventory=$(cat "$marker") || return 0
+    IFS= read -r started <<< "$inventory" || return 0
+    [[ "$started" =~ ^[0-9]+$ ]] || return 0
+    while IFS= read -r name; do
+        [[ -z "$name" ]] || existing["$name"]=1
+    done <<< "$inventory"
+    now=$(date +%s)
+    for dir in "$sessions_dir/"*; do
+        [[ -f "$dir/meta.json" && ! -L "$dir" && ! -L "$dir/meta.json" ]] || continue
         name="${dir##*/}"
-        if [[ "$name" == "$slug" ]]; then
-            n=1
-        else
-            n="${name#"$slug"-}"
-            [[ "$n" =~ ^[0-9]{1,9}$ ]] || continue
-            n=$((10#$n))
-        fi
-        [[ "$dir/meta.json" -nt "$marker" ]] || continue
-        if (( n > best_n )); then
-            best_n=$n
-            best="$name"
-        fi
+        [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || continue
+        # Modification time is not creation evidence: an old browser session
+        # can update its metadata while this invocation is running.
+        [[ -z "${existing[$name]+present}" ]] || continue
+        jq -e --arg id "$name" --arg output "$output" --argjson start "$started" --argjson now "$now" '
+            (.createdAt | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $created |
+            .id == $id and .options.writeOutputPath == $output and
+            $created >= $start and $created <= $now
+        ' "$dir/meta.json" >/dev/null 2>&1 || continue
+        # Ambiguity is a failure to identify, never permission to pick newest.
+        [[ -z "$best" ]] || return 0
+        best="$name"
     done
+    # A background retry may replace the snapshot during this scan. Never
+    # return an identity assembled from two different producer attempts.
+    [[ "$(cat "$marker")" == "$inventory" ]] || return 0
     [[ -n "$best" ]] && printf '%s\n' "$best"
     return 0
+}
+
+oracle_session_for_run() {
+    resolve_oracle_session_id "$APR_RUN_OUTPUT" "$APR_LEDGER_DIR/oracle-session-start"
+}
+
+# Oracle may not have allocated its session by the first background liveness
+# check. Bound the wait; callers report unavailable identity without guessing.
+oracle_session_wait() {
+    local id="" count
+    for count in {1..3}; do
+        id=$(oracle_session_for_run)
+        if [[ -n "$id" ]]; then printf '%s\n' "$id"; return 0; fi
+        sleep 0.1
+    done
 }
 
 # -----------------------------------------------------------------------------
@@ -3275,7 +3312,9 @@ apr_run_begin() {
     local workflow="$1" round="$2" slug="$3" config="$4" output="$5"
     ledger_write_start "$workflow" "$round" "$slug" "$config" "$output" || return $?
     apr_bind_validation || return $?
-    APR_RUN_OUTPUT="$APR_LEDGER_DIR/output.md"
+    # Oracle resolves --write-output before recording options.writeOutputPath.
+    # Pass an absolute path so metadata matching is independent of cwd/spelling.
+    APR_RUN_OUTPUT="$(cd "$APR_LEDGER_DIR" && pwd -P)/output.md" || return "$EXIT_CONFIG_ERROR"
     APR_RUN_OUTPUT_PATH="$output"
     APR_RUN_PRIOR_OUTPUT=""
     if [[ -e "$output" || -L "$output" ]]; then
@@ -5130,11 +5169,6 @@ run_round() (
         local start_time oracle_exit=0
         start_time=$(date +%s)
 
-        # Timestamp marker so truncation recovery can tell which Oracle
-        # session this run created (see resolve_oracle_session_id).
-        local session_marker=""
-        session_marker=$(mktemp "$APR_LEDGER_DIR/oracle-start.XXXXXX" 2>/dev/null) || session_marker=""
-
         # Use auto-retry wrapper if enabled
         if [[ "$enable_retry" == "true" ]]; then
             run_oracle_with_retry "${oracle_args[@]}" || oracle_exit=$?
@@ -5177,23 +5211,10 @@ run_round() (
                 # which would flood the terminal, so stdout is discarded;
                 # stderr is kept so a failure says why.
                 local recovery_err_file="${output_file}.recovery.err"
-                local session_id stale_session=false
-                session_id=$(resolve_oracle_session_id "$slug" "$session_marker")
+                local session_id
+                session_id=$(oracle_session_for_run)
                 if [[ -z "$session_id" ]]; then
-                    session_id="$slug"
-                    # The plain slug exists but predates this run: harvesting
-                    # it would bring back an older answer.
-                    local slug_meta="${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions/$slug/meta.json"
-                    if [[ -n "$session_marker" && -f "$slug_meta" && ! "$slug_meta" -nt "$session_marker" ]]; then
-                        stale_session=true
-                    fi
-                    verbose "Could not identify this run's Oracle session; trying slug: $slug"
-                elif [[ "$session_id" != "$slug" ]]; then
-                    print_dim "Oracle session for this run: $session_id"
-                fi
-                if [[ "$stale_session" == "true" ]]; then
-                    print_warning "Could not find the Oracle session this run created; not harvesting '$slug' (it belongs to an earlier run)"
-                    session_id="<session-id from 'oracle status'>"
+                    print_warning "Could not verify this run's Oracle session; refusing to harvest an unverified session (it may belong to an earlier run)"
                 elif "${ORACLE_CMD[@]}" session "$session_id" --harvest --write-output "$recovery_output_file" \
                         >/dev/null 2>"$recovery_err_file"; then
                     if validate_output_file "$recovery_output_file"; then
@@ -5230,8 +5251,13 @@ run_round() (
                     echo "" >&2
                     print_info "Manual recovery options:"
                     print_info "  1. Re-run the round: apr run $round_num --wait"
-                    print_info "  2. Harvest the answer by hand: oracle session $session_id --harvest --write-output \"$output_file\""
-                    print_info "  3. Check the Oracle session: apr attach $session_id"
+                    if [[ -n "$session_id" ]]; then
+                        print_info "  2. Harvest the answer by hand: oracle session $session_id --harvest --write-output \"$output_file\""
+                        print_info "  3. Check the Oracle session: apr attach $session_id"
+                    else
+                        print_info "  2. Inspect oracle status and verify the session's output destination against: $output_file"
+                        print_info "  3. Retained creation evidence: $APR_LEDGER_DIR/oracle-session-start"
+                    fi
                     print_info "  4. File an issue if this persists: https://github.com/steipete/oracle/issues"
                     echo "" >&2
                     print_info "Partial output saved to: $output_file"
@@ -5332,7 +5358,7 @@ run_round() (
     else
         local result_file
         if ! mkdir -p "$CONFIG_DIR/logs" ||
-            ! result_file=$(mktemp "$CONFIG_DIR/logs/oracle_${slug}.result.XXXXXX"); then
+            ! result_file=$(mktemp "$CONFIG_DIR/logs/oracle_${APR_LEDGER_RUN_ID}.result.XXXXXX"); then
             print_error "Cannot retain the Oracle launch result; Oracle was not started"
             exit "$EXIT_CONFIG_ERROR"
         fi
@@ -5382,7 +5408,11 @@ run_round() (
         print_success "Oracle running in background (PID: $oracle_pid)"
         echo "" >&2
 
-        if [[ "$GUM_AVAILABLE" == "true" && "$QUIET_MODE" != "true" ]]; then
+        local session_id
+        session_id=$(oracle_session_wait)
+        if [[ -z "$session_id" ]]; then
+            print_info "Oracle session identity is not yet verified. Once allocated: apr attach run:$workflow:$APR_LEDGER_RUN_ID"
+        elif [[ "$GUM_AVAILABLE" == "true" && "$QUIET_MODE" != "true" ]]; then
             gum style \
                 --border rounded \
                 --border-foreground 39 \
@@ -5390,14 +5420,14 @@ run_round() (
                 "$(gum style --foreground 214 --bold "MONITORING COMMANDS")" \
                 "" \
                 "Check status:      $(gum style --foreground 82 "apr status")" \
-                "Attach to session: $(gum style --foreground 82 "apr attach $slug")" \
-                "View with output:  $(gum style --foreground 82 "${ORACLE_CMD[*]} session $slug --render")" >&2
+                "Attach to session: $(gum style --foreground 82 "apr attach $session_id")" \
+                "View with output:  $(gum style --foreground 82 "${ORACLE_CMD[*]} session $session_id --render")" >&2
         elif [[ "$QUIET_MODE" != "true" ]]; then
             echo -e "  ${BOLD}${CYAN}MONITORING COMMANDS${NC}" >&2
             echo "" >&2
             echo -e "  Check status:      ${GREEN}apr status${NC}" >&2
-            echo -e "  Attach to session: ${GREEN}apr attach $slug${NC}" >&2
-            echo -e "  View with output:  ${GREEN}${ORACLE_CMD[*]} session $slug --render${NC}" >&2
+            echo -e "  Attach to session: ${GREEN}apr attach $session_id${NC}" >&2
+            echo -e "  View with output:  ${GREEN}${ORACLE_CMD[*]} session $session_id --render${NC}" >&2
         fi
 
         echo "" >&2
@@ -5462,6 +5492,23 @@ show_status() {
 
 attach_session() {
     local session="$1"
+    # Run references defer identification until attach time (e.g. slow npx
+    # startup), and follow retries without treating the requested slug as ID.
+    if [[ "$session" == run:* ]]; then
+        local reference="${session#run:}" workflow run_id directory
+        workflow="${reference%%:*}"
+        run_id="${reference#*:}"
+        if [[ ! "$workflow" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ||
+              ! "$run_id" =~ ^round_[0-9]+\.[A-Za-z0-9]+$ ]]; then
+            print_error "Invalid APR run reference"
+            return "$EXIT_USAGE_ERROR"
+        fi
+        directory="$CONFIG_DIR/runs/$workflow/$run_id"
+        [[ -d "$directory" && ! -L "$directory" ]] || { print_error "APR run not found"; return "$EXIT_CONFIG_ERROR"; }
+        directory=$(cd "$directory" && pwd -P) || return "$EXIT_CONFIG_ERROR"
+        session=$(resolve_oracle_session_id "$directory/output.md" "$directory/oracle-session-start")
+        [[ -n "$session" ]] || { print_error "Oracle session identity is not yet verified for this APR run"; return "$EXIT_CONFIG_ERROR"; }
+    fi
     print_banner
     print_info "Attaching to session: $session"
     echo "" >&2
@@ -7704,12 +7751,12 @@ robot_run() (
     # Important: robot mode must keep output clean; capture all Oracle/retry output to a log file.
     local logs_dir="$CONFIG_DIR/logs"
     local oracle_log
-    if ! mkdir -p "$logs_dir" 2>/dev/null || ! oracle_log=$(mktemp "$logs_dir/oracle_${slug}.log.XXXXXX"); then
+    if ! mkdir -p "$logs_dir" 2>/dev/null || ! oracle_log=$(mktemp "$logs_dir/oracle_${APR_LEDGER_RUN_ID}.log.XXXXXX"); then
         robot_fail config_error '{"reason":"log_capture_failed"}' "Cannot retain this run's Oracle diagnostics"
         return $?
     fi
     local result_file
-    if ! result_file=$(mktemp "$logs_dir/oracle_${slug}.result.XXXXXX"); then
+    if ! result_file=$(mktemp "$logs_dir/oracle_${APR_LEDGER_RUN_ID}.result.XXXXXX"); then
         release_lock 2>/dev/null || true
         robot_fail "config_error" '{"reason":"result_capture_failed"}' "Cannot retain the Oracle launch result"
         return $?
@@ -7763,9 +7810,13 @@ robot_run() (
     fi
 
     # Return session info
-    local data
+    local data session_id monitoring_hint
+    session_id=$(oracle_session_wait)
+    monitoring_hint="Session identity pending; use 'apr attach run:$workflow:$APR_LEDGER_RUN_ID' once Oracle allocates it"
+    [[ -z "$session_id" ]] || monitoring_hint="Use 'apr attach $session_id' to monitor"
     data=$(jq -nc \
-        --arg slug "$slug" \
+        --arg slug "$session_id" --arg requested_slug "$slug" \
+        --arg attach_target "run:$workflow:$APR_LEDGER_RUN_ID" \
         --argjson pid "$oracle_pid" \
         --arg output_file "$output_file" \
         --arg log_file "$oracle_log" \
@@ -7776,7 +7827,10 @@ robot_run() (
         --arg ledger "$APR_LEDGER_FILE" --arg run_id "$APR_LEDGER_RUN_ID" --arg record "$APR_LEDGER_DIR/terminal.meta.json" \
         --argjson include_impl "$include_impl" \
         '{
-            slug: $slug,
+            slug: (if $slug == "" then null else $slug end),
+            session_id: (if $slug == "" then null else $slug end),
+            requested_slug: $requested_slug,
+            attach_target: $attach_target,
             pid: $pid,
             output_file: $output_file,
             log_file: $log_file,
@@ -7790,7 +7844,7 @@ robot_run() (
             busy_policy: $busy_policy
         }')
 
-    robot_json true "ok" "$data" "Use 'apr status' or 'apr attach $slug' to monitor"
+    robot_json true "ok" "$data" "$monitoring_hint"
 )
 
 # Robot: History - List revision rounds
