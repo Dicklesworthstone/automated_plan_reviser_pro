@@ -114,6 +114,13 @@ recovery_receipt_valid() {
     local output_path parent expected round session
     round="${run_id#round_}"; round="${round%%.*}"
     [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+    # Reuse must authenticate the original pre-launch inventory too. A changed
+    # marker can rebind the run to another Oracle attempt while the terminal
+    # record and recovered answer remain byte-for-byte identical.
+    local marker="$directory/oracle-session-start" marker_sha
+    [[ -f "$marker" && -r "$marker" && ! -L "$marker" ]] || return 1
+    marker_sha=$(file_digest "$marker") || return 1
+    [[ "$marker_sha" == "$(jq -er '.creation_evidence_sha256 | select(type=="string" and test("^[a-f0-9]{64}$"))' "$receipt")" ]] || return 1
     jq -se --arg workflow "$workflow" --arg id "$run_id" --arg terminal "$terminal_hash" --arg receipt "$receipt" --argjson round "$round" '
         length==1 and (.[0] | .schema_version=="1.0.0" and .workflow==$workflow and .run_id==$id and
             .round==$round and .terminal_sha256==$terminal and .receipt_file==$receipt and
