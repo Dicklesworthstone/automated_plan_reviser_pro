@@ -178,7 +178,7 @@ apr stats -w myspec  # Score ≥0.75 = approaching stability
 
 ## Dependencies
 
-Required: bash 4+, node 18+, oracle (or npx @steipete/oracle)
+Required: bash 4+, Node.js 24+ with npm, oracle (or npx @steipete/oracle)
 Optional: gum (TUI), jq (robot mode), delta (prettier diffs)
 ```
 
@@ -1975,7 +1975,7 @@ APR respects the [NO_COLOR](https://no-color.org/) standard. When `NO_COLOR` is 
 |---------|---------|
 | Bash 4+ | Script runtime |
 | [Oracle](https://github.com/steipete/oracle) | GPT Pro browser automation (excellent tool by [Peter Steinberger](https://github.com/steipete)) |
-| Node.js 18+ | Oracle runtime |
+| Node.js 24+ with npm | Oracle runtime (`@steipete/oracle` requires Node 24 or newer) |
 | curl or wget | Installation |
 
 ### Optional
@@ -1988,12 +1988,13 @@ APR respects the [NO_COLOR](https://no-color.org/) standard. When `NO_COLOR` is 
 ### Install Dependencies
 
 ```bash
-# Node.js (if not installed)
+# Node.js 24+ with npm (Oracle requires Node 24 or newer)
 # macOS
 brew install node
 
-# Ubuntu/Debian
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+# Ubuntu/Debian: the distribution's nodejs is usually older than 24 and ships npm as a
+# separate package, so use NodeSource's Node 24 feed (this adds an apt source)
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
 # Oracle

@@ -207,7 +207,7 @@ Visual design:
 |---------|---------|---------|
 | Bash | 4.0+ | Script runtime |
 | Oracle | latest | GPT Pro browser automation |
-| Node.js | 18+ | Oracle runtime |
+| Node.js | 24+ (with npm) | Oracle runtime |
 | curl/wget | any | HTTP requests |
 
 ### Optional
