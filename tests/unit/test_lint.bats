@@ -6,7 +6,7 @@ setup() {
     setup_test_environment
     load_apr_functions
     cd "$TEST_PROJECT" || return
-    export APR_NO_ORACLE_PATCH=1 APR_NO_NPX=1
+    export APR_NO_NPX=1
 }
 teardown() { teardown_test_environment; }
 

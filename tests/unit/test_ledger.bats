@@ -409,7 +409,7 @@ EOF
     chmod +x "$TEST_DIR/oracle-bin/oracle"
     export PATH="$TEST_DIR/oracle-bin:$PATH"
     export APR_CLI_COUNT="$TEST_DIR/cli-count" APR_CLI_MODE="${1:-success}"
-    export APR_NO_NPX=1 APR_NO_ORACLE_PATCH=1 APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0 APR_RECOVERY_WAIT_SECS=0
+    export APR_NO_NPX=1 APR_MAX_RETRIES=1 APR_INITIAL_BACKOFF=0 APR_RECOVERY_WAIT_SECS=0
 }
 
 @test "ledger integration: foreground observes started inputs before one real producer and records success" {
@@ -605,7 +605,7 @@ EOF
     shell_path=$(command -v bash); jq_path=$(command -v jq)
     mkdir -p "$isolated_bin"
     ln -s "$jq_path" "$isolated_bin/jq"
-    export APR_NO_NPX=1 APR_NO_ORACLE_PATCH=1
+    export APR_NO_NPX=1
     capture_streams env PATH="$isolated_bin:/usr/bin:/bin:/usr/sbin" "$shell_path" "$APR_SCRIPT" run 1 --wait
     [[ "$CAPTURED_STATUS" -eq 3 ]]
     ledger_validate < .apr/rounds/default/round_1.meta.json

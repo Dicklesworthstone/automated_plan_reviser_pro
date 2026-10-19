@@ -1248,19 +1248,18 @@ guarantees, not model correctness, live-service or power-loss qualification.
 
 ### GPT Pro Extended Thinking Stability
 
-GPT Pro Extended Thinking can pause for 10-30+ seconds during its reasoning phase. Without adjustment, Oracle's browser automation might interpret these pauses as "response complete" and capture truncated output.
+GPT Pro Extended Thinking can pause for 10-30+ seconds during its reasoning phase. A completion check based only on "the text stopped changing" would capture a truncated answer during such a pause.
 
-APR automatically patches Oracle's stability detection thresholds at runtime to tolerate these long pauses:
+Oracle 0.16 and later do not rely on that alone. A turn counts as finished only when the stop button is gone, ChatGPT's finished-turn action bar has stayed visible for several polls with no content change, no thinking activity is visible, and the content has been stable for a minimum time. APR leaves Oracle's installed files alone and passes its environment through to every Oracle process, so Oracle's own knobs lengthen that gate:
 
-| Parameter | Oracle Default | APR Default | Purpose |
-|-----------|---------------|-------------|---------|
-| `minStableMs` | 1.2s | 30s | Time text must stop changing |
-| `settleWindowMs` | 5s | 30s | Completion detection window |
-| `stableCycles` | 6 | 12 | Polling cycles required |
+| Variable (read by Oracle 0.16+) | Oracle Default | Purpose |
+|----------|---------------|---------|
+| `ORACLE_TERMINAL_MIN_STABLE_MS` | `1200` | Time the content must stay unchanged before the turn counts as finished |
+| `ORACLE_BAR_CONFIRM_CYCLES` | `3` | Polls the finished-turn action bar must stay confirmed |
 
-The patch is applied during pre-flight checks and persists until Oracle is updated. A backup of the original file is preserved for restoration.
+APR versions up to 1.3.1 tried to sed-patch Oracle's `assistantResponse.js`. That patch only ever matched Oracle 0.8.0-0.8.4 and has been removed, together with its `APR_ORACLE_*` threshold variables and its per-run "may be truncated" warnings. If one of those variables is still set, pre-flight names it and points to the Oracle variables above.
 
-**Automatic recovery:** If truncation is detected despite patching (output ends mid-word), APR waits 30 seconds (`APR_RECOVERY_WAIT_SECS`) and harvests the Oracle session (`oracle session <slug> --harvest --write-output ...`) to capture the complete response. If that fails, Oracle's own error is shown.
+**Automatic recovery:** If truncation is detected anyway (output ends mid-word), APR waits 30 seconds (`APR_RECOVERY_WAIT_SECS`) and harvests the Oracle session (`oracle session <slug> --harvest --write-output ...`) to capture the complete response. If that fails, Oracle's own error is shown.
 
 ### Session Locking
 
@@ -2038,16 +2037,12 @@ sudo apt-get install jq
 | `APR_MAX_RETRIES` | Maximum Oracle retry attempts | `3` |
 | `APR_INITIAL_BACKOFF` | Initial retry delay (seconds) | `10` |
 
-### Oracle Stability Thresholds
-
-These control how APR patches Oracle to tolerate GPT Pro Extended Thinking pauses:
+### Oracle Completion Gate and Recovery
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `APR_ORACLE_MIN_STABLE_MS` | Time text must stop changing before considered complete | `30000` |
-| `APR_ORACLE_SHORT_STABLE_MS` | Shorter threshold for non-extended responses | `15000` |
-| `APR_ORACLE_SETTLE_WINDOW_MS` | Completion detection window | `30000` |
-| `APR_ORACLE_STABLE_CYCLES` | Polling cycles required for stability | `12` |
+| `ORACLE_TERMINAL_MIN_STABLE_MS` | Read by Oracle 0.16+: time the content must stay unchanged before the turn counts as finished | Oracle's (`1200`) |
+| `ORACLE_BAR_CONFIRM_CYCLES` | Read by Oracle 0.16+: polls the finished-turn action bar must stay confirmed | Oracle's (`3`) |
 | `APR_RECOVERY_WAIT_SECS` | Seconds to wait before reattaching to recover a truncated answer (`0` skips the wait) | `30` |
 
 ### Status & Monitoring
@@ -2240,16 +2235,17 @@ npx -y @steipete/oracle session apr-default-round-5 --render
 <details>
 <summary><strong>Response appears truncated or incomplete</strong></summary>
 
-**Cause:** GPT Pro Extended Thinking can pause for 10-30+ seconds during reasoning. If Oracle's stability thresholds are too low, it may capture output prematurely.
+**Cause:** GPT Pro Extended Thinking can pause for 10-30+ seconds during reasoning. If Oracle's completion gate closes during such a pause, it captures output prematurely.
 
 **Fix:**
 
-APR automatically patches Oracle's stability thresholds to tolerate extended thinking pauses. If you still experience truncation:
+Update Oracle first (`npm install -g @steipete/oracle@latest`): 0.16 and later wait for ChatGPT's finished-turn signals, not just for the text to stop changing. If you still see truncation, lengthen Oracle's gate (APR passes the environment through to Oracle):
 
 ```bash
-# Increase the stability wait time (milliseconds)
-export APR_ORACLE_MIN_STABLE_MS=45000
-export APR_ORACLE_SETTLE_WINDOW_MS=45000
+# Content must stay unchanged this long (milliseconds) before Oracle finishes
+export ORACLE_TERMINAL_MIN_STABLE_MS=30000
+# Polls the finished-turn action bar must stay confirmed
+export ORACLE_BAR_CONFIRM_CYCLES=6
 
 # Then re-run
 apr run 5

@@ -52,13 +52,12 @@
 #   APR_NO_GUM         Disable gum even if available
 #   NO_COLOR           Disable colors (accessibility)
 #
-#   Oracle Stability Thresholds (prevent truncation with GPT Pro Extended Thinking):
-#   APR_ORACLE_MIN_STABLE_MS     Min stability time for normal answers (default: 30000ms)
-#   APR_ORACLE_SHORT_STABLE_MS   Min stability time for short answers (default: 15000ms)
-#   APR_ORACLE_SETTLE_WINDOW_MS  Settle window for completion detection (default: 30000ms)
-#   APR_ORACLE_STABLE_CYCLES     Required stable polling cycles (default: 12)
-#   APR_NO_ORACLE_PATCH          Disable Oracle patching (set to 1)
 #   APR_RECOVERY_WAIT_SECS       Wait before reattaching to recover a truncated answer (default: 30)
+#
+#   Oracle reads its own completion-gate knobs (Oracle 0.16+), and apr passes
+#   the environment through unchanged:
+#   ORACLE_TERMINAL_MIN_STABLE_MS  Content must be unchanged this long before completion (Oracle default: 1200)
+#   ORACLE_BAR_CONFIRM_CYCLES      Polls the finished-turn action bar must stay confirmed (Oracle default: 3)
 #
 # More info: https://github.com/Dicklesworthstone/automated_plan_reviser_pro
 
@@ -156,30 +155,6 @@ ORACLE_CMD=()
 # Oracle feature detection (best-effort, set during preflight and other entrypoints)
 ORACLE_SUPPORTS_NOTIFY=false
 ORACLE_FEATURES_DETECTED=false
-
-# Oracle stability thresholds (monkey-patch prevention for GPT Pro Extended Thinking truncation)
-# GPT Pro can pause 10-30+ seconds during thinking, which Oracle misinterprets as completion.
-# These thresholds are patched into Oracle's assistantResponse.js at runtime.
-APR_ORACLE_MIN_STABLE_MS="${APR_ORACLE_MIN_STABLE_MS:-30000}"      # Min stable time for normal answers (default: 30s)
-APR_ORACLE_SHORT_STABLE_MS="${APR_ORACLE_SHORT_STABLE_MS:-15000}"  # Min stable time for short answers (default: 15s)
-APR_ORACLE_SETTLE_WINDOW_MS="${APR_ORACLE_SETTLE_WINDOW_MS:-30000}" # Settle window for normal answers (default: 30s)
-APR_ORACLE_STABLE_CYCLES="${APR_ORACLE_STABLE_CYCLES:-12}"         # Required stable cycles for normal (default: 12)
-APR_ORACLE_PATCHED=false                                           # Track if we've patched Oracle this session
-
-# Validate Oracle threshold env vars are positive integers
-for _apr_var in APR_ORACLE_MIN_STABLE_MS APR_ORACLE_SHORT_STABLE_MS APR_ORACLE_SETTLE_WINDOW_MS APR_ORACLE_STABLE_CYCLES; do
-    _apr_val="${!_apr_var}"
-    if ! [[ "$_apr_val" =~ ^[0-9]+$ ]] || [[ "$_apr_val" -eq 0 ]]; then
-        echo "Warning: $_apr_var must be a positive integer, got '$_apr_val'. Using default." >&2
-        case "$_apr_var" in
-            APR_ORACLE_MIN_STABLE_MS) APR_ORACLE_MIN_STABLE_MS=30000 ;;
-            APR_ORACLE_SHORT_STABLE_MS) APR_ORACLE_SHORT_STABLE_MS=15000 ;;
-            APR_ORACLE_SETTLE_WINDOW_MS) APR_ORACLE_SETTLE_WINDOW_MS=30000 ;;
-            APR_ORACLE_STABLE_CYCLES) APR_ORACLE_STABLE_CYCLES=12 ;;
-        esac
-    fi
-done
-unset _apr_var _apr_val
 
 # Seconds to wait before reattaching to the Oracle session when an answer looks
 # truncated. Deep-thinking models can keep generating for minutes. 0 = no wait.
@@ -825,181 +800,27 @@ oracle_detect_features() {
 }
 
 # -----------------------------------------------------------------------------
-# Oracle Stability Threshold Patching (GPT Pro Extended Thinking Fix)
+# Oracle Completion Gate
 # -----------------------------------------------------------------------------
-# Oracle's browser automation detects "completion" when the response text stops
-# changing. However, GPT Pro Extended Thinking can pause for 10-30+ seconds
-# during its reasoning phase, which Oracle misinterprets as completion.
-#
-# This function patches Oracle's assistantResponse.js to use configurable
-# stability thresholds that tolerate GPT Pro's thinking pauses.
-#
-# Original values (cause truncation):
-#   minStableMs: 1200ms (normal), 8000ms (short)
-#   settleWindowMs: 5000ms (normal), 12000ms (short)
-#   stableCycles: 6 (normal), 12 (short)
-#
-# Patched values (configured via APR_ORACLE_* env vars):
-#   minStableMs: APR_ORACLE_MIN_STABLE_MS (normal), APR_ORACLE_SHORT_STABLE_MS (short)
-#   settleWindowMs: APR_ORACLE_SETTLE_WINDOW_MS (normal), 15000ms (short)
-#   stableCycles: APR_ORACLE_STABLE_CYCLES (normal), 18 (short)
-#
-# NOTE: If Oracle is updated via npm, the backup may become stale.
-# Run `apr --restore-oracle` or delete the .apr-backup file to re-patch.
+# apr used to sed-patch stability constants into Oracle's installed
+# assistantResponse.js. Those four lines existed only in Oracle 0.8.0-0.8.4, the
+# lookup never found npx installs, and every later Oracle left the file
+# unchanged while apr warned about truncation on every run. Oracle 0.16+ decides
+# completion itself (stop button gone, finished-turn action bar confirmed for
+# several polls, no thinking activity, content stable) and reads its own knobs
+# from the environment, which apr passes to every Oracle process unchanged.
 
-ORACLE_ASSISTANT_RESPONSE_PATH=""
-ORACLE_BACKUP_PATH=""
-
-find_oracle_assistant_response() {
-    # Find Oracle's assistantResponse.js in the npm installation
-    local oracle_path=""
-
-    # Try to find oracle binary location
-    if command -v oracle &>/dev/null; then
-        oracle_path=$(command -v oracle)
-        # Resolve symlinks to find actual installation
-        if [[ -L "$oracle_path" ]]; then
-            oracle_path=$(readlink -f "$oracle_path" 2>/dev/null || realpath "$oracle_path" 2>/dev/null)
-        fi
-    fi
-
-    # Find the node_modules root
-    local node_modules=""
-    if [[ -n "$oracle_path" ]]; then
-        # Navigate from bin/oracle to lib/node_modules/@steipete/oracle
-        local bin_dir
-        bin_dir=$(dirname "$oracle_path")
-        local prefix_dir
-        prefix_dir=$(dirname "$bin_dir")
-        node_modules="$prefix_dir/lib/node_modules"
-    fi
-
-    # Fallback: try npm root -g
-    if [[ -z "$node_modules" ]] || [[ ! -d "$node_modules" ]]; then
-        node_modules=$(npm root -g 2>/dev/null || echo "")
-    fi
-
-    if [[ -z "$node_modules" ]] || [[ ! -d "$node_modules" ]]; then
-        verbose "find_oracle_assistant_response: Cannot find npm global node_modules"
-        return 1
-    fi
-
-    local target_file="$node_modules/@steipete/oracle/dist/src/browser/actions/assistantResponse.js"
-    if [[ -f "$target_file" ]]; then
-        ORACLE_ASSISTANT_RESPONSE_PATH="$target_file"
-        ORACLE_BACKUP_PATH="${target_file}.apr-backup"
-        verbose "find_oracle_assistant_response: Found at $target_file"
-        return 0
-    fi
-
-    verbose "find_oracle_assistant_response: assistantResponse.js not found at $target_file"
+# Name the removed APR_ORACLE_* knobs if a user still sets them, so a longer
+# gate they asked for is not silently ignored.
+warn_legacy_oracle_stability_knobs() {
+    local var legacy=()
+    for var in APR_ORACLE_MIN_STABLE_MS APR_ORACLE_SHORT_STABLE_MS APR_ORACLE_SETTLE_WINDOW_MS APR_ORACLE_STABLE_CYCLES; do
+        [[ -z "${!var:-}" ]] || legacy+=("$var")
+    done
+    [[ ${#legacy[@]} -gt 0 ]] || return 0
+    print_warning "No longer used (apr does not patch Oracle): ${legacy[*]}"
+    print_warning "For a longer completion gate, set ORACLE_TERMINAL_MIN_STABLE_MS (ms) or ORACLE_BAR_CONFIRM_CYCLES (Oracle 0.16+)"
     return 1
-}
-
-patch_oracle_stability_thresholds() {
-    # Skip if already patched this session
-    if [[ "$APR_ORACLE_PATCHED" == "true" ]]; then
-        verbose "patch_oracle_stability_thresholds: Already patched this session"
-        return 0
-    fi
-
-    # Skip if user disabled patching
-    if [[ "${APR_NO_ORACLE_PATCH:-}" == "1" ]]; then
-        verbose "patch_oracle_stability_thresholds: Disabled via APR_NO_ORACLE_PATCH"
-        return 0
-    fi
-
-    # Find the file to patch
-    if ! find_oracle_assistant_response; then
-        print_warning "Cannot find Oracle assistantResponse.js for stability patching"
-        print_warning "GPT Pro Extended Thinking responses may be truncated"
-        return 1
-    fi
-
-    # Check if file is already patched (look for our marker comment)
-    if grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
-        verbose "patch_oracle_stability_thresholds: Already patched (marker found)"
-        APR_ORACLE_PATCHED=true
-        return 0
-    fi
-
-    # Check if we can write to the file
-    if [[ ! -w "$ORACLE_ASSISTANT_RESPONSE_PATH" ]]; then
-        print_warning "Cannot write to Oracle assistantResponse.js (permission denied)"
-        print_warning "Run with sudo or fix permissions: $ORACLE_ASSISTANT_RESPONSE_PATH"
-        return 1
-    fi
-
-    verbose "patch_oracle_stability_thresholds: Patching $ORACLE_ASSISTANT_RESPONSE_PATH"
-
-    # Create backup if it doesn't exist
-    if [[ ! -f "$ORACLE_BACKUP_PATH" ]]; then
-        cp "$ORACLE_ASSISTANT_RESPONSE_PATH" "$ORACLE_BACKUP_PATH"
-        verbose "patch_oracle_stability_thresholds: Backup created at $ORACLE_BACKUP_PATH"
-    fi
-
-    # Apply patches using sed -i (in-place, more robust than echo piping)
-    # Note: Using | as delimiter to avoid escaping issues with /
-
-    # Patch 1: minStableMs in pollAssistantCompletion (line ~293)
-    # Original: const minStableMs = shortAnswer ? 8000 : 1200;
-    # Patched:  const minStableMs = shortAnswer ? 15000 : 30000; /* APR_PATCHED_STABILITY_THRESHOLDS */
-    sed -i "s|const minStableMs = shortAnswer ? 8000 : 1200;|const minStableMs = shortAnswer ? ${APR_ORACLE_SHORT_STABLE_MS} : ${APR_ORACLE_MIN_STABLE_MS}; /* APR_PATCHED_STABILITY_THRESHOLDS */|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
-
-    # Patch 2: requiredStableCycles in pollAssistantCompletion (line ~291)
-    # Original: const requiredStableCycles = shortAnswer ? 12 : 6;
-    # Patched:  const requiredStableCycles = shortAnswer ? 18 : 12;
-    sed -i "s|const requiredStableCycles = shortAnswer ? 12 : 6;|const requiredStableCycles = shortAnswer ? 18 : ${APR_ORACLE_STABLE_CYCLES};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
-
-    # Patch 3: settleWindowMs in waitForSettle (line ~551)
-    # Original: const settleWindowMs = shortAnswer ? 12_000 : 5_000;
-    # Patched:  const settleWindowMs = shortAnswer ? 15_000 : 30_000;
-    sed -i "s|const settleWindowMs = shortAnswer ? 12_000 : 5_000;|const settleWindowMs = shortAnswer ? 15_000 : ${APR_ORACLE_SETTLE_WINDOW_MS};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
-
-    # Patch 4: stableTarget in waitForSettle (line ~557)
-    # Original: const stableTarget = shortAnswer ? 6 : 3;
-    # Patched:  const stableTarget = shortAnswer ? 12 : 6;
-    sed -i "s|const stableTarget = shortAnswer ? 6 : 3;|const stableTarget = shortAnswer ? 12 : 6;|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
-
-    # Verify patch was applied
-    if grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
-        APR_ORACLE_PATCHED=true
-        print_success "Patched Oracle stability thresholds for GPT Pro Extended Thinking"
-        verbose "patch_oracle_stability_thresholds: Patch applied successfully"
-        verbose "  minStableMs: ${APR_ORACLE_MIN_STABLE_MS}ms (normal), ${APR_ORACLE_SHORT_STABLE_MS}ms (short)"
-        verbose "  settleWindowMs: ${APR_ORACLE_SETTLE_WINDOW_MS}ms"
-        verbose "  stableCycles: ${APR_ORACLE_STABLE_CYCLES}"
-        return 0
-    else
-        print_warning "Oracle patch may not have applied correctly"
-        return 1
-    fi
-}
-
-restore_oracle_from_backup() {
-    # Restore Oracle's original assistantResponse.js from backup
-    if [[ -z "$ORACLE_BACKUP_PATH" ]] || [[ -z "$ORACLE_ASSISTANT_RESPONSE_PATH" ]]; then
-        find_oracle_assistant_response || return 1
-    fi
-
-    if [[ ! -f "$ORACLE_BACKUP_PATH" ]]; then
-        print_error "No Oracle backup found at $ORACLE_BACKUP_PATH"
-        return 1
-    fi
-
-    # Verify destination directory exists (Oracle might have been uninstalled)
-    local dest_dir
-    dest_dir=$(dirname "$ORACLE_ASSISTANT_RESPONSE_PATH")
-    if [[ ! -d "$dest_dir" ]]; then
-        print_error "Oracle installation directory not found: $dest_dir"
-        print_error "Oracle may have been uninstalled. Backup preserved at: $ORACLE_BACKUP_PATH"
-        return 1
-    fi
-
-    cp "$ORACLE_BACKUP_PATH" "$ORACLE_ASSISTANT_RESPONSE_PATH"
-    APR_ORACLE_PATCHED=false
-    print_success "Restored Oracle from backup"
-    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -1040,13 +861,7 @@ preflight_check() {
     # Detect Oracle feature support (--notify may not exist in older versions)
     oracle_detect_features || true
 
-    # Patch Oracle stability thresholds to prevent GPT Pro Extended Thinking truncation
-    # This is critical for reliable spec revision - without it, responses are often cut off mid-sentence
-    if ! patch_oracle_stability_thresholds; then
-        print_warning "Oracle stability patch failed - responses may be truncated"
-        print_warning "Set APR_NO_ORACLE_PATCH=1 to disable this warning"
-        has_warnings=true
-    fi
+    warn_legacy_oracle_stability_knobs || has_warnings=true
     # CLI execution already applied the canonical document policy. This legacy
     # direct readiness interface must not reintroduce different run warnings.
     if [[ "$documents_validated" == true ]]; then
@@ -5279,6 +5094,7 @@ run_round() (
                     print_error "Automatic recovery failed"
                     print_warning "The response was truncated by Oracle's browser automation."
                     print_info "This happens when GPT Pro Extended Thinking pauses during reasoning."
+                    print_info "A longer Oracle completion gate can help: export ORACLE_TERMINAL_MIN_STABLE_MS=30000 (Oracle 0.16+)"
                     echo "" >&2
                     print_info "Manual recovery options:"
                     print_info "  1. Re-run the round: apr run $round_num --wait"

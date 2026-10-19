@@ -270,6 +270,33 @@ assert_json_array_contains() {
     [[ "$CAPTURED_STATUS" -eq 0 ]]
 }
 
+@test "preflight_check: never edits an installed Oracle and names removed stability knobs" {
+    create_docs
+    setup_mock_oracle
+    # A global install beside the oracle on PATH, holding the exact Oracle 0.8.x
+    # lines that apr used to rewrite in place with sed.
+    local installed="$TEST_DIR/lib/node_modules/@steipete/oracle/dist/src/browser/actions/assistantResponse.js"
+    mkdir -p "$(dirname "$installed")"
+    printf '%s\n' 'const minStableMs = shortAnswer ? 8000 : 1200;' 'const stableTarget = shortAnswer ? 6 : 3;' > "$installed"
+    local before
+    before=$(cat "$installed")
+    unset APR_ORACLE_MIN_STABLE_MS APR_ORACLE_SHORT_STABLE_MS APR_ORACLE_SETTLE_WINDOW_MS APR_ORACLE_STABLE_CYCLES
+
+    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$CAPTURED_STDERR" != *truncat* && "$CAPTURED_STDERR" != *assistantResponse* && "$CAPTURED_STDERR" != *'No longer used'* ]]
+
+    export APR_ORACLE_MIN_STABLE_MS=45000 APR_ORACLE_STABLE_CYCLES=12
+    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
+    log_test_actual "stderr" "$CAPTURED_STDERR"
+    [[ "$CAPTURED_STATUS" -eq 2 ]]
+    [[ "$CAPTURED_STDERR" == *'No longer used (apr does not patch Oracle): APR_ORACLE_MIN_STABLE_MS APR_ORACLE_STABLE_CYCLES'* ]]
+    [[ "$CAPTURED_STDERR" == *ORACLE_TERMINAL_MIN_STABLE_MS* && "$CAPTURED_STDERR" != *truncat* ]]
+
+    [[ "$(cat "$installed")" == "$before" && ! -e "$installed.apr-backup" ]]
+}
+
 @test "preflight_check: README missing returns 1" {
     printf '%s\n' "# SPEC" > "$TEST_PROJECT/SPEC.md"
     setup_mock_oracle
