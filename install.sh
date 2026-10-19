@@ -302,13 +302,73 @@ gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
     return 1
 }
 
+# Oracle (@steipete/oracle) declares engines.node ">=24" (since 0.10.0) and is
+# installed with npm, so Node.js alone is not enough: both must be usable.
+readonly ORACLE_MIN_NODE_MAJOR=24
+
+node_major_version() {
+    node -p 'process.versions.node.split(".")[0]' 2>/dev/null
+}
+
+# True when the node on PATH is at least ORACLE_MIN_NODE_MAJOR (npm not checked).
+node_meets_min_major() {
+    command -v node &> /dev/null || return 1
+    local major
+    major=$(node_major_version) || return 1
+    [[ "$major" =~ ^[0-9]+$ ]] && (( major >= ORACLE_MIN_NODE_MAJOR ))
+}
+
+node_ready_for_oracle() {
+    node_meets_min_major && command -v npm &> /dev/null
+}
+
+# Explain why the Node.js on PATH cannot run Oracle (nothing printed if it can).
+describe_node_gap() {
+    if ! command -v node &> /dev/null; then
+        log_warn "Node.js is not installed (Oracle needs Node.js ${ORACLE_MIN_NODE_MAJOR}+ with npm)"
+        return 0
+    fi
+    local version
+    version=$(node --version 2>/dev/null | head -1) || version=""
+    if ! node_meets_min_major; then
+        log_warn "Node.js ${version:-of unknown version} is too old: Oracle needs Node.js ${ORACLE_MIN_NODE_MAJOR}+"
+    fi
+    if ! command -v npm &> /dev/null; then
+        log_warn "Node.js${version:+ $version} is installed without npm (some distributions, Debian and Ubuntu among them, package npm separately)"
+    fi
+}
+
+# An earlier version of this installer silently added NodeSource's end-of-life
+# Node 18 apt feed with a priority-600 pin. Point it out so it can be removed.
+# Only an active (uncommented) entry counts; release upgrades comment it out.
+warn_legacy_nodesource_feed() {
+    local list="${1:-/etc/apt/sources.list.d/nodesource.list}"
+    grep -Eqs '^[[:space:]]*deb[[:space:]].*deb\.nodesource\.com/node_18\.x' "$list" || return 0
+    log_warn "NodeSource's end-of-life Node.js 18 apt feed is still configured (older APR installers could add it)."
+    log_warn "Its setup script also pins it at priority 600, so apt prefers it over your distribution's Node.js. If nothing else needs it:"
+    log_dim "  sudo rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/preferences.d/nodejs /etc/apt/preferences.d/nsolid /usr/share/keyrings/nodesource.gpg"
+    log_dim "  sudo apt-get update"
+}
+
+print_node_instructions() {
+    log_dim "  Install Node.js ${ORACLE_MIN_NODE_MAJOR}+ with npm, for example:"
+    log_dim "    macOS:          brew install node"
+    log_dim "    any platform:   a version manager such as nvm, fnm or mise (no root needed)"
+    log_dim "    Debian/Ubuntu:  curl -fsSL https://deb.nodesource.com/setup_${ORACLE_MIN_NODE_MAJOR}.x | sudo -E bash -   # adds an apt source"
+    log_dim "                    sudo apt-get install -y nodejs"
+    log_dim "  Then: npm install -g @steipete/oracle   (or rely on: npx -y @steipete/oracle)"
+}
+
+# Make Node.js ORACLE_MIN_NODE_MAJOR+ with npm available. Uses only the
+# platform's own package manager (Homebrew, pacman, dnf) and never adds a
+# third-party package source. Success means node and npm now satisfy Oracle,
+# not that a package manager exited 0.
 install_node() {
-    if command -v node &> /dev/null && command -v npm &> /dev/null; then
+    if node_ready_for_oracle; then
         log_info "Node.js already installed: $(node --version 2>/dev/null | head -1)"
         return 0
     fi
-
-    log_step "Installing Node.js (required for Oracle)..."
+    describe_node_gap
 
     local os="unknown"
     case "$(uname -s)" in
@@ -319,34 +379,45 @@ install_node() {
     case "$os" in
         macos)
             if command -v brew &> /dev/null; then
-                brew install node &>/dev/null && return 0
+                log_step "Installing Node.js with Homebrew (brew install node)..."
+                brew install node &>/dev/null || true
             fi
             ;;
         linux)
-            if ! command -v sudo &> /dev/null; then
-                log_warn "sudo not available; cannot install Node.js automatically"
-                return 1
-            fi
+            # apt-get is checked first: Debian and Ubuntu also package pacman
+            # and dnf, and those must never be run against an apt system.
             if command -v apt-get &> /dev/null; then
-                if command -v curl &> /dev/null; then
-                    curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - &>/dev/null
-                    sudo apt-get install -y -qq nodejs &>/dev/null && return 0
-                elif command -v wget &> /dev/null; then
-                    wget -qO- https://deb.nodesource.com/setup_18.x | sudo -E bash - &>/dev/null
-                    sudo apt-get install -y -qq nodejs &>/dev/null && return 0
-                else
-                    log_warn "curl/wget not available; cannot install Node.js via NodeSource"
-                    return 1
+                # Never change apt packages or sources from here. Current
+                # Debian/Ubuntu releases ship a nodejs older than Oracle needs,
+                # without npm, and a newer one means adding a third-party apt
+                # source: the user's decision, not an installer side effect.
+                log_warn "Not changing apt packages or sources automatically on Debian/Ubuntu"
+                if node_meets_min_major && ! command -v npm &> /dev/null; then
+                    log_dim "  Node.js is new enough; npm is a separate package here: sudo apt-get install -y npm"
                 fi
-            elif command -v dnf &> /dev/null; then
-                sudo dnf install -y nodejs &>/dev/null && return 0
-            elif command -v pacman &> /dev/null; then
-                sudo pacman -S --noconfirm nodejs npm &>/dev/null && return 0
+            elif command -v pacman &> /dev/null || command -v dnf &> /dev/null; then
+                local as_root=()
+                [[ "$EUID" -eq 0 ]] || as_root=(sudo)
+                if [[ ${#as_root[@]} -gt 0 ]] && ! command -v sudo &> /dev/null; then
+                    log_warn "sudo not available; cannot install Node.js with the system package manager"
+                elif command -v pacman &> /dev/null; then
+                    log_step "Installing Node.js from the distribution (pacman -S --needed nodejs npm)..."
+                    ${as_root[@]+"${as_root[@]}"} pacman -S --needed --noconfirm nodejs npm &>/dev/null || true
+                else
+                    log_step "Installing Node.js from the distribution (dnf install nodejs npm)..."
+                    ${as_root[@]+"${as_root[@]}"} dnf install -y nodejs npm &>/dev/null || true
+                fi
             fi
             ;;
     esac
 
-    log_warn "Could not install Node.js automatically"
+    if node_ready_for_oracle; then
+        log_info "Node.js ready: $(node --version 2>/dev/null | head -1)"
+        return 0
+    fi
+
+    log_warn "Could not set up Node.js ${ORACLE_MIN_NODE_MAJOR}+ with npm automatically"
+    print_node_instructions
     return 1
 }
 
@@ -358,20 +429,16 @@ install_oracle() {
 
     log_step "Ensuring Oracle is installed..."
 
-    if ! command -v npm &> /dev/null; then
-        install_node || {
-            log_warn "Node.js not installed; cannot install Oracle automatically"
-            return 1
-        }
+    if ! install_node; then
+        log_warn "Oracle needs Node.js ${ORACLE_MIN_NODE_MAJOR}+ with npm; cannot install Oracle automatically"
+        return 1
     fi
 
-    if command -v npm &> /dev/null; then
-        log_step "Installing Oracle globally..."
-        if npm install -g @steipete/oracle &>/dev/null; then
-            return 0
-        fi
-        log_warn "Oracle global install failed; trying npx fallback"
+    log_step "Installing Oracle globally..."
+    if npm install -g @steipete/oracle &>/dev/null; then
+        return 0
     fi
+    log_warn "Oracle global install failed; trying npx fallback"
 
     if command -v npx &> /dev/null; then
         log_info "Oracle available via npx"
@@ -379,7 +446,7 @@ install_oracle() {
     fi
 
     log_warn "Oracle not installed. APR requires Oracle for GPT Pro reviews."
-    log_warn "Install Node.js and run: npm install -g @steipete/oracle"
+    log_warn "Run: npm install -g @steipete/oracle"
     return 1
 }
 
@@ -508,6 +575,7 @@ main() {
         command -v gum &>/dev/null && gum_ok=true
         { command -v oracle &>/dev/null || command -v npx &>/dev/null; } && oracle_ok=true
     fi
+    warn_legacy_nodesource_feed
 
     # Verify installation
     if [[ -x "$script_path" ]]; then
@@ -535,7 +603,7 @@ main() {
         if [[ "$oracle_ok" == "true" ]]; then
             echo -e "  ${GREEN}✓${NC} oracle (ChatGPT automation)" >&2
         else
-            echo -e "  ${RED}✗${NC} oracle ${RED}(required)${NC} - install with: npm install -g @steipete/oracle" >&2
+            echo -e "  ${RED}✗${NC} oracle ${RED}(required)${NC} - needs Node.js ${ORACLE_MIN_NODE_MAJOR}+ with npm, then: npm install -g @steipete/oracle" >&2
         fi
         echo "" >&2
 
