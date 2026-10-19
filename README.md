@@ -1814,7 +1814,13 @@ apr (bash script, ~5000 LOC)
 ```
 
 Workflow YAMLs can include `template` and `template_with_impl` block scalars to
-override the Oracle prompt. If omitted, APR uses the built-in default prompt.
+override the Oracle prompt. If omitted, APR uses the built-in default prompt,
+which names the attached README, implementation (when included) and spec.
+Oracle does not substitute anything inside the prompt: it pastes each document
+after the prompt, in that order, under a `### File: <path>` heading. A custom
+template should therefore refer to the documents by name instead of leaving
+empty slots for them; `apr lint` warns about the old
+`<contents of … will be included by oracle>` slots.
 
 ### File Locations
 

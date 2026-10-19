@@ -274,3 +274,109 @@ EOF
         [[ "$CAPTURED_STDERR" == *'.apr/workflows/default.yaml:'* ]]
     done
 }
+
+# Oracle never fills prompt text: it pastes each --file after the prompt, in
+# argument order (README, implementation, spec), under "### File: <path>".
+default_template_fixture() {
+    lint_fixture
+    mkdir -p docs
+    cp README.md docs/BRIEF.md
+    cp README.md plan-v1.md
+    cat > .apr/workflows/default.yaml <<'YAML'
+documents:
+  readme: docs/BRIEF.md
+  spec: plan-v1.md
+  implementation: IMPL.md
+oracle:
+  model: "5.2 Thinking"
+  thinking_time: heavy
+rounds:
+  output_dir: .apr/rounds/default
+YAML
+}
+
+@test "default prompt: names the attached files in Oracle's order and has no unfilled slots" {
+    default_template_fixture
+    local include manifest prompt readme_at impl_at spec_at
+    for include in false true; do
+        manifest=$(build_document_manifest docs/BRIEF.md plan-v1.md IMPL.md "$include" optional)
+        prompt=$(build_revision_prompt "$include" .apr/workflows/default.yaml "$manifest")
+        [[ "$prompt" != *'will be included by oracle'* && "$prompt" != *'shown below'* ]]
+        [[ "$prompt" == *'attached after this prompt'* && "$prompt" == *'"### File"'* ]]
+        [[ "$prompt" == *'1. The README ("BRIEF.md"). Read it first.'* ]]
+        [[ "$prompt" == *'versus the original plan ("plan-v1.md").'* ]]
+        prompt_quality_check "$prompt" .apr/workflows/default.yaml prompt
+        readme_at=${prompt%%The README (*}; spec_at=${prompt%%The plan (specification) to review (*}
+        [[ ${#readme_at} -lt ${#spec_at} ]]
+        if [[ "$include" == true ]]; then
+            [[ "$prompt" == *'2. A document detailing the implementation ("IMPL.md").'* ]]
+            [[ "$prompt" == *'3. The plan (specification) to review ("plan-v1.md").'* ]]
+            impl_at=${prompt%%A document detailing the implementation (*}
+            [[ ${#readme_at} -lt ${#impl_at} && ${#impl_at} -lt ${#spec_at} ]]
+        else
+            [[ "$prompt" != *'detailing the implementation'* ]]
+            [[ "$prompt" == *'2. The plan (specification) to review ("plan-v1.md").'* ]]
+        fi
+    done
+    # Without a manifest (per-variant lint), roles are named generically.
+    prompt=$(build_revision_template true .apr/workflows/default.yaml)
+    [[ "$prompt" == *'1. The README. Read it first.'* && "$prompt" == *'versus the original plan.'* ]]
+    capture_streams bash "$APR_SCRIPT" robot lint 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    jq -e '.data.valid and (.data.warnings|length)==0' <<< "$CAPTURED_STDOUT"
+}
+
+@test "default prompt: file names cannot inject placeholders into the named list" {
+    default_template_fixture
+    cp README.md 'plan-{{SPEC}}-$HOME-TODO:.md'
+    local manifest prompt
+    manifest=$(build_document_manifest docs/BRIEF.md 'plan-{{SPEC}}-$HOME-TODO:.md' IMPL.md false optional)
+    prompt=$(build_revision_prompt false .apr/workflows/default.yaml "$manifest")
+    [[ "$prompt" != *'{{SPEC}}'* && "$prompt" != *'$HOME'* && "$prompt" != *'TODO:'* ]]
+    prompt_quality_check "$prompt" .apr/workflows/default.yaml prompt
+}
+
+@test "lint policies: templates with the old empty oracle slots warn once and fail strict mode" {
+    lint_fixture
+    cat > .apr/workflows/default.yaml <<'YAML'
+documents:
+  readme: README.md
+  spec: SPEC.md
+oracle:
+  model: "5.2 Thinking"
+  thinking_time: heavy
+rounds:
+  output_dir: .apr/rounds/default
+template: |
+  First, read this README:
+
+  ```
+  <contents of README will be included by oracle>
+  ```
+
+  Now review the plan shown below:
+
+  ```
+  <contents of spec will be included by oracle>
+  ```
+YAML
+    capture_streams bash "$APR_SCRIPT" robot lint 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    jq -e '.data.valid and (.data.warnings|length)==1 and (.data.warnings[0].message|contains("will be included by oracle"))
+        and (.data.warnings[0].hint|contains("### File")) and .data.warnings[0].source.label=="template"' <<< "$CAPTURED_STDOUT"
+    export APR_FAIL_ON_WARN=1
+    capture_streams bash "$APR_SCRIPT" robot lint 1 --compact
+    [[ "$CAPTURED_STATUS" -ne 0 ]]
+    jq -e '(.data.valid|not) and any(.data.errors[]; .message|contains("will be included by oracle"))' <<< "$CAPTURED_STDOUT"
+}
+
+@test "lint policies: the bundled example workflow has no empty oracle slots" {
+    [[ "$(cat "$PROJECT_ROOT/workflows/fcp-example.yaml")" != *'will be included by oracle'* ]]
+    local variant template
+    for variant in false true; do
+        template=$(build_revision_template "$variant" "$PROJECT_ROOT/workflows/fcp-example.yaml")
+        [[ -n "$template" ]]
+        prompt_quality_check "$template" "$PROJECT_ROOT/workflows/fcp-example.yaml" template
+    done
+    [[ "$(build_revision_template true "$PROJECT_ROOT/workflows/fcp-example.yaml")" == *'fcp_model_connectors_rust.md'* ]]
+}

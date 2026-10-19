@@ -3,7 +3,7 @@
 #
 # To use this example:
 # 1. Copy this file to your project: cp workflows/fcp-example.yaml .apr/workflows/fcp-spec.yaml
-# 2. Update the document paths to match your project
+# 2. Update the document paths (and the file names in the templates below) to match your project
 # 3. Run: apr run 1 -w fcp-spec
 
 name: fcp-spec
@@ -33,13 +33,15 @@ rounds:
   impl_every_n: 4
 
 # Custom prompt template
-# The standard template works for most cases, but you can customize here
+# The default template works for most cases, but you can customize here.
+# Oracle does not substitute anything inside the prompt: it pastes each
+# document AFTER the prompt, in the order README, implementation (when
+# included), spec, each under a "### File: <path>" heading. Refer to the
+# documents by name rather than leaving empty slots for them.
 template: |
-  First, read this README:
-
-  ```
-  <contents of README will be included by oracle>
-  ```
+  The README (README.md) and the specification (FCP_Specification_V2.md) are
+  attached after this prompt, in that order, each under its own "### File"
+  heading. Read the README first.
 
   ---
 
@@ -50,31 +52,19 @@ template: |
 
   For each proposed change, give me your detailed analysis and
   rationale/justification for why it would make the project better along
-  with the git-diff style change versus the original plan shown below:
+  with the git-diff style change versus the original plan
+  (FCP_Specification_V2.md).
 
-  ```
-  <contents of spec will be included by oracle>
-  ```
-
-# Extended template (used when --include-impl is specified)
+# Extended template (used when the implementation document is included)
 template_with_impl: |
-  First, read this README:
+  The README (README.md), a document detailing Rust implementations for the
+  canonical connector types (fcp_model_connectors_rust.md), and the
+  specification (FCP_Specification_V2.md) are attached after this prompt, in
+  that order, each under its own "### File" heading. Read the README first.
 
-  ```
-  <contents of README will be included by oracle>
-  ```
-
-  ---
-
-  And here is a document detailing Rust implementations for the canonical
-  connector types that follow the specification document given below; you
-  should also keep the implementation in mind as you think about the
-  specification, since ultimately the specification needs to be translated
-  into the Rust code eventually!
-
-  ```
-  <contents of implementation will be included by oracle>
-  ```
+  Keep the implementation in mind as you think about the specification, since
+  ultimately the specification needs to be translated into the Rust code
+  eventually!
 
   ---
 
@@ -85,8 +75,5 @@ template_with_impl: |
 
   For each proposed change, give me your detailed analysis and
   rationale/justification for why it would make the project better along
-  with the git-diff style change versus the original plan shown below:
-
-  ```
-  <contents of spec will be included by oracle>
-  ```
+  with the git-diff style change versus the original plan
+  (FCP_Specification_V2.md).

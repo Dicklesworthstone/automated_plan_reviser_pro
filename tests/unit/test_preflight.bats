@@ -1203,7 +1203,11 @@ assert_recorded_document() {
     prompt=$(cat "$APR_FIXTURE_PROMPT_DIR/prompt-1")
     [[ "$prompt" == 'Observed local input metadata (not a sent attachment receipt):'* ]]
     [[ "$prompt" == *'bytes=6; sha256=c2d6098cbf68842ad602337645fae2e17f40f4282f66c573cf5945274971cab9'* ]]
-    [[ "$prompt" == *'First, read this README:'* && -s .apr/rounds/default/round_1.md ]]
+    # The default prompt names the files Oracle appends, in the order they are sent.
+    [[ "$prompt" == *'1. The README ("README.md"). Read it first.'* ]]
+    [[ "$prompt" == *'2. A document detailing the implementation ("IMPL.md").'* ]]
+    [[ "$prompt" == *'3. The plan (specification) to review ("SPEC.md").'* && "$prompt" != *'will be included by oracle'* ]]
+    [[ -s .apr/rounds/default/round_1.md ]]
 }
 
 @test "prompt binding: robot completes once with clean JSON and omitted implementation metadata" {

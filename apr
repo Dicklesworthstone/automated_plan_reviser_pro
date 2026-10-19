@@ -2062,11 +2062,32 @@ load_prompt_template() {
     printf '%s' "$template"
 }
 
+# JSON-quote a document name for prompt text. Braces, '$', angle brackets and
+# TODO/TBD markers are escaped so a legitimate file name can never masquerade as
+# an unfilled template placeholder; prompt QC stays strict.
+APR_PROMPT_QUOTED_JQ='def quoted: @json | gsub("\\{"; "\\u007b") | gsub("\\}"; "\\u007d") |
+    gsub("\\$";"\\u0024") | gsub("<";"\\u003c") | gsub(">";"\\u003e") |
+    gsub("TODO:";"\\u0054ODO:") | gsub("TBD";"\\u0054BD");'
+
+# Print the quoted basename of an included document role, or nothing.
+# Usage: document_prompt_name <manifest_json> <role>
+document_prompt_name() {
+    jq -r --arg role "$2" "$APR_PROMPT_QUOTED_JQ"'
+        [.files[] | select(.role == $role and .included == true) | .basename | quoted] | first // empty
+    ' <<< "$1"
+}
+
 # Build the configured/default template without document metadata. Validation
-# checks both variants as well as the final selected prompt.
+# checks both variants (without a manifest) as well as the final selected prompt.
+#
+# Oracle never substitutes text inside the prompt. It pastes every --file AFTER
+# the prompt, in argument order (README, implementation, spec), each in its own
+# section headed "### File" plus the file's path. The default template says
+# exactly that and, when the document manifest is known, names each file.
 build_revision_template() {
     local include_impl="${1:-false}"
     local config_file="${2:-}"
+    local manifest="${3:-}"
     local template=""
 
     template=$(load_prompt_template "$include_impl" "$config_file") || return "$EXIT_CONFIG_ERROR"
@@ -2075,30 +2096,42 @@ build_revision_template() {
         return 0
     fi
 
-    local prompt="First, read this README:
-
-\`\`\`
-<contents of README will be included by oracle>
-\`\`\`
-
----
-"
-
-    if [[ "$include_impl" == "true" ]]; then
-        prompt+="
-And here is a document detailing the implementation; you should also keep
-the implementation in mind as you think about the specification, since
-ultimately the specification needs to be translated into code eventually!
-
-\`\`\`
-<contents of implementation will be included by oracle>
-\`\`\`
-
----
-"
+    local readme_label="The README" impl_label="A document detailing the implementation"
+    local spec_label="The plan (specification) to review" spec_ref="the original plan"
+    if [[ -n "$manifest" ]]; then
+        local readme_name impl_name spec_name
+        if ! readme_name=$(document_prompt_name "$manifest" readme) ||
+            ! impl_name=$(document_prompt_name "$manifest" implementation) ||
+            ! spec_name=$(document_prompt_name "$manifest" spec); then
+            print_error "Cannot assemble document metadata into prompt"
+            return "$EXIT_CONFIG_ERROR"
+        fi
+        [[ -z "$readme_name" ]] || readme_label+=" ($readme_name)"
+        [[ -z "$impl_name" ]] || impl_label+=" ($impl_name)"
+        if [[ -n "$spec_name" ]]; then
+            spec_label+=" ($spec_name)"
+            spec_ref+=" ($spec_name)"
+        fi
     fi
 
+    local prompt="The documents for this review are attached after this prompt, in the
+order listed below, each in its own section headed \"### File\" plus the
+file's path:
+
+1. $readme_label. Read it first."
+    local item=2
+    if [[ "$include_impl" == "true" ]]; then
+        prompt+="
+$item. $impl_label.
+   Keep it in mind as you think about the plan, since ultimately the plan
+   needs to be translated into code."
+        item=3
+    fi
     prompt+="
+$item. $spec_label.
+
+---
+
 NOW: Carefully review this entire plan for me and come up with your best
 revisions in terms of better architecture, new features, changed features,
 etc. to make it better, more robust/reliable, more performant, more
@@ -2106,12 +2139,7 @@ compelling/useful, etc.
 
 For each proposed change, give me your detailed analysis and
 rationale/justification for why it would make the project better along
-with the git-diff style change versus the original plan shown below:
-
-\`\`\`
-<contents of spec will be included by oracle>
-\`\`\`
-"
+with the git-diff style change versus $spec_ref."
 
     printf '%s\n' "$prompt"
 }
@@ -2123,15 +2151,12 @@ with the git-diff style change versus the original plan shown below:
 build_revision_prompt() {
     local include_impl="$1" config_file="$2" manifest="$3"
     local template metadata
-    template=$(build_revision_template "$include_impl" "$config_file") || return "$EXIT_CONFIG_ERROR"
+    template=$(build_revision_template "$include_impl" "$config_file" "$manifest") || return "$EXIT_CONFIG_ERROR"
     if [[ -z "$template" ]]; then
         print_error "Prompt template is empty"
         return "$EXIT_CONFIG_ERROR"
     fi
-    if ! metadata=$(jq -er '
-        def quoted: @json | gsub("\\{"; "\\u007b") | gsub("\\}"; "\\u007d") |
-            gsub("\\$";"\\u0024") | gsub("<";"\\u003c") | gsub(">";"\\u003e") |
-            gsub("TODO:";"\\u0054ODO:") | gsub("TBD";"\\u0054BD");
+    if ! metadata=$(jq -er "$APR_PROMPT_QUOTED_JQ"'
         if .v != 1 or (.files | length) != 3 then error("Invalid document manifest") else
         "Observed local input metadata (not a sent attachment receipt):",
         (.files | sort_by(.role,.path)[] |
@@ -2246,7 +2271,7 @@ validate_workflow_local() {
                         validation_add_finding error config_error "Implementation cadence must be a non-negative integer of at most nine digits" "Set rounds.impl_every_n to a valid integer" "$config" impl_every_n
                     fi
                 fi
-                local variant template
+                local variant template previous_template=''
                 for variant in false true; do
                     local label=template
                     [[ "$variant" != true ]] || label=template_with_impl
@@ -2254,7 +2279,13 @@ validate_workflow_local() {
                         validation_add_finding error validation_failed "Cannot build $label" "Provide a nonempty workflow template" "$config" "$label"
                     elif ! prompt_quality_check "$template" "$config" "$label"; then
                         validation_add_finding error validation_failed "$PROMPT_QC_REASON ($label)" "Replace unfilled markers; fence literal code examples or allow exact tokens" "$config" "$label" "$(jq -nc --argjson hits "$PROMPT_QC_HITS" '{hits:$hits}')"
+                    elif [[ "$template" == *"<contents of "*" will be included by oracle>"* && "$template" != "$previous_template" ]]; then
+                        # Earlier default prompts (and the bundled example) had these
+                        # fenced slots. Oracle never fills them: the model sees empty
+                        # blocks, and the files only after the instructions end.
+                        validation_add_finding warning validation_failed "$label has '<contents of ... will be included by oracle>' slots that Oracle never fills" "Oracle pastes each file after the prompt under a '### File: <path>' heading; name the attached README and spec instead of leaving empty slots" "$config" "$label"
                     fi
+                    previous_template="$template"
                 done
                 local manifest='null' prompt='' effective=false manifest_result=0
                 if [[ -z "$readme" || ! -f "$readme" ]]; then
