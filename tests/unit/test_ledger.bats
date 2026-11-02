@@ -617,7 +617,7 @@ EOF
     jq -e '.state=="failed" and .outcome.code=="dependency_missing" and .outcome.exit_code==3 and .outcome.oracle_exit_code==null and .execution.attempts_count==0' .apr/rounds/default/round_2.meta.json
 }
 
-@test "ledger integration: early human prompt rejection keeps validation category and legacy caller exit" {
+@test "ledger integration: early human prompt rejection keeps validation category and lint refusal exit" {
     runtime_cli_fixture
     cp .apr/workflows/default.yaml "$TEST_DIR/valid-workflow.yaml"
     cat > .apr/workflows/default.yaml <<'EOF'
@@ -633,10 +633,12 @@ template: |
   {{README}}
 EOF
     capture_streams bash "$APR_SCRIPT" run 1 --wait --no-retry --no-preflight
-    [[ "$CAPTURED_STATUS" -eq 1 && ! -f "$APR_CLI_COUNT" ]]
+    # Since 0bd1872 an unfilled placeholder is a local lint refusal: exit 4
+    # (v1.3.1 exited 1); the validation_failed category is unchanged.
+    [[ "$CAPTURED_STATUS" -eq 4 && ! -f "$APR_CLI_COUNT" ]]
     [[ "$CAPTURED_STDERR" == *APR_ERROR_CODE=validation_failed* ]]
     ledger_validate < .apr/rounds/default/round_1.meta.json
-    jq -e '.state=="failed" and .outcome.code=="validation_failed" and .outcome.exit_code==1 and .execution.attempts_count==0' .apr/rounds/default/round_1.meta.json
+    jq -e '.state=="failed" and .outcome.code=="validation_failed" and .outcome.exit_code==4 and .execution.attempts_count==0' .apr/rounds/default/round_1.meta.json
 }
 
 @test "ledger integration: failed harvest keeps producer partial recovery partial stderr and session marker" {

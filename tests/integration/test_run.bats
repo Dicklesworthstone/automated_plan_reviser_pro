@@ -68,6 +68,18 @@ if [[ "$*" == *"--render"* ]]; then
     exit 0
 fi
 
+# By default this mock writes no --write-output file, so the recovery path
+# runs (the GH #5 and harvest tests rely on that). Tests of a successful run
+# set MOCK_ORACLE_WRITE_OUTPUT=1: a real Oracle run writes the answer there,
+# and apr validates that file and fails closed without it (feb69aa).
+out=""
+while [[ $# -gt 0 ]]; do
+    [[ "$1" == "--write-output" ]] && { shift; out="${1:-}"; }
+    shift
+done
+if [[ "${MOCK_ORACLE_WRITE_OUTPUT:-0}" == "1" && -n "$out" ]]; then
+    for i in $(seq 1 80); do echo "Line $i of the complete review answer from the mock Oracle."; done > "$out"
+fi
 exit 0
 EOF
     chmod +x "$bin_dir/oracle"
@@ -127,6 +139,16 @@ if [[ "$*" == *"--render"* ]]; then
     exit 0
 fi
 
+# Success after the simulated failures writes the answer to --write-output,
+# as a real Oracle run does (apr validates it; feb69aa).
+out=""
+while [[ $# -gt 0 ]]; do
+    [[ "$1" == "--write-output" ]] && { shift; out="${1:-}"; }
+    shift
+done
+if [[ -n "$out" ]]; then
+    for i in $(seq 1 80); do echo "Line $i of the complete review answer from the flaky mock Oracle."; done > "$out"
+fi
 exit 0
 EOF
     chmod +x "$bin_dir/oracle"
@@ -348,6 +370,7 @@ EOF
 }
 
 @test "run: --wait shows retry messaging by default" {
+    export MOCK_ORACLE_WRITE_OUTPUT=1
     run "$APR_SCRIPT" run 1 --wait
 
     log_test_output "$output"
@@ -357,6 +380,7 @@ EOF
 }
 
 @test "run: --wait --no-retry omits retry messaging" {
+    export MOCK_ORACLE_WRITE_OUTPUT=1
     run "$APR_SCRIPT" run 1 --wait --no-retry
 
     log_test_output "$output"
@@ -690,13 +714,16 @@ EOF
 }
 
 @test "run: preflight passes for valid files" {
+    export MOCK_ORACLE_WRITE_OUTPUT=1
     capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
 
     log_test_actual "exit code" "$CAPTURED_STATUS"
 
     [[ "$CAPTURED_STATUS" -eq 0 ]]
     [[ "$CAPTURED_STDERR" == *"Running pre-flight checks"* ]]
-    [[ "$CAPTURED_STDERR" == *"All pre-flight checks passed"* ]]
+    # Since 0bd1872 the CLI validates documents before preflight, which then
+    # reports only the Oracle check (no separate "All pre-flight checks passed").
+    [[ "$CAPTURED_STDERR" == *"Oracle available (oracle 0.0.0)"* ]]
 }
 
 @test "run: preflight fails when required file missing" {
@@ -707,7 +734,8 @@ EOF
     log_test_actual "exit code" "$CAPTURED_STATUS"
 
     [[ "$CAPTURED_STATUS" -eq 4 ]]
-    [[ "$CAPTURED_STDERR" == *"Pre-flight failed: README not found"* ]]
+    # Since ca57646 the document manifest reports the missing required file.
+    [[ "$CAPTURED_STDERR" == *"README not found: README.md"* ]]
 }
 
 # =============================================================================
@@ -718,6 +746,7 @@ EOF
     mkdir -p .apr/rounds/default
     printf '%s\n' "existing output" > .apr/rounds/default/round_1.md
 
+    export MOCK_ORACLE_WRITE_OUTPUT=1
     capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
 
     log_test_actual "exit code" "$CAPTURED_STATUS"
@@ -791,6 +820,28 @@ EOF
     [[ "$CAPTURED_STATUS" -eq 0 ]]
     [[ "$CAPTURED_STDERR" == *"Attempt 1/3 failed"* ]]
     [[ "$CAPTURED_STDERR" == *"Retrying in 0s"* ]]
+}
+
+@test "run: missing output and failed recovery exits 1 (fail-closed, feb69aa)" {
+    local bin_dir="$TEST_DIR/silent_oracle"
+    mkdir -p "$bin_dir"
+    cat > "$bin_dir/oracle" << 'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then echo "oracle 0.0.0"; exit 0; fi
+if [[ "${1:-}" == "--help" ]]; then echo "Usage: oracle [options]"; echo "  --notify"; exit 0; fi
+# Exits 0 but never writes the --write-output file.
+exit 0
+EOF
+    chmod +x "$bin_dir/oracle"
+    export PATH="$bin_dir:$PATH" APR_RECOVERY_WAIT_SECS=0
+
+    capture_streams "$APR_SCRIPT" run 1 --wait --no-retry
+
+    log_test_actual "exit code" "$CAPTURED_STATUS"
+
+    [[ "$CAPTURED_STATUS" -eq 1 ]]
+    [[ "$CAPTURED_STDERR" == *"Output validation failed: Output file does not exist"* ]]
+    [[ "$CAPTURED_STDERR" == *"Automatic recovery failed"* ]]
 }
 
 # =============================================================================
