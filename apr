@@ -63,7 +63,7 @@
 
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 # Metrics schema (analytics)
 readonly METRICS_SCHEMA_VERSION="1.0.0"

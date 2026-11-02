@@ -8,6 +8,19 @@ Repository: <https://github.com/Dicklesworthstone/automated_plan_reviser_pro>
 
 ---
 
+## [v1.4.1](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases/tag/v1.4.1) -- 2026-11-02
+
+### Fixed: jq 1.6 (the stock jq on Ubuntu 22.04 and Debian 12)
+
+- jq 1.6 rejects jq keywords as variable names (jq 1.7 and later accept them). Three of apr's jq filters bound such a name, and on jq 1.6:
+  - `apr lint`, and the lint that `apr run` and `apr robot run` perform first, dropped every finding and reported that validation passed. A prompt with an unfilled placeholder went on to Oracle (`$label`, new in v1.4.0);
+  - `apr queue add` refused with `config_error` (`$include`, new in v1.4.0);
+  - `apr stats --export … --rounds N-M` failed (`$end`, present since v1.2.0).
+
+  The three bindings are renamed. No other jq variable name in `apr`, `install.sh` or `scripts/recover_oracle_run.sh` is a jq 1.6 keyword. v1.4.1 was tested under jq 1.6 (Ubuntu 22.04) as well as jq 1.8.1 (Ubuntu 26.04) (bd-nsi, [8c74449](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/8c7444979276f6cfef7981df2678b1496f872a2f))
+
+---
+
 ## [v1.4.0](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases/tag/v1.4.0) -- 2026-11-02
 
 ### Added: run ledger, exact replay, persistent queue and local lint
