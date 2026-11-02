@@ -2007,8 +2007,8 @@ validation_add_finding() {
         source_line="${source_line:-null}"
     fi
     finding=$(jq -nc --arg code "$code" --arg message "$message" --arg hint "$hint" \
-        --arg file "$file" --arg label "$label" --argjson line "$source_line" --argjson details "$details" \
-        '{code:$code,message:$message,hint:$hint,source:{file:(if $file=="" then null else $file end),line:$line,label:$label},details:$details}') || return "$EXIT_CONFIG_ERROR"
+        --arg file "$file" --arg lbl "$label" --argjson line "$source_line" --argjson details "$details" \
+        '{code:$code,message:$message,hint:$hint,source:{file:(if $file=="" then null else $file end),line:$line,label:$lbl},details:$details}') || return "$EXIT_CONFIG_ERROR"
     if [[ "$severity" == error ]]; then
         VALIDATION_ERRORS=$(jq -nc --argjson findings "$VALIDATION_ERRORS" --argjson finding "$finding" '$findings+[$finding]')
     else
@@ -2567,7 +2567,7 @@ cmd_queue() {
                 elif [[ ! -d "$CONFIG_DIR" ]]; then result=$EXIT_CONFIG_ERROR; code=not_configured
                 else
                     id="entry-$(date -u +%Y%m%dT%H%M%SZ)-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
-                    data=$(queue_mutate "$workflow" enqueue "$id" "$(jq -nc --argjson round "$round" --argjson include "${INCLUDE_IMPL:-false}" '{round:$round,include_impl:$include}')") || result=$?
+                    data=$(queue_mutate "$workflow" enqueue "$id" "$(jq -nc --argjson round "$round" --argjson incl "${INCLUDE_IMPL:-false}" '{round:$round,include_impl:$incl}')") || result=$?
                 fi ;;
             status|doctor)
                 if [[ "$#" -ne 0 ]]; then result=$EXIT_USAGE_ERROR; else data=$(queue_status_data "$workflow") || result=$?; fi ;;
@@ -6119,8 +6119,8 @@ metrics_filter_for_export() {
                 print_error "Invalid --rounds range: start greater than end"
                 return 1
             fi
-            filtered=$(echo "$filtered" | jq --argjson start "$start" --argjson end "$end" \
-                '.rounds |= map(select(.round >= $start and .round <= $end))')
+            filtered=$(echo "$filtered" | jq --argjson start "$start" --argjson range_end "$end" \
+                '.rounds |= map(select(.round >= $start and .round <= $range_end))')
         elif [[ "$rounds_spec" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
             local rounds_list_json
             IFS=',' read -r -a rounds_list <<< "$rounds_spec"
