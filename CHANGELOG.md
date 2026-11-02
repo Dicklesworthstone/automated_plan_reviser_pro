@@ -8,6 +8,51 @@ Repository: <https://github.com/Dicklesworthstone/automated_plan_reviser_pro>
 
 ---
 
+## [v1.4.0](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases/tag/v1.4.0) -- 2026-11-02
+
+### Added: run ledger, exact replay, persistent queue and local lint
+
+- Every run (human foreground and background, robot detached) writes a versioned provenance record to `.apr/rounds/<workflow>/round_<N>.meta.json`. It holds the config bytes, the selected document manifest and the exact prompt hash, all recorded before Oracle is called, and keeps earlier generations. See "Run Ledger Contract" in the README ([5d3c4c7](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/5d3c4c7587a1ac1d63da77151b6015487af14514), [3d9b7dc](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/3d9b7dc0194f421e64651d563a77c60624369dfe), [feb69aa](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/feb69aaf7055adafa4dd137d3f5bce24cc2f4bcf))
+- `apr replay <round | terminal.meta.json> --json` validates a retained round bundle offline. `--include-bytes` also exports the exact prompt and document bytes. Producers and their retries now read pinned copies of their inputs, so a round can be reproduced after its source files change ([bf68746](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/bf687460fd9b18faabb9d04cb1c8f7d342524dfb))
+- `apr queue add | status | run | cancel | doctor` keeps a persistent FIFO of rounds. `run` processes them one at a time through the same runner and ledger as `apr run`, and recovers completed work without repeating an uncertain review ([85f71fc](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/85f71fc480cc335a796046d703afc82c956e621e))
+- `apr lint <round>` runs offline checks with typed findings:
+  - per-role byte thresholds, with strict-mode minimums;
+  - unfilled template markers: mustache, shell variables, TODO/TBD.
+
+  `--fail-on-warn` promotes warnings to failures ([0bd1872](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/0bd187277ad8a0b21dd04b55525c8a7de10e1125))
+- `apr run <round> --show-manifest`, optionally with `--json`, previews offline which documents are selected, with each one's size and SHA-256, and why an implementation document was included or skipped ([ca57646](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/ca576463d7415020cd2df9d23bb7a4f584cef882))
+- The same document metadata is bound into every review path: run, dry-run, render, robot validate and robot run ([42e1f2b](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/42e1f2bd84d7f3d7b151cb28aa0a7e5d88998b1b))
+- `scripts/recover_oracle_run.sh` recovers a retained robot or background run's Oracle answer without repeating the review ([1f0c4f4](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/1f0c4f4e54a5eba7a748bd64f4c22f1aa008c031), [5bbe94d](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/5bbe94d8e9adf1a7c11c6205006ebe69963fd630)). It:
+  - pins the output destination and the creation evidence;
+  - accepts the pre-launch inventory only if it matches the SHA-256 in the recovery receipt.
+
+  See `scripts/README.md`.
+
+### Changed
+
+- `apr run` refuses to call Oracle when local lint fails. `--no-lint` bypasses the check with a warning and records the bypass in the ledger. Queue entries always lint ([0bd1872](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/0bd187277ad8a0b21dd04b55525c8a7de10e1125))
+- **Breaking for scripts:** `apr run` on a prompt with an unfilled placeholder now exits 4 (a lint refusal, like every other lint failure); v1.3.1 exited 1. `APR_ERROR_CODE=validation_failed` is unchanged ([0bd1872](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/0bd187277ad8a0b21dd04b55525c8a7de10e1125))
+- Oracle's single-flight "busy" replies no longer use up the retry budget. A human run waits up to 300 seconds on a separate busy budget, and a busy failure no longer discards useful completed output ([cad5409](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/cad5409abffe35f09462c3c90dc90cad8e13709f), [3a514df](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/3a514df3ff1a6969d7305ad389133f02e66e01f8))
+- `apr run --wait` now exits 1 when Oracle's output is missing or fails validation and automatic recovery also fails, and records the error in the run ledger. v1.3.1 printed the same failure but exited 0 ([feb69aa](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/feb69aaf7055adafa4dd137d3f5bce24cc2f4bcf))
+- apr no longer sed-patches Oracle's `assistantResponse.js` (GH #8, [e4cd8c6](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/e4cd8c68bb10e4a923f4197ec31548bf6f091407)):
+  - the patch only ever matched Oracle 0.8.0-0.8.4;
+  - the per-run "responses may be truncated" warnings are gone;
+  - the `APR_ORACLE_*` stability knobs are removed, and apr names any that are still set.
+- The installer requires Node.js 24+ with npm. It no longer adds NodeSource's end-of-life Node 18 apt feed (GH #10, [58391bd](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/58391bd1f0eee87af6569770b4bdf0b1af3c40cb))
+
+### Fixed
+
+- The default prompt showed empty "contents ... will be included by oracle" slots. It now names the attached files, which Oracle appends after the prompt (GH #7, [0aaffae](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/0aaffaee686fc0ea5ab0fa5fb3e1740f542184d4))
+- Each run binds to its own Oracle session, and refuses stale or ambiguous candidates, across:
+  - slug normalization;
+  - `-2`/`-3` collisions;
+  - retries;
+  - concurrent launches.
+
+  (GH #9, [3f5ae9a](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/3f5ae9ad3335484bc16b8cac100c8fea54c925e8), [7724cc0](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/7724cc01795fe9948faa6e0bfbf8765f7218baf7))
+
+---
+
 ## [v1.3.1](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases/tag/v1.3.1) -- 2026-09-29
 
 ### Fixed: recovering a truncated answer
