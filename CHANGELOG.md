@@ -8,6 +8,18 @@ Repository: <https://github.com/Dicklesworthstone/automated_plan_reviser_pro>
 
 ---
 
+## [v1.4.2](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases/tag/v1.4.2) -- 2026-11-21
+
+### Fixed
+
+- **Oracle `thinking_time` compatibility & Node 22 `npx` fallback guidance**: `apr` now probes configured `--browser-thinking-time` values during its offline `--render` feature check across `preflight_check`, `apr run`, and `apr robot run`, failing closed (`exit 3` / `dependency_missing`) before starting a review when the resolved Oracle rejects the level (such as `oracle.thinking_time: pro` on Oracle 0.9.0 resolved via `npx` under Node.js 22). Diagnostics report the resolved Oracle command/version, allowed choices, detected Node.js version, and Node.js 24+ upgrade guidance. Offline local workflow lint now also recognizes `thinking_time: pro` alongside `heavy` and `extended` (GH #11, [ee261d7](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/ee261d78fba5ad9e69d7c2229afbdaca709bcc6b))
+- **`apr attach` argument validation order**: Missing `<session>` arguments now consistently return `EXIT_USAGE_ERROR` (`2`) before checking whether Oracle or `npx` is installed, while `apr attach <session>` still exits `3` when Oracle is missing ([ee261d7](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/ee261d78fba5ad9e69d7c2229afbdaca709bcc6b))
+- **Process-group cleanup for advisory `oracle status` probes**: `oracle_busy_status_probe` now isolates the probe in its own process group (`set -m`) and sends `SIGKILL` to the group on completion/timeout, preventing surviving `TERM`-ignoring descendants on timeout implementations that only signal their direct child (such as `uutils coreutils` `timeout` on Ubuntu 26.04) ([ee261d7](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/ee261d78fba5ad9e69d7c2229afbdaca709bcc6b))
+- **Background launch readiness handshake**: Replaced the fixed `0.5s` post-launch sleep in human background and `robot run` paths with a bounded worker startup-readiness handshake so loaded hosts still report immediate busy or completion outcomes accurately ([ee261d7](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/ee261d78fba5ad9e69d7c2229afbdaca709bcc6b))
+- **Cross-platform test portability and determinism**: Replaced undeclared `rg` calls with POSIX `grep`, fixed `stat -c`/`stat -f` order for GNU/Linux, restored owner permissions before removing sealed test directories in teardown, canonicalized test temp directories with `pwd -P`, fixed `release_lock` subshell/Bash 3.2 helper issues, and replaced fixed test sleeps with deterministic release files ([425fa21](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/commit/425fa211da1c7384a324c9e90e41c8fd0d9d8abd))
+
+---
+
 ## [v1.4.1](https://github.com/Dicklesworthstone/automated_plan_reviser_pro/releases/tag/v1.4.1) -- 2026-11-02
 
 ### Fixed: jq 1.6 (the stock jq on Ubuntu 22.04 and Debian 12)
