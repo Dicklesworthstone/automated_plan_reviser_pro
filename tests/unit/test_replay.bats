@@ -96,7 +96,7 @@ EOF
     cmp "$APR_REPLAY_CAPTURE/prompt-1" "$root/prompt.txt"
     [[ ! -w "$root/readme/source.md" && ! -w "$root/config.yaml" ]]
     [[ "$record" != *SECRET_REPLAY_CONFIG_MARKER* ]]
-    run rg SECRET_REPLAY_CONFIG_MARKER "$record" "$root/bundle.json" "$root/config.yaml"
+    run grep -q -F SECRET_REPLAY_CONFIG_MARKER "$record" "$root/bundle.json" "$root/config.yaml"
     [[ "$status" -eq 1 ]]
     jq -e '.state=="finished" and .inputs.files[0].path=="docs/implementation/source.md" and .replay.schema_version=="1.0.0"' "$record"
 }
@@ -295,7 +295,7 @@ EOF
     cmp "$TEST_DIR/seeds/readme" "$APR_REPLAY_CAPTURE/input-1-1"
     local root; root=".apr/runs/default/$(jq -r .run_id .apr/rounds/default/round_1.meta.json)/inputs"
     [[ $(wc -c < "$root/config.yaml") -lt 1000 ]]
-    run rg SECRET_REPLAY_CONFIG_MARKER "$root/config.yaml" "$root/bundle.json" .apr/rounds/default/round_1.meta.json
+    run grep -q -F SECRET_REPLAY_CONFIG_MARKER "$root/config.yaml" "$root/bundle.json" .apr/rounds/default/round_1.meta.json
     [[ "$status" -eq 1 ]]
     [[ $(jq -r .config.sha256 .apr/rounds/default/round_1.meta.json) == "$(document_sha256_stdin < "$TEST_DIR/seeds/large-config.yaml")" ]]
 }
@@ -314,6 +314,6 @@ EOF
     [[ $(get_config_value model "$config") == 'plain"literal' ]]
     apr_capture_config "$config" "$TEST_DIR/safe-config.yaml"
     [[ $(yaml_unquote "$(get_config_value readme "$TEST_DIR/safe-config.yaml")") == "docs/Bob's notes.md" ]]
-    run rg 'unused comment' "$TEST_DIR/safe-config.yaml"
+    run grep -q -F 'unused comment' "$TEST_DIR/safe-config.yaml"
     [[ "$status" -eq 1 ]]
 }

@@ -11,8 +11,19 @@ setup() {
 }
 
 teardown() {
+    if [[ -n "${APR_CLI_RELEASE_FILE:-}" ]]; then
+        touch "$APR_CLI_RELEASE_FILE" 2>/dev/null || true
+    fi
     log_test_end "${BATS_TEST_NAME}" "$([[ ${status:-0} -eq 0 ]] && echo pass || echo fail)"
     teardown_test_environment
+}
+
+file_mode_octal() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+file_inode() {
+    stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"
 }
 
 ledger_fixture() {
@@ -132,7 +143,7 @@ bind_runtime_ledger() {
     [[ $(jq -r .inputs.status "$APR_LEDGER_FILE") == pending ]]
     [[ $(jq -r .outcome.oracle_exit_code "$APR_LEDGER_FILE") == null ]]
     [[ -f "$APR_LEDGER_FILE.lock" ]]
-    [[ $(stat -f '%Lp' "$APR_LEDGER_FILE" 2>/dev/null || stat -c '%a' "$APR_LEDGER_FILE") == 600 ]]
+    [[ $(file_mode_octal "$APR_LEDGER_FILE") == 600 ]]
 }
 
 @test "ledger writer: actual config manifest and exact prompt bytes are bound without secret values" {
@@ -149,7 +160,7 @@ bind_runtime_ledger() {
     [[ $(jq -r .inputs.prompt_hash "$APR_LEDGER_FILE") == "$hash" ]]
     [[ $(jq -r .config.sha256 "$APR_LEDGER_FILE") == "$(document_sha256_stdin < .apr/workflows/default.yaml)" ]]
     [[ $(jq -r .invocation.remote_host "$APR_LEDGER_FILE") == host.example:444 ]]
-    run rg -q 'PRIVATE_TOKEN|Useful review prompt|No added final newline' "$APR_LEDGER_FILE"
+    run grep -q -E 'PRIVATE_TOKEN|Useful review prompt|No added final newline' "$APR_LEDGER_FILE"
     [[ "$status" -eq 1 ]]
     jq -e '.invocation.oracle_args | index("[redacted]")!=null' "$APR_LEDGER_FILE"
 }
@@ -208,13 +219,13 @@ bind_runtime_ledger() {
     exec 8>>"$APR_LEDGER_FILE.lock"
     apr_kernel_lock 8
     local inode
-    inode=$(stat -f '%i' "$APR_LEDGER_FILE.lock" 2>/dev/null || stat -c '%i' "$APR_LEDGER_FILE.lock")
+    inode=$(file_inode "$APR_LEDGER_FILE.lock")
     run bash -c 'source "$1"; exec 8>>"$2"; apr_kernel_lock 8' _ "$TEST_DIR/apr_functions.bash" "$APR_LEDGER_FILE.lock"
     [[ "$status" -eq 12 ]]
     exec 8>&-
     run bash -c 'source "$1"; exec 8>>"$2"; apr_kernel_lock 8' _ "$TEST_DIR/apr_functions.bash" "$APR_LEDGER_FILE.lock"
     [[ "$status" -eq 0 ]]
-    [[ "$inode" == "$(stat -f '%i' "$APR_LEDGER_FILE.lock" 2>/dev/null || stat -c '%i' "$APR_LEDGER_FILE.lock")" ]]
+    [[ "$inode" == "$(file_inode "$APR_LEDGER_FILE.lock")" ]]
 }
 
 @test "ledger writer: real retrying producer counters native exit and useful output reach terminal record" {
@@ -401,7 +412,17 @@ case "$APR_CLI_MODE" in
     busy) printf 'ERROR: busy: another review is active\n' >&2; exit 7 ;;
     missing) exit 0 ;;
     truncated|harvest_partial|harvest_success) printf 'Incomplete response.\n' > "$output"; exit 0 ;;
-    slow) sleep 2 ;;
+    slow)
+        if [[ -n "${APR_CLI_RELEASE_FILE:-}" ]]; then
+            waited=0
+            while [[ ! -f "$APR_CLI_RELEASE_FILE" && "$waited" -lt 300 ]]; do
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+        else
+            sleep 2
+        fi
+        ;;
 esac
 for ((i=0;i<100;i++)); do printf 'A complete deterministic useful review response.\n'; done > "$output"
 [[ "$APR_CLI_MODE" != native_partial ]] || exit 19
@@ -440,6 +461,7 @@ EOF
 
 @test "ledger integration: detached worker owns started trace and finalizes after parent launch acknowledgement" {
     runtime_cli_fixture slow
+    export APR_CLI_RELEASE_FILE="$TEST_DIR/release-detached"
     capture_streams bash "$APR_SCRIPT" robot run 1 --compact
     [[ "$CAPTURED_STATUS" -eq 0 ]]
     assert_json_value "$CAPTURED_STDOUT" .data.status running
@@ -447,7 +469,8 @@ EOF
     jq -e '.state=="started" and .finished_at==null and .outcome.ok==null' "$ledger"
     owner=$(jq -r .owner_pid "$ledger")
     kill -0 "$owner"
-    for ((attempt=0;attempt<50;attempt++)); do
+    touch "$APR_CLI_RELEASE_FILE"
+    for ((attempt=0;attempt<150;attempt++)); do
         [[ $(jq -r .state "$ledger") == started ]] || break
         sleep 0.1
     done
@@ -494,6 +517,7 @@ EOF
 
 @test "ledger integration: busy contender preserves the live canonical and its own refused trace" {
     runtime_cli_fixture slow
+    export APR_CLI_RELEASE_FILE="$TEST_DIR/release-busy"
     capture_streams bash "$APR_SCRIPT" robot run 1 --compact
     [[ "$CAPTURED_STATUS" -eq 0 ]]
     local ledger=.apr/rounds/default/round_1.meta.json id attempt
@@ -510,7 +534,8 @@ EOF
         refused=$((refused+1))
     done
     [[ "$refused" -eq 1 ]]
-    for ((attempt=0;attempt<50;attempt++)); do
+    touch "$APR_CLI_RELEASE_FILE"
+    for ((attempt=0;attempt<150;attempt++)); do
         [[ $(jq -r .state "$ledger") == started ]] || break
         sleep 0.1
     done
@@ -541,14 +566,14 @@ EOF
     local lock inode
     acquire_lock default 1
     lock="$APR_LOCK_FILE"
-    inode=$(stat -f '%i' "$lock" 2>/dev/null || stat -c '%i' "$lock")
+    inode=$(file_inode "$lock")
     run bash -c 'source "$1"; acquire_lock default 1' _ "$TEST_DIR/apr_functions.bash"
     [[ "$status" -eq 12 ]]
     release_lock
     [[ -f "$lock" ]]
     run bash -c 'source "$1"; acquire_lock default 1; release_lock' _ "$TEST_DIR/apr_functions.bash"
     [[ "$status" -eq 0 ]]
-    [[ "$inode" == "$(stat -f '%i' "$lock" 2>/dev/null || stat -c '%i' "$lock")" ]]
+    [[ "$inode" == "$(file_inode "$lock")" ]]
 }
 
 @test "ledger integration: failed producer cannot replace an earlier good canonical answer" {

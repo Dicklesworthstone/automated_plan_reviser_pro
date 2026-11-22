@@ -17,7 +17,7 @@ teardown() {
 @test "acquire_lock: does not remove existing lock file on failure (fallback)" {
     # Create the reproduction script
     cat > "$TEST_DIR/lock_test.sh" << 'EOF'
-#!/bin/bash
+#!/usr/bin/env bash
 set -u
 
 # Source APR functions (strip main)
@@ -60,7 +60,7 @@ echo "Success: Lock file preserved"
 EOF
     chmod +x "$TEST_DIR/lock_test.sh"
     
-    run "$TEST_DIR/lock_test.sh" "$APR_SCRIPT" "$CONFIG_DIR"
+    run "$BASH" "$TEST_DIR/lock_test.sh" "$APR_SCRIPT" "$CONFIG_DIR"
     
     echo "$output"
     

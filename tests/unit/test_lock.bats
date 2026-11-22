@@ -150,16 +150,16 @@ teardown() {
 
     log_test_step "action" "Releasing lock"
 
-    run release_lock
+    local release_rc=0
+    release_lock || release_rc=$?
 
-    log_test_actual "exit code" "$status"
+    log_test_actual "exit code" "$release_rc"
 
-    assert_success
+    [[ "$release_rc" -eq 0 ]]
 
     # Now another process should be able to acquire
     run acquire_lock "test" "1"
     assert_success
-    release_lock
 }
 
 @test "release_lock: safe to call without lock" {

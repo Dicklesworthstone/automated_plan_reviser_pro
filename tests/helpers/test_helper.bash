@@ -47,8 +47,12 @@ APR_SCRIPT="$PROJECT_ROOT/apr"
 # setup_test_environment - Create isolated temp directory for test
 # Sets TEST_DIR, TEST_HOME, and configures XDG paths
 setup_test_environment() {
-    # Create unique temp directory for this test
-    TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/apr_test.XXXXXX")"
+    # Create unique temp directory for this test (canonicalized so macOS
+    # trailing slashes on TMPDIR and /var -> /private/var symlinks match pwd -P)
+    local base_tmp="${TMPDIR:-/tmp}"
+    base_tmp="${base_tmp%/}"
+    TEST_DIR="$(mktemp -d "${base_tmp}/apr_test.XXXXXX")"
+    TEST_DIR="$(cd "$TEST_DIR" && pwd -P)"
     export TEST_DIR
 
     # Save real home for tests that need access to installed tools
@@ -90,6 +94,10 @@ teardown_test_environment() {
     if [[ -n "${TEST_DIR:-}" && -d "$TEST_DIR" ]]; then
         # Log before cleanup
         log_test_step "teardown" "Cleaning up $TEST_DIR"
+
+        # Restore owner permissions on intentionally sealed test paths so
+        # non-root teardown can always remove the temp directory cleanly.
+        chmod -R u+rwx "$TEST_DIR" 2>/dev/null || true
 
         # Remove test directory
         rm -rf "$TEST_DIR"

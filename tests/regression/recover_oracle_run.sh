@@ -6,7 +6,9 @@
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 recover="$root/scripts/recover_oracle_run.sh"
-work=$(mktemp -d "${TMPDIR:-/tmp}/apr-recovery-tests.XXXXXX")
+base_tmp="${TMPDIR:-/tmp}"
+base_tmp="${base_tmp%/}"
+work=$(cd "$(mktemp -d "${base_tmp}/apr-recovery-tests.XXXXXX")" && pwd -P)
 readonly root recover work
 real_date=$(command -v date)
 export REAL_DATE="$real_date"

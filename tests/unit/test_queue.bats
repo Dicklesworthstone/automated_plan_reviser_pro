@@ -11,6 +11,9 @@ setup() {
 }
 
 teardown() {
+    if [[ -n "${APR_QUEUE_RELEASE_FILE:-}" ]]; then
+        touch "$APR_QUEUE_RELEASE_FILE" 2>/dev/null || true
+    fi
     teardown_test_environment
 }
 
@@ -315,7 +318,17 @@ count=0
 count=$((count+1)); printf '%s\n' "$count" > "$APR_QUEUE_COUNT"
 printf '%s\n' "$slug" >> "$APR_QUEUE_STARTS"
 if [[ "$APR_QUEUE_MODE" == always_busy || ( "$APR_QUEUE_MODE" == busy && "$count" -eq 1 ) ]]; then printf 'ERROR: busy: another review is active\n' >&2; exit 7; fi
-[[ "$APR_QUEUE_MODE" != slow ]] || sleep 2
+if [[ "$APR_QUEUE_MODE" == slow ]]; then
+    if [[ -n "${APR_QUEUE_RELEASE_FILE:-}" ]]; then
+        waited=0
+        while [[ ! -f "$APR_QUEUE_RELEASE_FILE" && "$waited" -lt 300 ]]; do
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+    else
+        sleep 2
+    fi
+fi
 for ((i=0;i<100;i++)); do printf 'A complete useful queue review for %s.\n' "$slug"; done > "$output"
 EOF
     chmod +x "$TEST_DIR/probe-bin/oracle"
@@ -430,14 +443,16 @@ EOF
 
 @test "queue runner: a competing controller is refused while the actual slow worker is preserved" {
     queue_test_producer slow
+    export APR_QUEUE_RELEASE_FILE="$TEST_DIR/release-competing"
     bash "$APR_SCRIPT" queue add 1 --json > "$TEST_DIR/enqueue.json"
     bash "$APR_SCRIPT" robot queue run --once --compact > "$TEST_DIR/first-run.json" 2> "$TEST_DIR/first-run.stderr" &
     local runner_pid=$!
-    for ((i=0;i<100;i++)); do [[ ! -f "$APR_QUEUE_COUNT" ]] || break; sleep 0.05; done
+    for ((i=0;i<600;i++)); do [[ ! -f "$APR_QUEUE_COUNT" ]] || break; sleep 0.05; done
     [[ -f "$APR_QUEUE_COUNT" ]]
     capture_streams bash "$APR_SCRIPT" robot queue run --once --compact
     [[ "$CAPTURED_STATUS" -eq 12 ]]
     assert_json_value "$CAPTURED_STDOUT" .code busy
+    touch "$APR_QUEUE_RELEASE_FILE"
     wait "$runner_pid"
     jq -e '.ok and .data.counts.done==1' "$TEST_DIR/first-run.json"
     [[ $(cat "$APR_QUEUE_COUNT") -eq 1 ]]
@@ -485,14 +500,16 @@ EOF
 
 @test "queue runner: active cancellation preserves useful output and records its observed completion" {
     queue_test_producer slow
+    export APR_QUEUE_RELEASE_FILE="$TEST_DIR/release-cancel"
     bash "$APR_SCRIPT" queue add 1 --json > "$TEST_DIR/enqueue.json"
     local id runner_pid
     id=$(jq -r .entry_id "$TEST_DIR/enqueue.json")
     bash "$APR_SCRIPT" robot queue run --once --compact > "$TEST_DIR/run.json" 2> "$TEST_DIR/run.stderr" &
     runner_pid=$!
-    for ((i=0;i<100;i++)); do [[ ! -f "$APR_QUEUE_COUNT" ]] || break; sleep 0.05; done
+    for ((i=0;i<600;i++)); do [[ ! -f "$APR_QUEUE_COUNT" ]] || break; sleep 0.05; done
     [[ -f "$APR_QUEUE_COUNT" ]]
     bash "$APR_SCRIPT" robot queue cancel "$id" --compact > "$TEST_DIR/cancel.json"
+    touch "$APR_QUEUE_RELEASE_FILE"
     wait "$runner_pid"
     jq -e '.ok and .data.counts.canceled==1 and .data.entries[0].status=="canceled" and .data.entries[0].execution_status=="done" and .data.entries[0].output_path!=null' "$TEST_DIR/run.json"
     [[ $(cat "$APR_QUEUE_COUNT") -eq 1 && $(wc -c < .apr/rounds/default/round_1.md) -gt 2000 ]]
