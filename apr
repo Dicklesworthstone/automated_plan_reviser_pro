@@ -152,9 +152,18 @@ CONFIG_DIR=".apr"
 # Oracle command (determined at runtime)
 ORACLE_CMD=()
 
+# Minimum Node.js major version required by @steipete/oracle >= 0.10.0
+readonly ORACLE_MIN_NODE_MAJOR=24
+
 # Oracle feature detection (best-effort, set during preflight and other entrypoints)
 ORACLE_SUPPORTS_NOTIFY=false
 ORACLE_FEATURES_DETECTED=false
+ORACLE_FEATURES_THINKING_TIME=""
+ORACLE_THINKING_TIME_ERROR=""
+ORACLE_THINKING_TIME_HINT=""
+ORACLE_THINKING_TIME_ALLOWED=""
+ORACLE_THINKING_TIME_VERSION=""
+ORACLE_THINKING_TIME_NODE_VERSION=""
 
 # Seconds to wait before reattaching to the Oracle session when an answer looks
 # truncated. Deep-thinking models can keep generating for minutes. 0 = no wait.
@@ -759,13 +768,86 @@ check_oracle() {
     fi
 }
 
+oracle_node_version() {
+    command -v node >/dev/null 2>&1 || return 1
+    node --version 2>/dev/null | head -n 1 | tr -d '\r'
+}
+
+oracle_node_major() {
+    local ver="${1:-}"
+    ver="${ver#v}"
+    local major="${ver%%.*}"
+    [[ "$major" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$((10#$major))"
+}
+
+oracle_extract_allowed_choices() {
+    local text="$1" rest=""
+    if [[ "$text" == *"Allowed choices are "* ]]; then
+        rest="${text#*Allowed choices are }"
+        rest="${rest%%$'\n'*}"
+        rest="${rest%.}"
+        printf '%s\n' "$rest"
+    fi
+}
+
+oracle_probe_rejected_thinking_time() {
+    local probe_rc="$1" probe_out="$2"
+    [[ "$probe_rc" -ne 0 ]] || return 1
+    if [[ "$probe_out" == *"Allowed choices are "* ]]; then
+        return 0
+    fi
+    if [[ "$probe_out" == *"--browser-thinking-time"* ]] &&
+       [[ "$probe_out" == *"invalid"* || "$probe_out" == *"unknown option"* || "$probe_out" == *"unrecognized option"* || "$probe_out" == *"error: option"* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+oracle_record_thinking_time_error() {
+    local thinking_time="$1" probe_out="$2"
+    local oracle_ver="" allowed="" node_ver="" node_major=""
+    oracle_ver=$("${ORACLE_CMD[@]}" --version 2>/dev/null | head -n 1 | tr -d '\r' || true)
+    allowed=$(oracle_extract_allowed_choices "$probe_out" || true)
+    node_ver=$(oracle_node_version || true)
+    node_major=$(oracle_node_major "$node_ver" || true)
+
+    ORACLE_THINKING_TIME_ALLOWED="$allowed"
+    ORACLE_THINKING_TIME_VERSION="$oracle_ver"
+    ORACLE_THINKING_TIME_NODE_VERSION="$node_ver"
+
+    local method="${ORACLE_CMD[*]}"
+    ORACLE_THINKING_TIME_ERROR="Resolved Oracle ($method${oracle_ver:+, $oracle_ver}) does not support oracle.thinking_time '$thinking_time'"
+    if [[ -n "$allowed" ]]; then
+        ORACLE_THINKING_TIME_ERROR="${ORACLE_THINKING_TIME_ERROR} (allowed choices: $allowed)"
+    fi
+
+    if [[ "${ORACLE_CMD[0]:-}" == "npx" && -n "$node_major" && "$node_major" -lt "$ORACLE_MIN_NODE_MAJOR" ]]; then
+        ORACLE_THINKING_TIME_HINT="Node.js ${node_ver} with npx fallback resolves an older @steipete/oracle (releases supporting '${thinking_time}' require Node.js ${ORACLE_MIN_NODE_MAJOR}+). Upgrade to Node.js ${ORACLE_MIN_NODE_MAJOR}+ and install a current @steipete/oracle, or set oracle.thinking_time to a supported level${allowed:+ ($allowed)}."
+    elif [[ "$thinking_time" == "pro" ]]; then
+        ORACLE_THINKING_TIME_HINT="Upgrade to Node.js ${ORACLE_MIN_NODE_MAJOR}+ and a newer @steipete/oracle (npm install -g @steipete/oracle@latest), or set oracle.thinking_time to a supported level${allowed:+ ($allowed)}."
+    else
+        ORACLE_THINKING_TIME_HINT="Upgrade @steipete/oracle (npm install -g @steipete/oracle@latest) or set oracle.thinking_time to a supported level${allowed:+ ($allowed)}."
+    fi
+}
+
 oracle_detect_features() {
     local mode="${1:-full}" # "full" (default) or "fast"
+    local thinking_time="${2:-}"
 
-    # Only detect once per process unless explicitly reset.
-    [[ "${ORACLE_FEATURES_DETECTED:-false}" == "true" ]] && return 0
+    # Only detect once per process for the same thinking_time unless explicitly reset.
+    if [[ "${ORACLE_FEATURES_DETECTED:-false}" == "true" ]]; then
+        if [[ -z "$thinking_time" || "$mode" == "fast" || "${ORACLE_FEATURES_THINKING_TIME:-}" == "$thinking_time" ]]; then
+            return 0
+        fi
+    fi
 
     ORACLE_SUPPORTS_NOTIFY=false
+    ORACLE_THINKING_TIME_ERROR=""
+    ORACLE_THINKING_TIME_HINT=""
+    ORACLE_THINKING_TIME_ALLOWED=""
+    ORACLE_THINKING_TIME_VERSION=""
+    ORACLE_THINKING_TIME_NODE_VERSION=""
 
     if [[ ${#ORACLE_CMD[@]} -eq 0 ]]; then
         return 1
@@ -779,24 +861,54 @@ oracle_detect_features() {
     # which can unexpectedly download/install packages.
     if [[ "$mode" == "fast" && "${ORACLE_CMD[0]}" == "npx" ]]; then
         ORACLE_FEATURES_DETECTED=true
+        ORACLE_FEATURES_THINKING_TIME=""
         verbose "oracle_detect_features: skipping --help probe for npx in fast mode"
         return 0
     fi
 
-    # Check if --notify actually works with real commands (not just appears in help).
-    # Oracle 0.8.4 has a bug where --notify appears in help but is rejected by the parser
-    # when used with actual prompts. Test by checking if the flag produces an error.
-    local _notify_test
-    _notify_test=$("${ORACLE_CMD[@]}" -p "test" --notify --render 2>&1)
-    if echo "$_notify_test" | /usr/bin/grep -q "unknown option"; then
+    # Check if --notify and (when configured) --browser-thinking-time actually work
+    # with the resolved Oracle parser in a single offline --render probe.
+    # Oracle 0.8.4 has a bug where --notify appears in help but is rejected by the
+    # parser; Oracle 0.9.0 (resolved by npx on Node 22) rejects --browser-thinking-time pro.
+    local probe_args=()
+    if [[ -n "$thinking_time" && "$mode" != "fast" ]]; then
+        probe_args+=(--browser-thinking-time "$thinking_time")
+    fi
+    probe_args+=(-p "test" --notify --render)
+
+    local _notify_test="" _probe_rc=0
+    _notify_test=$("${ORACLE_CMD[@]}" "${probe_args[@]}" 2>&1) || _probe_rc=$?
+
+    if [[ -n "$thinking_time" && "$mode" != "fast" ]] && oracle_probe_rejected_thinking_time "$_probe_rc" "$_notify_test"; then
+        oracle_record_thinking_time_error "$thinking_time" "$_notify_test"
+        verbose "oracle_detect_features: $ORACLE_THINKING_TIME_ERROR"
+        ORACLE_FEATURES_DETECTED=true
+        ORACLE_FEATURES_THINKING_TIME="$thinking_time"
+        return 0
+    fi
+
+    if [[ "$_notify_test" == *"unknown option"* ]]; then
         ORACLE_SUPPORTS_NOTIFY=false
         verbose "oracle_detect_features: Oracle --notify rejected by parser (Oracle bug)"
+        if [[ -n "$thinking_time" && "$mode" != "fast" ]]; then
+            local _tt_test="" _tt_rc=0
+            _tt_test=$("${ORACLE_CMD[@]}" --browser-thinking-time "$thinking_time" --render -p "test" 2>&1) || _tt_rc=$?
+            if oracle_probe_rejected_thinking_time "$_tt_rc" "$_tt_test"; then
+                oracle_record_thinking_time_error "$thinking_time" "$_tt_test"
+                verbose "oracle_detect_features: $ORACLE_THINKING_TIME_ERROR"
+            fi
+        fi
     else
         ORACLE_SUPPORTS_NOTIFY=true
         verbose "oracle_detect_features: Oracle supports --notify"
     fi
 
     ORACLE_FEATURES_DETECTED=true
+    if [[ "$mode" != "fast" ]]; then
+        ORACLE_FEATURES_THINKING_TIME="$thinking_time"
+    else
+        ORACLE_FEATURES_THINKING_TIME=""
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -836,6 +948,7 @@ preflight_check() {
     local impl_path="${3:-}"
     local has_warnings=false
     local documents_validated="${4:-false}"
+    local thinking_time="${5:-}"
 
     verbose "preflight_check: readme=$readme_path spec=$spec_path impl=${impl_path:-<none>}"
 
@@ -858,8 +971,13 @@ preflight_check() {
         has_warnings=true
     fi
 
-    # Detect Oracle feature support (--notify may not exist in older versions)
-    oracle_detect_features || true
+    # Detect Oracle feature support (--notify and configured --browser-thinking-time)
+    oracle_detect_features full "$thinking_time" || true
+    if [[ -n "$ORACLE_THINKING_TIME_ERROR" ]]; then
+        print_error "Pre-flight failed: $ORACLE_THINKING_TIME_ERROR"
+        [[ -n "$ORACLE_THINKING_TIME_HINT" ]] && print_info "$ORACLE_THINKING_TIME_HINT"
+        return 1
+    fi
 
     warn_legacy_oracle_stability_knobs || has_warnings=true
     # CLI execution already applied the canonical document policy. This legacy
@@ -1118,8 +1236,17 @@ oracle_busy_status_probe() {
         return 0
     fi
     print_info "Oracle status (local sessions only; availability remains unconfirmed):"
-    "$timeout_cmd" --signal=KILL "${seconds}s" "${ORACLE_CMD[@]}" status >&2 ||
-        verbose "Advisory Oracle status unavailable or timed out"
+    (
+        # Isolate the probe in its own process group so timeout implementations
+        # that only SIGKILL their direct child (such as uutils timeout) still
+        # leave no surviving TERM-ignoring descendants.
+        set -m
+        "$timeout_cmd" --signal=KILL "${seconds}s" "${ORACLE_CMD[@]}" status </dev/null >&2 &
+        local probe_pid=$! probe_rc=0
+        wait "$probe_pid" 2>/dev/null || probe_rc=$?
+        kill -KILL -- "-$probe_pid" 2>/dev/null || true
+        exit "$probe_rc"
+    ) || verbose "Advisory Oracle status unavailable or timed out"
     return 0
 }
 
@@ -1161,6 +1288,9 @@ run_oracle_once() {
         oracle_session_snapshot "$APR_LEDGER_DIR/oracle-session-start" || return 1
     fi
     APR_ATTEMPTS_COUNT=$((${APR_ATTEMPTS_COUNT:-0} + 1))
+    if [[ -n "${APR_LAUNCH_READY_FILE:-}" ]]; then
+        printf '%s\n' "$APR_ATTEMPTS_COUNT" > "$APR_LAUNCH_READY_FILE" 2>/dev/null || true
+    fi
     {
         if "${ORACLE_CMD[@]}" "$@" 2>&1 1>&3 3>&- | tee "$stderr_file" >&2; then
             pipeline_status=("${PIPESTATUS[@]}")
@@ -1309,6 +1439,42 @@ run_oracle_with_retry() {
 
     print_error "All $MAX_RETRY_ATTEMPTS attempts failed"
     return "$exit_code"
+}
+
+# Wait for a detached background worker to finish startup (ledger ownership and
+# first producer launch) and observe a short post-launch settle window so fast
+# completions or immediate busy/failure outcomes are caught reliably even under
+# heavy CPU load, while genuinely long-running producers still detach promptly.
+apr_wait_background_launch() {
+    local worker_pid="$1" result_file="$2" ready_file="$3"
+    local waited=0
+    while (( waited < 100 )); do
+        if [[ -s "$result_file" ]] || ! kill -0 "$worker_pid" 2>/dev/null; then
+            return 0
+        fi
+        if [[ -s "$ready_file" ]]; then
+            break
+        fi
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+
+    local seen_attempt="" attempt_polls=0 total_polls=0 cur_attempt=""
+    seen_attempt=$(cat "$ready_file" 2>/dev/null || true)
+    while (( attempt_polls < 10 && total_polls < 100 )); do
+        if [[ -s "$result_file" ]] || ! kill -0 "$worker_pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.05
+        attempt_polls=$((attempt_polls + 1))
+        total_polls=$((total_polls + 1))
+        cur_attempt=$(cat "$ready_file" 2>/dev/null || true)
+        if [[ -n "$cur_attempt" && "$cur_attempt" != "$seen_attempt" ]]; then
+            seen_attempt="$cur_attempt"
+            attempt_polls=0
+        fi
+    done
+    return 0
 }
 
 # A detached worker's globals are not visible to its parent. Record only the
@@ -2070,7 +2236,7 @@ validate_workflow_local() {
                             validation_add_finding warning validation_failed "Model '$model' is outside APR's extended-reasoning defaults" "Use oracle.model: 5.2 Thinking or gpt-5.2-pro; intentionally override with APR_ALLOW_NONPRO_MODELS=1" "$config" model '{"policy":"model"}'
                         fi ;;
                 esac
-                if [[ "$thinking" != heavy && "$thinking" != extended ]]; then
+                if [[ "$thinking" != heavy && "$thinking" != extended && "$thinking" != pro ]]; then
                     validation_add_finding warning validation_failed "Thinking time '${thinking:-missing}' is below APR's intended extended reasoning" "Set oracle.thinking_time: heavy; intentionally override with APR_ALLOW_LIGHT_THINKING=1" "$config" thinking_time '{"policy":"thinking_time"}'
                 fi
                 policy_warnings=$(jq -c --argjson start "$warning_count" '.[$start:]' <<< "$VALIDATION_WARNINGS")
@@ -4665,7 +4831,6 @@ run_round() (
             APR_RUN_ERROR_CODE=dependency_missing;apr_emit_error_code_tag dependency_missing
             print_error "Oracle not available";return "$EXIT_DEPENDENCY_ERROR"
         fi
-        oracle_detect_features || true
     fi
 
     verbose "Starting run_round: round=$round_num workflow=$workflow"
@@ -4744,11 +4909,21 @@ run_round() (
     # Preserve existing preflight diagnostics/order. The standalone metadata
     # preview bypasses all Oracle checks, as before.
     if [[ "$show_manifest" != true ]]; then
+        if [[ "$dry_run" != "true" && "$render" != "true" ]]; then
+            oracle_detect_features full "$thinking_time" || true
+            if [[ -n "$ORACLE_THINKING_TIME_ERROR" ]]; then
+                APR_RUN_ERROR_CODE=dependency_missing
+                apr_emit_error_code_tag dependency_missing
+                print_error "$ORACLE_THINKING_TIME_ERROR"
+                [[ -n "$ORACLE_THINKING_TIME_HINT" ]] && print_info "$ORACLE_THINKING_TIME_HINT"
+                return "$EXIT_DEPENDENCY_ERROR"
+            fi
+        fi
         if [[ "${APR_NO_LINT:-0}" != 1 && "$skip_preflight" != "true" && "$dry_run" != "true" && "$render" != "true" ]]; then
             local impl_for_preflight=""
             [[ "$include_impl" == "true" && -n "$impl_path" ]] && impl_for_preflight="$impl_path"
             local preflight_result=0
-            preflight_check "$readme_path" "$spec_path" "$impl_for_preflight" true || preflight_result=$?
+            preflight_check "$readme_path" "$spec_path" "$impl_for_preflight" true "$thinking_time" || preflight_result=$?
             if [[ $preflight_result -eq 1 ]]; then
                 print_error "Pre-flight checks failed. Fix the issues above and try again."
                 print_info "Use --no-preflight to skip these checks (not recommended)"
@@ -5203,7 +5378,7 @@ run_round() (
             exit $oracle_exit
         fi
     else
-        local result_file
+        local result_file ready_file="$APR_LEDGER_DIR/launch.ready"
         if ! mkdir -p "$CONFIG_DIR/logs" ||
             ! result_file=$(mktemp "$CONFIG_DIR/logs/oracle_${APR_LEDGER_RUN_ID}.result.XXXXXX"); then
             print_error "Cannot retain the Oracle launch result; Oracle was not started"
@@ -5214,14 +5389,15 @@ run_round() (
             # background run keeps going after `apr run` returns.
             trap "" HUP
             local worker_exit=0
+            APR_LAUNCH_READY_FILE="$ready_file"
             apr_run_worker_owner || exit $?
             run_oracle_recorded "$result_file" "$enable_retry" "${oracle_args[@]}" || worker_exit=$?
             apr_run_finish "$worker_exit" "$EXIT_DEPENDENCY_ERROR"
         ) &
         local oracle_pid=$!
 
-        # Brief delay to verify process started
-        sleep 0.5
+        # Wait for worker startup and observe immediate launch result
+        apr_wait_background_launch "$oracle_pid" "$result_file" "$ready_file"
 
         # Verify the process is actually running
         if [[ -s "$result_file" ]] || ! kill -0 "$oracle_pid" 2>/dev/null; then
@@ -7421,7 +7597,6 @@ robot_run() (
         robot_fail "dependency_missing" '{"dependency":"oracle"}' "Oracle not available"
         return $?
     fi
-    oracle_detect_features || true
 
     # Load workflow config
     local config_path="$CONFIG_DIR/workflows/$workflow.yaml"
@@ -7442,6 +7617,21 @@ robot_run() (
     output_dir=$(yaml_unquote "$(get_config_value "output_dir" "$config_path")")
     impl_every_n=$(yaml_unquote "$(get_config_value "impl_every_n" "$config_path")")
     thinking_time=$(yaml_unquote "$(get_config_value "thinking_time" "$config_path")")
+    fi
+
+    oracle_detect_features full "$thinking_time" || true
+    if [[ -n "$ORACLE_THINKING_TIME_ERROR" ]]; then
+        robot_fail "dependency_missing" "$(jq -nc \
+            --arg dep "oracle" \
+            --arg tt "$thinking_time" \
+            --arg cmd "${ORACLE_CMD[*]}" \
+            --arg ver "$ORACLE_THINKING_TIME_VERSION" \
+            --arg node "$ORACLE_THINKING_TIME_NODE_VERSION" \
+            --arg allowed "$ORACLE_THINKING_TIME_ALLOWED" \
+            --arg msg "$ORACLE_THINKING_TIME_ERROR" \
+            '{dependency:$dep, reason:"unsupported_thinking_time", thinking_time:$tt, oracle_cmd:$cmd, oracle_version:(if $ver=="" then null else $ver end), node_version:(if $node=="" then null else $node end), allowed_choices:(if $allowed=="" then null else $allowed end), error:$msg}')" \
+            "$ORACLE_THINKING_TIME_HINT"
+        return $?
     fi
 
     # Auto-include implementation every N rounds if configured
@@ -7609,19 +7799,21 @@ robot_run() (
         return $?
     fi
 
+    local ready_file="$APR_LEDGER_DIR/launch.ready"
     (
         # Bash will SIGHUP background jobs on shell exit. Ignore HUP so the
         # detached robot run can survive after `apr` exits.
         trap "" HUP
         local worker_exit=0
+        APR_LAUNCH_READY_FILE="$ready_file"
         apr_run_worker_owner || exit $?
         run_oracle_recorded "$result_file" "true" "${oracle_args[@]}" || worker_exit=$?
         apr_run_finish "$worker_exit" 1
     ) >"$oracle_log" 2>&1 &
     local oracle_pid=$!
 
-    # Brief delay to verify process started
-    sleep 0.5
+    # Wait for worker startup and observe immediate launch result
+    apr_wait_background_launch "$oracle_pid" "$result_file" "$ready_file"
 
     # Verify the process is actually running
     local launch_status="running"
@@ -8746,7 +8938,16 @@ main() {
     if [[ "$command_is_round" == "true" || "$command" == "run" ]]; then
         # run_round gates local lint before provider discovery/readiness.
         oracle_required=false
-    elif [[ "$command" == "status" || "$command" == "attach" ]]; then
+    elif [[ "$command" == "status" ]]; then
+        oracle_required=true
+    elif [[ "$command" == "attach" ]]; then
+        # Validate missing usage argument before probing Oracle so exit codes
+        # do not depend on whether Oracle/npx is installed.
+        if [[ ${#positional_args[@]} -lt 1 ]]; then
+            print_error "Session ID/slug required"
+            print_info "Usage: apr attach <session>"
+            exit $EXIT_USAGE_ERROR
+        fi
         oracle_required=true
     fi
 

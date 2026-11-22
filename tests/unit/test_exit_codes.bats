@@ -69,6 +69,25 @@ load '../helpers/test_helper.bash'
     assert_exit_code 2
 }
 
+@test "apr attach missing argument exits 2 even without Oracle while named session exits 3" {
+    local no_oracle_bin="$TEST_DIR/no_oracle_bin"
+    mkdir -p "$no_oracle_bin"
+    local tool
+    for tool in basename dirname grep sed awk tr wc cut head tail cat mkdir mktemp rm date tput; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            ln -s "$(command -v "$tool")" "$no_oracle_bin/$tool"
+        fi
+    done
+
+    run env PATH="$no_oracle_bin" APR_NO_NPX=1 "$BASH" "$APR_SCRIPT" attach
+    assert_exit_code 2
+    [[ "$output" == *"Session ID/slug required"* ]]
+
+    run env PATH="$no_oracle_bin" APR_NO_NPX=1 "$BASH" "$APR_SCRIPT" attach some-session
+    assert_exit_code 3
+    [[ "$output" == *"Oracle not found"* ]]
+}
+
 @test "apr robot run without round number returns error" {
     capture_streams "$APR_SCRIPT" robot run --compact
     status="$CAPTURED_STATUS"

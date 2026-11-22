@@ -454,6 +454,7 @@ assert_json_array_contains() {
 @test "run_round: existing output can cancel with prompt" {
     create_docs
     write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "$TEST_PROJECT/IMPL.md"
+    setup_mock_oracle
     mkdir -p ".apr/rounds/default"
     printf '%s\n' "existing" > ".apr/rounds/default/round_1.md"
 
@@ -1459,4 +1460,237 @@ EOF
     capture_streams bash "$APR_SCRIPT" run 1 --render
     [[ "$CAPTURED_STATUS" -eq 4 && -z "$CAPTURED_STDOUT" && "$CAPTURED_STDERR" == *'fixture: template reader process failed'* ]]
     [[ ! -e "$APR_FIXTURE_PROMPT_DIR/count" && ! -e "$APR_FIXTURE_COUNT" ]]
+}
+
+# =============================================================================
+# Oracle Thinking-Time Compatibility Tests (GH #11)
+# =============================================================================
+
+create_thinking_time_env() {
+    local mode="$1" # "npx_node22_0_9_0" | "global_0_9_0" | "global_0_23_0"
+    local bin_dir="$TEST_DIR/tt-bin-$mode"
+    mkdir -p "$bin_dir"
+    local tool
+    for tool in bash env sh cat cp mv rm ln cmp touch stat uname sort uniq id diff git mkdir mktemp chmod date head tail tr wc cut sed awk grep jq base64 tee sleep ps kill timeout gtimeout flock lockf sha256sum shasum find du tput dirname basename; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            ln -sf "$(command -v "$tool")" "$bin_dir/$tool"
+        fi
+    done
+
+    local oracle_body
+    if [[ "$mode" == "global_0_23_0" ]]; then
+        cat > "$bin_dir/node" <<'EOF'
+#!/usr/bin/env bash
+printf 'v24.12.0\n'
+EOF
+        cat > "$bin_dir/oracle" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+    --version) printf '0.23.0\n'; exit 0 ;;
+esac
+render=false out="" tt=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --render) render=true ;;
+        --browser-thinking-time) tt="$2"; shift ;;
+        --write-output) out="$2"; shift ;;
+    esac
+    shift
+done
+if [[ "$render" == true ]]; then
+    printf 'Rendered preview (thinking=%s)\n' "$tt"
+    exit 0
+fi
+printf '%s\n' "$tt" >> "$APR_TT_LAUNCHES"
+if [[ -n "$out" ]]; then
+    for ((i=0; i<100; i++)); do printf 'A complete Pro thinking review answer.\n'; done > "$out"
+fi
+EOF
+        chmod +x "$bin_dir/node" "$bin_dir/oracle"
+    else
+        cat > "$bin_dir/node" <<'EOF'
+#!/usr/bin/env bash
+printf 'v22.23.4\n'
+EOF
+        oracle_body=$(cat <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# When invoked as `npx -y @steipete/oracle ...`, shift off wrapper args.
+if [[ "${1:-}" == "-y" ]]; then
+    shift
+    [[ "${1:-}" == "@steipete/oracle" ]] && shift
+fi
+case "${1:-}" in
+    --version) printf '0.9.0\n'; exit 0 ;;
+esac
+tt="" render=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --render) render=true ;;
+        --browser-thinking-time)
+            tt="$2"; shift
+            case "$tt" in
+                light|standard|extended|heavy) ;;
+                *)
+                    printf "error: option '--browser-thinking-time <level>' argument '%s' is invalid. Allowed choices are light, standard, extended, heavy.\n(use --help for usage)\n" "$tt" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+    esac
+    shift
+done
+if [[ "$render" == true ]]; then
+    printf 'Rendered preview\n'
+    exit 0
+fi
+printf 'unexpected-review-launch\n' >> "$APR_TT_LAUNCHES"
+exit 99
+EOF
+        )
+        if [[ "$mode" == "npx_node22_0_9_0" ]]; then
+            printf '%s\n' "$oracle_body" > "$bin_dir/npx"
+            chmod +x "$bin_dir/node" "$bin_dir/npx"
+        else
+            printf '%s\n' "$oracle_body" > "$bin_dir/oracle"
+            chmod +x "$bin_dir/node" "$bin_dir/oracle"
+        fi
+    fi
+    export APR_TT_LAUNCHES="$TEST_DIR/tt-launches"
+    APR_TT_BIN="$bin_dir"
+}
+
+@test "thinking_time: pro passes offline workflow lint without light-thinking warning (GH #11)" {
+    create_docs
+    write_workflow_config "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md"
+    cat > ".apr/workflows/default.yaml" <<EOF
+name: default
+documents:
+  readme: $TEST_PROJECT/README.md
+  spec: $TEST_PROJECT/SPEC.md
+oracle:
+  model: "5.2 Thinking"
+  thinking_time: pro
+rounds:
+  output_dir: .apr/rounds/default
+template: |
+  Review the attached README.md and SPEC.md thoroughly.
+EOF
+    capture_streams bash "$APR_SCRIPT" robot lint 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    jq -e '.ok and .data.valid and (.data.warnings | length) == 0' <<< "$CAPTURED_STDOUT"
+}
+
+@test "thinking_time: preflight_check rejects Oracle 0.9.0 with thinking_time pro (GH #11)" {
+    create_docs
+    create_thinking_time_env global_0_9_0
+    ORACLE_FEATURES_DETECTED=false
+    ORACLE_FEATURES_THINKING_TIME=""
+    local old_path="$PATH"
+    PATH="$APR_TT_BIN"
+    export PATH
+    unset APR_NO_NPX
+
+    capture_streams preflight_check "$TEST_PROJECT/README.md" "$TEST_PROJECT/SPEC.md" "" false "pro"
+
+    PATH="$old_path"
+    export PATH
+
+    [[ "$CAPTURED_STATUS" -eq 1 ]]
+    [[ "$CAPTURED_STDERR" == *"does not support oracle.thinking_time 'pro'"* ]]
+    [[ "$CAPTURED_STDERR" == *"0.9.0"* ]]
+    [[ "$CAPTURED_STDERR" == *"light, standard, extended, heavy"* ]]
+    [[ "$CAPTURED_STDERR" == *"Node.js 24+"* ]]
+    [[ ! -e "$APR_TT_LAUNCHES" ]]
+}
+
+@test "thinking_time: human run via Node 22 npx fallback rejecting pro fails before review with guidance (GH #11)" {
+    create_docs
+    mkdir -p .apr/workflows
+    cat > ".apr/workflows/default.yaml" <<EOF
+name: default
+documents:
+  readme: $TEST_PROJECT/README.md
+  spec: $TEST_PROJECT/SPEC.md
+oracle:
+  model: "5.2 Thinking"
+  thinking_time: pro
+rounds:
+  output_dir: .apr/rounds/default
+template: |
+  Review the attached README.md and SPEC.md thoroughly.
+EOF
+    echo "default_workflow: default" > ".apr/config.yaml"
+    create_thinking_time_env npx_node22_0_9_0
+
+    capture_streams env -u APR_NO_NPX PATH="$APR_TT_BIN" "$BASH" "$APR_SCRIPT" run 1 --wait --no-retry
+    [[ "$CAPTURED_STATUS" -eq 3 ]]
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=dependency_missing"* ]]
+    [[ "$CAPTURED_STDERR" == *"npx -y @steipete/oracle"* ]]
+    [[ "$CAPTURED_STDERR" == *"0.9.0"* ]]
+    [[ "$CAPTURED_STDERR" == *"light, standard, extended, heavy"* ]]
+    [[ "$CAPTURED_STDERR" == *"Node.js v22.23.4"* ]]
+    [[ "$CAPTURED_STDERR" == *"Node.js 24+"* ]]
+    [[ ! -e "$APR_TT_LAUNCHES" ]]
+    [[ ! -e .apr/rounds/default/round_1.md ]]
+}
+
+@test "thinking_time: robot run via Node 22 npx fallback rejecting pro returns structured dependency_missing (GH #11)" {
+    create_docs
+    mkdir -p .apr/workflows
+    cat > ".apr/workflows/default.yaml" <<EOF
+name: default
+documents:
+  readme: $TEST_PROJECT/README.md
+  spec: $TEST_PROJECT/SPEC.md
+oracle:
+  model: "5.2 Thinking"
+  thinking_time: pro
+rounds:
+  output_dir: .apr/rounds/default
+template: |
+  Review the attached README.md and SPEC.md thoroughly.
+EOF
+    echo "default_workflow: default" > ".apr/config.yaml"
+    create_thinking_time_env npx_node22_0_9_0
+
+    capture_streams env -u APR_NO_NPX PATH="$APR_TT_BIN" "$BASH" "$APR_SCRIPT" robot run 1 --compact
+    [[ "$CAPTURED_STATUS" -eq 3 ]]
+    assert_valid_json "$CAPTURED_STDOUT"
+    jq -e '.ok==false and .code=="dependency_missing" and .data.reason=="unsupported_thinking_time" and .data.thinking_time=="pro" and .data.oracle_version=="0.9.0" and .data.node_version=="v22.23.4" and (.data.allowed_choices | contains("heavy")) and (.hint | contains("Node.js 24+"))' <<< "$CAPTURED_STDOUT"
+    [[ "$CAPTURED_STDERR" == *"APR_ERROR_CODE=dependency_missing"* ]]
+    [[ ! -e "$APR_TT_LAUNCHES" ]]
+}
+
+@test "thinking_time: Oracle 0.23.0 supporting pro succeeds in both human and robot run (GH #11)" {
+    create_docs
+    mkdir -p .apr/workflows
+    cat > ".apr/workflows/default.yaml" <<EOF
+name: default
+documents:
+  readme: $TEST_PROJECT/README.md
+  spec: $TEST_PROJECT/SPEC.md
+oracle:
+  model: "5.2 Thinking"
+  thinking_time: pro
+rounds:
+  output_dir: .apr/rounds/default
+template: |
+  Review the attached README.md and SPEC.md thoroughly.
+EOF
+    echo "default_workflow: default" > ".apr/config.yaml"
+    create_thinking_time_env global_0_23_0
+
+    capture_streams env APR_NO_NPX=1 PATH="$APR_TT_BIN" "$BASH" "$APR_SCRIPT" run 1 --wait --no-retry
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    [[ "$(cat "$APR_TT_LAUNCHES")" == "pro" ]]
+    [[ -s .apr/rounds/default/round_1.md ]]
+
+    capture_streams env APR_NO_NPX=1 PATH="$APR_TT_BIN" "$BASH" "$APR_SCRIPT" robot run 2 --compact
+    [[ "$CAPTURED_STATUS" -eq 0 ]]
+    assert_valid_json "$CAPTURED_STDOUT"
+    jq -e '.ok==true and .data.status=="completed"' <<< "$CAPTURED_STDOUT"
+    [[ "$(wc -l < "$APR_TT_LAUNCHES" | tr -d ' ')" -eq 2 ]]
+    [[ -s .apr/rounds/default/round_2.md ]]
 }
